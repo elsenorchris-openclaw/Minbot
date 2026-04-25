@@ -1481,6 +1481,80 @@ def _compute_today_exposure() -> float:
     return total
 
 
+def _reconcile_kalshi_positions() -> int:
+    """Fetch current open positions from Kalshi /portfolio/positions and add
+    any non-zero KXLOWT* holdings that aren't already in _open_positions.
+    Recovers from earlier-bug-induced 'ghost positions' where the bot lost
+    track of holdings (positions.json drained during a deploy cascade).
+    Returns count of positions added."""
+    global _open_positions
+    try:
+        data = kalshi_get("/trade-api/v2/portfolio/positions", {"limit": 200})
+    except Exception as e:
+        log(f"  Kalshi reconcile fetch failed: {e}", "warn")
+        return 0
+    added = 0
+    for p in (data.get("market_positions") or []):
+        tk = p.get("ticker", "")
+        if not tk.startswith("KXLOWT"):
+            continue
+        try:
+            pf = float(p.get("position_fp") or 0)
+        except (TypeError, ValueError):
+            continue
+        if abs(pf) < 0.01:
+            continue
+        with _positions_lock:
+            if tk in _open_positions:
+                continue  # already tracked locally
+            # Add stub so dedupe blocks re-entry. Kalshi's settle loop will
+            # do its thing; settle records will be missing some entry context
+            # (mu, sigma at entry) but that's an analytics gap, not a safety one.
+            action = "BUY_YES" if pf > 0 else "BUY_NO"
+            count = int(round(abs(pf)))
+            cost = float(p.get("market_exposure_dollars") or 0)
+            entry_price = (cost / count) if count else 0.0
+            # Parse station + date_str from ticker
+            m = re.match(r"KXLOWT([A-Z]+)-(\d{2}[A-Z]{3}\d{2})-", tk)
+            station = ""
+            date_str = ""
+            if m:
+                # Map series prefix to station
+                series = "KXLOWT" + m.group(1)
+                meta = CITIES.get(series, {})
+                station = meta.get("station", "")
+                # Parse date e.g. 26APR25 → 2026-04-25
+                yy, mon_s, dd = m.group(2)[:2], m.group(2)[2:5], m.group(2)[5:7]
+                mon_map = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
+                           "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
+                date_str = f"20{yy}-{mon_map.get(mon_s, '01')}-{dd}"
+            # Parse bracket bounds from ticker
+            br = parse_market_bracket(tk)
+            floor = br.get("floor") if br else None
+            cap = br.get("cap") if br else None
+            _open_positions[tk] = {
+                "ts": p.get("last_updated_ts") or datetime.now(timezone.utc).isoformat(),
+                "kind": "entry",
+                "market_ticker": tk,
+                "action": action,
+                "entry_price": entry_price,
+                "count": count,
+                "cost": cost,
+                "station": station,
+                "date_str": date_str,
+                "floor": floor,
+                "cap": cap,
+                "label": (CITIES.get("KXLOWT" + m.group(1), {}) if m else {}).get("label", ""),
+                "_recovered_from_kalshi": True,
+            }
+            added += 1
+            log(f"  recovered ghost position {tk}: {action} {count}x @ {int(entry_price*100)}c")
+    if added:
+        _save_positions()
+        log(f"  reconciliation: recovered {added} ghost positions from Kalshi")
+    return added
+
+
 def _load_positions() -> None:
     """Load positions.json, dropping any whose climate day is more than
     POSITION_TTL_DAYS in the past. Defends against orphaned positions that
@@ -1837,6 +1911,13 @@ def main() -> None:
         if bal < BANKROLL_FLOOR_USD:
             raise RuntimeError(f"Balance ${bal:.2f} < floor ${BANKROLL_FLOOR_USD:.2f}; aborting")
     _load_positions()
+    # Self-heal: pull live Kalshi positions and add any ghosts we lost track of.
+    # Defends against a deploy cascade or crash that left holdings on Kalshi
+    # without a corresponding record in positions.json.
+    try:
+        _reconcile_kalshi_positions()
+    except Exception as e:
+        log(f"  reconcile failed: {e}", "warn")
     _load_nbp_cache_from_disk()
     # Initial forecast fetches before first scan
     try:

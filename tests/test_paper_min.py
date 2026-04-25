@@ -451,5 +451,62 @@ class TestDailyExposurePersistence(unittest.TestCase):
         self.assertAlmostEqual(pb._compute_today_exposure(), 1.25, places=2)
 
 
+class TestKalshiReconcile(unittest.TestCase):
+    """Reconcile Kalshi positions into _open_positions on startup so ghost
+    positions (Kalshi has them, bot doesn't) get tracked."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        self._orig_get = pb.kalshi_get
+        self._orig_save = pb._save_positions
+        pb._save_positions = lambda: None  # don't write disk in test
+
+    def tearDown(self):
+        pb.kalshi_get = self._orig_get
+        pb._save_positions = self._orig_save
+
+    def test_recovers_ghost_position(self):
+        # Kalshi shows 1 NO position on a ticker bot doesn't track
+        pb.kalshi_get = lambda path, params=None: {
+            "market_positions": [{
+                "ticker": "KXLOWTNYC-26APR25-T48",
+                "position_fp": -3.0,
+                "market_exposure_dollars": 0.21,
+                "last_updated_ts": "2026-04-25T05:00:00Z",
+            }]
+        }
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 1)
+        self.assertIn("KXLOWTNYC-26APR25-T48", pb._open_positions)
+        rec = pb._open_positions["KXLOWTNYC-26APR25-T48"]
+        self.assertEqual(rec["action"], "BUY_NO")
+        self.assertEqual(rec["count"], 3)
+        self.assertEqual(rec["station"], "KNYC")
+        self.assertEqual(rec["date_str"], "2026-04-25")
+        self.assertTrue(rec["_recovered_from_kalshi"])
+
+    def test_skips_already_tracked(self):
+        pb._open_positions["KXLOWTNYC-26APR25-T48"] = {"market_ticker": "KXLOWTNYC-26APR25-T48"}
+        pb.kalshi_get = lambda path, params=None: {
+            "market_positions": [{
+                "ticker": "KXLOWTNYC-26APR25-T48",
+                "position_fp": -3.0, "market_exposure_dollars": 0.21,
+            }]
+        }
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 0)
+
+    def test_skips_zero_positions(self):
+        pb.kalshi_get = lambda path, params=None: {
+            "market_positions": [{
+                "ticker": "KXLOWTNYC-26APR25-T48",
+                "position_fp": 0.0, "market_exposure_dollars": 0.0,
+            }]
+        }
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
