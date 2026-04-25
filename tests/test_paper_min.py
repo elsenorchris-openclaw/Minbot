@@ -254,7 +254,7 @@ class TestWalletConfig(unittest.TestCase):
         self.assertLessEqual(pb.MAX_BET_USD, 1.00)
         self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 25.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
-        self.assertGreaterEqual(pb.MIN_EDGE_LIVE, 0.20)
+        self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
 
 
 class TestObsCliBuffer(unittest.TestCase):
@@ -338,12 +338,12 @@ class TestCooldowns(unittest.TestCase):
 
 class TestLiveSafetyConstants(unittest.TestCase):
     def test_max_edge_is_set(self):
-        self.assertGreater(pb.MAX_EDGE_LIVE, pb.MIN_EDGE_LIVE)
-        self.assertLess(pb.MAX_EDGE_LIVE, 1.0)
+        self.assertGreater(pb.MAX_EDGE, pb.MIN_EDGE)
+        self.assertLess(pb.MAX_EDGE, 1.0)
 
     def test_disagreement_threshold_reasonable(self):
-        self.assertGreater(pb.MAX_DISAGREEMENT_F_LIVE, 2.0)
-        self.assertLess(pb.MAX_DISAGREEMENT_F_LIVE, 10.0)
+        self.assertGreater(pb.MAX_DISAGREEMENT_F, 2.0)
+        self.assertLess(pb.MAX_DISAGREEMENT_F, 10.0)
 
     def test_per_event_per_cycle_is_one(self):
         self.assertEqual(pb.MAX_NEW_PER_EVENT_PER_CYCLE, 1)

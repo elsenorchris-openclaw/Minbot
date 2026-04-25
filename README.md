@@ -1,12 +1,16 @@
-# paper-min-bot
+# min_bot
 
-Trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20 cities as
-V1/V2 but opposite settlement: daily minimum instead of maximum.
+Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
+cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
 **Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
 `KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
-`PAPER_MODE=False`. Conservative live caps: $1 per entry, 3 entries per cycle,
-$20 daily exposure, 20% min edge. Flip back with `PAPER_MODE=True`.
+Conservative caps: $1 per entry, 3 entries per cycle, $4 daily exposure,
+20% min edge.
+
+> File / dir / service names still carry the `paper-min-bot` prefix from the
+> initial paper-trading scaffold. Keeping them avoids touching the systemd
+> unit + git remote. Internally everything is live-only.
 
 ## Architecture
 
@@ -15,32 +19,34 @@ $20 daily exposure, 20% min edge. Flip back with `PAPER_MODE=True`.
   `running_max`).
 - **Forecasts**: NBP (NBM Probabilistic text bulletins on AWS S3, `TNNMN`/`TNNSD`
   for min-temp mu + sigma). Fallback to NBM via Open-Meteo daily
-  `temperature_2m_min`.
-- **Model**: truncated Gaussian bounded above by `running_min` (the final daily
-  min cannot exceed the lowest observed temperature so far). Post-sunrise, sigma
-  collapses to 0.5°F residual ASOS-vs-CLI noise — the min is essentially fixed
-  once the sun's been up for an hour.
+  `temperature_2m_min`. HRRR via paid Open-Meteo on day-0.
+- **Model**: truncated Gaussian bounded above by `running_min + 1.0°F` (the
+  +1°F is the ASOS-vs-CLI buffer; CLI rounds to integer and our 5-min obs
+  may be 0.5°F off). Post-sunrise, sigma collapses to 1.0°F residual noise.
 - **Settlement**: reads CLI daily low from obs-pipeline's `cli_reports.low_f`
   field (same source V1/V2 use for CLI high).
 
 ## Data flow
 
 ```
-obs-pipeline                   paper-min-bot
-─────────────                  ──────────────
+obs-pipeline                    min_bot
+─────────────                   ──────────────
 ingests ASOS/MADIS/AWC
-  → running_min table       →  get_running_min(station, date)
-  → observations           →  get_latest_obs(station)
-  → cli_reports.low_f       →  check_settlements()
+  → running_min table        →  get_running_min(station, date)
+  → observations             →  get_latest_obs(station)
+  → cli_reports.low_f        →  check_settlements()
 
-AWS S3 NBM Probabilistic     →  refresh_nbp_forecasts()
-Open-Meteo NBM daily min     →  refresh_nbm_om_forecasts()
+AWS S3 NBM Probabilistic      →  refresh_nbp_forecasts()
+Open-Meteo NBM daily min      →  refresh_nbm_om_forecasts()
+Open-Meteo HRRR (paid)        →  refresh_hrrr_forecasts()
 
-Kalshi REST  /markets         → discover_markets() (per-series, parallel)
-Kalshi WS    orderbook_delta  → kalshi_ws.get_bbo() (sub-100ms BBO overlay)
+Kalshi REST  /markets         →  discover_markets() (per-series, parallel)
+Kalshi WS    orderbook_delta  →  kalshi_ws.get_bbo() (sub-100ms BBO overlay)
+Kalshi REST  /portfolio/...   →  place_kalshi_order, wait_for_fill, cancel
+Discord webhook → channel     →  notify_discord_entry / _settlement
 ```
 
-## Kalshi quote source (2026-04-24)
+## Kalshi quote source
 
 Discovery uses `/trade-api/v2/markets?series_ticker=X&status=open`, parsed via
 `yes_bid_dollars` / `yes_ask_dollars` (the `/events?with_nested_markets` path
@@ -54,20 +60,73 @@ the REST snapshot with cached BBO when fresh (≤10 s), dropping quote staleness
 from one cycle (~60 s) to ~50 ms. WS BBO is for read-side only — order
 placement still routes through REST. Disable with `USE_KALSHI_WS = False`.
 
+## Order flow
+
+1. `discover_markets()` returns quoted markets (REST) with WS BBO overlay.
+2. `find_opportunities()` filters per-market: skips if obs-pipeline already
+   has CLI for `(station, climate-day)`, or `date_str < today` for the city's
+   TZ. Computes `mu`, `sigma`, `running_min`, `model_prob`, `edge`.
+3. `execute_opportunity()` runs the safety gate stack (below), dedupes per
+   ticker, checks cycle / daily / per-event budgets, sizes via Kelly.
+4. `place_kalshi_order()` POSTs a limit buy at the ask price.
+5. `wait_for_fill()` polls the `kalshi_ws` fill cache for up to 5 s, falls
+   back to REST `/portfolio/orders/{id}` (authoritative).
+6. Partial / no-fill: cancel any resting remainder. Record actual `filled`
+   count to `data/trades.jsonl` and emit a Discord notification.
+7. `check_settlements()` walks open positions; on CLI publish, computes P&L
+   and emits a Discord settlement notification.
+
+## Caps and gates
+
+All in `paper_min_bot.py`:
+
+| Constant | Value | Why |
+|---|---|---|
+| `MAX_BET_USD` | `$1.00` | Kelly-sized but capped per entry |
+| `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
+| `MAX_NEW_PER_EVENT_PER_CYCLE` | `1` | Don't pile correlated bracket bets in same city |
+| `DAILY_EXPOSURE_CAP_USD` | `$4.00` | Sized for the V1 wallet (~$25); raise as bankroll grows |
+| `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
+| `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
+| `MAX_EDGE` | `0.40` | Skip edges > 40% (V1 trust-zone — model error) |
+| `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain |
+| `MAX_DISAGREEMENT_F` | `5.0°F` | Skip if HRRR vs NBP / NBP vs NBM diverge > this |
+| `MAX_SPREAD_CENTS` | `10c` | Skip if ask − bid > 10c on buying side |
+| `MAX_MU_VS_RM_DIFF_F` | `5.0°F` | Pre-sunrise: forecast μ vs observed rm sanity gate |
+| `POSITION_TTL_DAYS` | `3` | Drop positions on load whose climate day is older than this |
+| `ORDER_FILL_TIMEOUT_SEC` | `5.0` | Wait this long for fill, then cancel |
+
+## Cooldowns (V2 H-2 fix port)
+
+- 409 `trading_is_paused` from Kalshi → 60-second per-ticker cooldown.
+- 400 `insufficient_balance` → 5-minute account-wide cooldown.
+
+V1 logged 11k retries in one day before V2 added these.
+
+## Wallet selection
+
+`WALLET = "v1"` (default) loads `~/.env` `KALSHI_KEY_ID` and `~/kalshi_key.pem`.
+Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
+(`obs-pipeline-bot/kalshi_key_v2_account2.pem`).
+
+## Discord notifications
+
+- Channel `1497464077608550570` receives `ENTRY` and `SETTLED` messages.
+- Bot token comes from `DISCORD_BOT_TOKEN` in `~/.env` (same token V1/V2 use;
+  must already be a member of the channel).
+- One bounded queue + one worker thread; non-blocking; drops on overflow.
+
 ## Data dir
 
 `/home/ubuntu/paper_min_bot/data/`:
-- `paper_trades.jsonl` — every candidate + entry (full context for calibration)
-- `paper_positions.json` — currently open hypothetical positions
-- `paper_settlements.jsonl` — settled outcomes + P&L
-- `paper_stats.json` — aggregates
-- `paper_nbp_cache.json` — persisted NBP forecasts across restarts
+- `trades.jsonl` — every candidate + entry (full context for calibration)
+- `positions.json` — currently open positions
+- `settlements.jsonl` — settled outcomes + P&L
+- `nbp_cache.json` — persisted NBP forecasts across restarts
 
 ## Running
 
 ```bash
-# systemd
-sudo systemctl enable paper-min-bot.service
 sudo systemctl start paper-min-bot.service
 sudo systemctl status paper-min-bot.service
 sudo journalctl -u paper-min-bot -f
@@ -76,73 +135,10 @@ sudo journalctl -u paper-min-bot -f
 python3.12 /home/ubuntu/paper_min_bot/paper_min_bot.py
 ```
 
-## Live mode (current)
+## Kill switch
 
-Live executor placed at the limit-buy ask, fill-aware via `kalshi_ws`, with
-hard caps gating every entry. Order placement mirrors V2's `place_order`
-without maker-remainder / paused-cooldown logic.
-
-**Caps** (in `paper_min_bot.py`):
-- `MAX_BET_USD = 1.00` — Kelly-sized but capped per entry.
-- `MAX_NEW_POSITIONS_PER_CYCLE = 3` — first cycle of a fresh restart took 55
-  paper entries; the cycle cap stops a runaway.
-- `DAILY_EXPOSURE_CAP_USD = 20.00` — sum of fill costs since UTC midnight.
-- `MIN_EDGE_LIVE = 0.20` — bumped from 0.15 to skip the marginal 78c BUY_NO
-  entries the model overproduces.
-- `BANKROLL_FLOOR_USD = 5.00` — startup refuses to run if portfolio balance
-  drops below this.
-- `MAX_EDGE_LIVE = 0.40` — skip if computed edge exceeds 40% (mirrors V1
-  trust zone; high edges almost always indicate model error).
-- `MIN_MODEL_PROB = 0.15` / `MAX_MODEL_PROB = 0.85` — gate at execute time,
-  not just record time. Skip wildly unlikely or near-certain trades.
-- `MAX_DISAGREEMENT_F_LIVE = 5.0` — skip if HRRR vs NBP / NBP vs NBM-OM
-  forecasts diverge by more than this; sigma inflation alone (capped at 1.5×)
-  doesn't cover that uncertainty.
-- `MAX_SPREAD_CENTS_LIVE = 10` — skip if (ask − bid) on the buying side
-  exceeds 10c; thin liquidity = bad fills.
-- `MAX_MU_VS_RM_DIFF_F = 5.0` — pre-sunrise sanity gate. If forecast μ
-  disagrees with the observed running_min by >5°F, the forecast is wrong
-  by definition.
-- `MAX_NEW_PER_EVENT_PER_CYCLE = 1` — don't pile correlated bracket bets
-  in the same city's event. V1 NO-CASCADE pattern.
-
-**Cooldowns (V2 H-2 fix port).** A 409 `trading_is_paused` from Kalshi arms a
-60-second per-ticker cooldown so we don't retry-storm; a 400
-`insufficient_balance` arms a 5-minute account-wide cooldown so we don't
-hammer the API with no-op orders. V1 logged 11k retries in one day before
-this fix.
-
-**Wallet selection.** `WALLET = "v1"` (default) loads `~/.env` `KALSHI_KEY_ID`
-and `~/kalshi_key.pem`. Set `WALLET = "v2"` for the obs-pipeline-bot's
-secondary account.
-
-**Skip-if-resolved guard (2026-04-25).** `find_opportunities` skips any
-market whose `(station, climate-day)` pair already has a CLI low recorded
-in obs-pipeline. Prevents the post-CLI / pre-Kalshi-close window where the
-market is still tradeable but the answer is decided. Also skips any market
-whose climate day is already strictly in the past for the city's TZ.
-
-**+1°F obs-vs-CLI buffer (2026-04-25).** `running_min` (5-min ASOS samples)
-and Kalshi's settlement CLI (2-min averages, integer-rounded) can differ by
-~1°F. Mirrors the V1/V2 max-bot fix. In `calc_bracket_probability_min`:
-running_min is treated as `running_min + 1.0` for the truncation upper
-bound and the "bracket impossible" guard, and the post-sunrise lock uses
-σ=1.0°F (was 0.5°F).
-
-**Order flow.**
-1. `discover_markets()` returns quoted markets (REST) with WS BBO overlay.
-2. `find_opportunities()` filters; `execute_opportunity()` dedupes per ticker
-   and checks the cycle/daily caps.
-3. `place_kalshi_order()` POSTs a limit buy at the ask price.
-4. `wait_for_fill()` polls the `kalshi_ws` fill cache for up to 5 seconds,
-   falls back to REST `/portfolio/orders/{id}`.
-5. Partial / no-fill: cancel any resting remainder. Record actual `filled`
-   count to `paper_trades.jsonl`.
-
-**Kill switch:** `sudo systemctl stop paper-min-bot`. Open positions stay
-on Kalshi and self-settle from the `cli_reports` low.
-
-**Flipping back to paper:** set `PAPER_MODE = True` and restart.
+`sudo systemctl stop paper-min-bot`. Open positions stay on Kalshi and
+self-settle from the `cli_reports` low.
 
 ## Files touched by the obs-pipeline extension (2026-04-24)
 
@@ -168,7 +164,7 @@ ignoring the new min fields.
 - HRRR overnight nowcast blending (HRRR 0-18h min trajectory)
 - NWS gridpoint minTemperature as tertiary mu source
 - `seed_running_min_from_observations()` wired into obs-pipeline startup
-  (so fresh restarts correctly initialize today's running_min from the
-  observations table instead of whatever obs arrives first post-restart)
-- Discord alerts (route paper bot alerts to a separate channel)
+- client_order_id-based idempotency on retry
+- Time-to-settlement-aware sigma collapse (smooth interpolation, not just
+  the binary `_is_post_sunrise` flip)
 - Web dashboard (calibration curve, P&L by city, rolling Brier score)

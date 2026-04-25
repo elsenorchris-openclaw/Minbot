@@ -1,28 +1,30 @@
 #!/usr/bin/env python3.12
 """
-paper_min_bot.py — Kalshi daily-low temperature paper trading bot.
+min_bot — Kalshi daily-low temperature live trading bot.
 
-Trades hypothetically on KXLOWT* markets (2026-04-24 onward). Uses the
+Trades real money on KXLOWT* markets (live since 2026-04-25). Uses the
 obs-pipeline's running_min tracking + forecast fetchers to predict overnight
-lows, compares to Kalshi's live bracket quotes, logs opportunities with full
-context. When PAPER_MODE is True, no real orders are placed.
+lows, compares against Kalshi's live bracket quotes, places limit-buy
+orders with hard caps on bet size, per-cycle entries, daily exposure, and
+edge sanity gates.
 
 ARCHITECTURE:
-  PAPER_MODE flag controls executor: True → log_hypothetical_trade();
-  False → place_kalshi_order(). All upstream code (forecast, obs, model,
-  opp generation) is identical in both modes — one flag flip enables live.
+  Single live executor. WS-based market discovery via kalshi_ws.py.
+  REST POST for order placement; WS fill cache for sub-second confirmation;
+  REST GET as authoritative fallback.
 
 SAFETY:
-  - Separate Kalshi key file (optional; live mode only)
-  - Separate systemd unit (paper-min-bot.service)
-  - Separate data dir (/home/ubuntu/paper_min_bot/data)
-  - Does NOT touch V1/V2 positions, trades, stats, or logs
+  - Wallet selectable via WALLET ('v1' = ~/.env+~/kalshi_key.pem; 'v2' =
+    obs-pipeline-bot/kalshi_key_v2_account2.pem)
+  - Separate systemd unit (paper-min-bot.service — name kept for backward
+    compat with backups; bot is live, not paper)
+  - Separate data dir; does NOT touch V1/V2 max-bot positions, trades, stats
 
 DATA:
   - Reads obs from obs-pipeline sqlite (/home/ubuntu/obs-pipeline/data/obs.sqlite)
   - Fetches NBP sigma + mu from NBM Probabilistic text bulletins on AWS S3
   - Fetches NBM hourly min via Open-Meteo
-  - Writes hypothetical trades + settlement outcomes to data/paper_trades.jsonl
+  - Writes orders + settlement outcomes to data/trades.jsonl
 """
 from __future__ import annotations
 
@@ -53,15 +55,10 @@ import kalshi_ws  # WebSocket BBO client (V2 pattern, ported 2026-04-24)
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
 
-# Execution mode. PAPER_MODE=True → no real Kalshi orders; everything else
-# runs identically (fetch forecasts, compute edges, record hypothetical
-# entries + settlements). Flip to False to run live.
-PAPER_MODE = False                # 2026-04-25: live cutover with V2 wallet + caps
-
 # Wallet selection. "v1" → ~/.env KALSHI_KEY_ID + ~/kalshi_key.pem (account 1).
 # "v2" → _KALSHI_KEY_ID_V2 const + obs-pipeline-bot/kalshi_key_v2_account2.pem
-# Paper-min-bot trades KXLOWT* — distinct from V1's KXHIGH* — so wallet sharing
-# is fine. (Switched 2026-04-25 from v2→v1.)
+# min_bot trades KXLOWT* — distinct from V1's KXHIGH* — so wallet sharing
+# is fine.
 WALLET = "v1"
 
 # Path to the obs-pipeline sqlite DB (read-only queries for running_min).
@@ -112,36 +109,39 @@ SCAN_INTERVAL_SEC = 60              # 60s normal; low-temp markets move slowly
 FAST_SCAN_INTERVAL_SEC = 15         # pre-dawn (1h before sunrise → 1h after)
 LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
-# Opportunity filters (paper mode logs everything; these gate what gets flagged in Discord)
-MIN_EDGE_PAPER = 0.10               # log ALL, but tag 'TAKEABLE' when >=10% edge
-MIN_EDGE_LIVE = 0.20                # live mode: 20% edge (raised from 0.15 at live cutover)
-MAX_EDGE_LIVE = 0.40                # mirror V1 trust zone: edges above this almost always come
+# Opportunity filters
+MIN_EDGE = 0.20                     # min edge to take a trade
+MAX_EDGE = 0.40                     # mirror V1 trust zone: edges above this almost always come
                                     # from model error (forecast vs market disagree wildly)
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
 MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
 
-# Live-mode safety gates (HIGH-impact: prevent the patterns that lost money on
-# the 04:09 UTC live cycle and that V1/V2 had to fix in production).
-MAX_DISAGREEMENT_F_LIVE = 5.0       # skip if HRRR vs NBP / NBP vs NBM disagree > this
-MAX_SPREAD_CENTS_LIVE = 10          # skip if (yes_ask − yes_bid) > 10c on the active side
+# Hard safety gates (HIGH-impact: prevent the patterns that lost money on the
+# 04:09 UTC live cycle and that V1/V2 had to fix in production).
+MAX_DISAGREEMENT_F = 5.0            # skip if HRRR vs NBP / NBP vs NBM disagree > this
+MAX_SPREAD_CENTS = 10               # skip if (yes_ask − yes_bid) > 10c on the active side
 MAX_MU_VS_RM_DIFF_F = 5.0           # pre-sunrise sanity: skip if forecast μ disagrees with
                                     # observed running_min by more than this — model is wrong
 MAX_NEW_PER_EVENT_PER_CYCLE = 1     # don't pile on multiple brackets of the same event
                                     # (correlated bets — if forecast is wrong all lose)
 
-# Live-mode Kelly sizing (only used when PAPER_MODE=False)
-MAX_BET_USD = 1.00                  # 2026-04-25 live cutover: $1 cap per entry
+# Kelly sizing
+MAX_BET_USD = 1.00                  # $1 cap per entry
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 
-# ─── Live-mode safety caps (only enforced when PAPER_MODE=False) ─────────
-# Hard ceilings that gate execute_opportunity *before* place_order is called.
-MAX_NEW_POSITIONS_PER_CYCLE = 3     # first cycle paper-mode took 55; cap live exposure
-DAILY_EXPOSURE_CAP_USD = 4.00       # 2026-04-25: V1 wallet ~$7 — keep cap < balance - floor
+# ─── Hard ceilings that gate execute_opportunity before placing the order
+MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
+DAILY_EXPOSURE_CAP_USD = 4.00       # day scope (UTC midnight)
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
+
+# Auto-cleanup of position records whose climate day is more than this many
+# days in the past. Defends against positions that never settle (data error)
+# from accumulating indefinitely.
+POSITION_TTL_DAYS = 3
 
 # Data paths
 DATA_DIR = Path("/home/ubuntu/paper_min_bot/data")
@@ -154,11 +154,11 @@ except OSError:
     # Tests override DATA_DIR/LOG_DIR before calling anything that writes.
     pass
 
-POSITIONS_FILE = DATA_DIR / "paper_positions.json"
-TRADES_FILE = DATA_DIR / "paper_trades.jsonl"       # every candidate + decision
-SETTLEMENTS_FILE = DATA_DIR / "paper_settlements.jsonl"
-STATS_FILE = DATA_DIR / "paper_stats.json"
-NBP_CACHE_FILE = DATA_DIR / "paper_nbp_cache.json"
+POSITIONS_FILE = DATA_DIR / "positions.json"
+TRADES_FILE = DATA_DIR / "trades.jsonl"            # every candidate + decision
+SETTLEMENTS_FILE = DATA_DIR / "settlements.jsonl"
+STATS_FILE = DATA_DIR / "stats.json"
+NBP_CACHE_FILE = DATA_DIR / "nbp_cache.json"
 ENV_FILE = Path("/home/ubuntu/.env")
 
 # Kalshi
@@ -175,7 +175,7 @@ USE_KALSHI_WS = True
 # ═══════════════════════════════════════════════════════════════════════
 
 _LOG_LOCK = threading.Lock()
-_LOG_FILE_PATH = LOG_DIR / f"paper_min_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+_LOG_FILE_PATH = LOG_DIR / f"min_bot_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
 
 def log(msg: str, level: str = "info") -> None:
     ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
@@ -185,7 +185,7 @@ def log(msg: str, level: str = "info") -> None:
         try:
             # Rotate log by date
             global _LOG_FILE_PATH
-            today_path = LOG_DIR / f"paper_min_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+            today_path = LOG_DIR / f"min_bot_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
             _LOG_FILE_PATH = today_path
             with open(today_path, "a") as f:
                 f.write(line + "\n")
@@ -198,6 +198,115 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, default=str)
     os.replace(tmp, path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# DISCORD NOTIFICATIONS
+# ═══════════════════════════════════════════════════════════════════════
+# Pattern ported from V1 (kalshi_weather_bot.py): one bounded queue + one
+# worker thread, never block the caller, drop on overflow. Auth is a Discord
+# bot token; the same bot must already be a member of DISCORD_CHANNEL.
+
+DISCORD_TOKEN = ""                  # filled from ~/.env at startup
+DISCORD_CHANNEL = "1497464077608550570"   # min_bot updates channel
+
+import queue as _queue
+_discord_queue: "_queue.Queue[str]" = _queue.Queue(maxsize=50)
+_discord_dropped = 0
+
+
+def _discord_worker_loop() -> None:
+    url = f"https://discord.com/api/v10/channels/{DISCORD_CHANNEL}/messages"
+    headers = {"Authorization": f"Bot {DISCORD_TOKEN}", "Content-Type": "application/json"}
+    while True:
+        try:
+            msg = _discord_queue.get()
+        except Exception:
+            time.sleep(1.0)
+            continue
+        try:
+            text = str(msg)
+            chunks = [text[i:i + 1990] for i in range(0, len(text), 1990)] if len(text) > 1990 else [text]
+            for chunk in chunks:
+                try:
+                    resp = httpx.post(url, headers=headers, json={"content": chunk}, timeout=5.0)
+                    if resp.status_code == 429:
+                        try:
+                            retry_after = float(resp.json().get("retry_after", 1.0))
+                        except Exception:
+                            retry_after = 1.0
+                        time.sleep(min(max(retry_after, 0.5), 10.0))
+                        break
+                    if resp.status_code >= 400:
+                        if not hasattr(discord_send, "_last_err") or time.time() - discord_send._last_err > 300:
+                            discord_send._last_err = time.time()
+                            print(f"[discord] HTTP {resp.status_code}: {resp.text[:200]}", flush=True)
+                        break
+                except Exception as exc:
+                    if not hasattr(discord_send, "_last_err") or time.time() - discord_send._last_err > 300:
+                        discord_send._last_err = time.time()
+                        print(f"[discord] send failed: {exc}", flush=True)
+                    break
+        except Exception:
+            pass
+        finally:
+            try:
+                _discord_queue.task_done()
+            except Exception:
+                pass
+
+
+def discord_send(msg: str) -> None:
+    """Enqueue a Discord message. Non-blocking; drops if queue is full."""
+    if not DISCORD_TOKEN:
+        return
+    global _discord_dropped
+    try:
+        _discord_queue.put_nowait(str(msg))
+    except _queue.Full:
+        _discord_dropped += 1
+        if _discord_dropped == 1 or _discord_dropped % 100 == 0:
+            print(f"[discord] queue full — dropped {_discord_dropped} messages total", flush=True)
+
+
+def _start_discord_worker() -> None:
+    """Load token from ~/.env and start the single worker thread. Idempotent."""
+    global DISCORD_TOKEN
+    if DISCORD_TOKEN:
+        return
+    try:
+        env_txt = ENV_FILE.read_text()
+        m = re.search(r"DISCORD_BOT_TOKEN=(\S+)", env_txt)
+        if m:
+            DISCORD_TOKEN = m.group(1)
+    except Exception:
+        pass
+    if not DISCORD_TOKEN:
+        log("  Discord disabled — DISCORD_BOT_TOKEN missing from .env", "warn")
+        return
+    threading.Thread(target=_discord_worker_loop, name="discord-worker", daemon=True).start()
+    log(f"  Discord worker started → channel {DISCORD_CHANNEL}")
+
+
+def notify_discord_entry(record: dict, opp: dict) -> None:
+    """Send a one-line ENTRY notification to Discord."""
+    discord_send(
+        f"**ENTRY** {record['action']} {record['count']}x @ {int(round(record['entry_price']*100))}c "
+        f"on `{record['market_ticker']}` ({record['label']})\n"
+        f"edge {record['edge']:.0%}  mp {record['model_prob']:.0%}  "
+        f"μ {record['mu']:.1f}°F  σ {record['sigma']:.1f}°F  "
+        f"rm {record['running_min']}  cost ${record['cost']:.2f}  "
+        f"day ${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}"
+    )
+
+
+def notify_discord_settlement(ticker: str, action: str, cli_low: int,
+                              in_bracket: bool, won: bool, pnl: float) -> None:
+    emoji = "🟢" if won else "🔴"
+    discord_send(
+        f"{emoji} **SETTLED** `{ticker}` — {action}, CLI {cli_low}°F, "
+        f"in_bracket={in_bracket}, P&L **${pnl:+.2f}**"
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -217,7 +326,7 @@ def _load_kalshi_auth() -> None:
     """Load Kalshi auth based on WALLET.
         v1 → ~/.env KALSHI_KEY_ID + ~/kalshi_key.pem
         v2 → _KALSHI_KEY_ID_V2 const + obs-pipeline-bot/kalshi_key_v2_account2.pem
-    Auth is required even in paper mode (market discovery is signed)."""
+    Auth is needed for market discovery (signed)."""
     global _KEY_ID, _PRIVATE_KEY
     if WALLET == "v2":
         _KEY_ID = _KALSHI_KEY_ID_V2
@@ -1255,7 +1364,7 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-# PAPER EXECUTOR
+# EXECUTOR
 # ═══════════════════════════════════════════════════════════════════════
 
 def _append_jsonl(path: Path, record: dict) -> None:
@@ -1266,10 +1375,10 @@ def _append_jsonl(path: Path, record: dict) -> None:
         log(f"  jsonl append failed {path}: {e}", "warn")
 
 
-_open_paper_positions: dict[str, dict] = {}  # market_ticker → position record
+_open_positions: dict[str, dict] = {}  # market_ticker → position record
 _positions_lock = threading.Lock()
 
-# ─── Live-mode budgets (no-op in PAPER mode) ────────────────────────────
+# ─── Per-cycle / per-day budget tracking ────────────────────────────────
 _cycle_budget_lock = threading.Lock()
 _cycle_new_count = 0                          # reset each cycle
 _today_exposure_usd = 0.0                     # cost of today's entries
@@ -1340,20 +1449,34 @@ def _set_insufficient_balance_cooldown() -> None:
     log(f"  insufficient_balance cooldown set for {INSUFFICIENT_BALANCE_COOLDOWN_SEC:.0f}s", "warn")
 
 
-def _load_paper_positions() -> None:
-    global _open_paper_positions
+def _load_positions() -> None:
+    """Load positions.json, dropping any whose climate day is more than
+    POSITION_TTL_DAYS in the past. Defends against orphaned positions that
+    never settle (data error) accumulating indefinitely."""
+    global _open_positions
     try:
-        if POSITIONS_FILE.exists():
-            with open(POSITIONS_FILE) as f:
-                _open_paper_positions = json.load(f)
-            log(f"  loaded {len(_open_paper_positions)} paper positions")
+        if not POSITIONS_FILE.exists():
+            return
+        with open(POSITIONS_FILE) as f:
+            raw = json.load(f)
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=POSITION_TTL_DAYS)).strftime("%Y-%m-%d")
+        keep, dropped = {}, 0
+        for tk, pos in raw.items():
+            ds = pos.get("date_str") or ""
+            if ds and ds < cutoff:
+                dropped += 1
+                continue
+            keep[tk] = pos
+        _open_positions = keep
+        log(f"  loaded {len(_open_positions)} positions (dropped {dropped} > {POSITION_TTL_DAYS}d old)")
     except Exception as e:
-        log(f"  paper positions load failed: {e}", "warn")
+        log(f"  positions load failed: {e}", "warn")
 
 
-def _save_paper_positions() -> None:
+def _save_positions() -> None:
     with _positions_lock:
-        snap = dict(_open_paper_positions)
+        snap = dict(_open_positions)
     _atomic_write_json(POSITIONS_FILE, snap)
 
 
@@ -1363,7 +1486,6 @@ def record_candidate(opp: dict) -> None:
     the model's probability calibration against settled outcomes."""
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": "PAPER" if PAPER_MODE else "LIVE",
         "kind": "candidate",
         **{k: opp.get(k) for k in (
             "event_ticker", "market_ticker", "station", "series", "date_str",
@@ -1380,24 +1502,22 @@ def record_candidate(opp: dict) -> None:
     _append_jsonl(TRADES_FILE, record)
 
 
-def execute_opportunity(opp: dict) -> None:
-    """PAPER mode: log a hypothetical entry.
-    LIVE mode: enforce caps, place real Kalshi limit-buy at the ask, wait
-    up to ORDER_FILL_TIMEOUT_SEC for fill, cancel any unfilled remainder,
-    record actual fill_count + cost."""
+def execute_opportunity(opp: dict) -> bool:
+    """Enforce caps, place a real Kalshi limit-buy at the ask, wait up to
+    ORDER_FILL_TIMEOUT_SEC for fill via WS cache, cancel any unfilled
+    remainder, record actual fill_count + cost. Returns True on a real
+    entry, False if any gate blocked or no fill landed."""
     if opp.get("action") is None or opp.get("entry_price") is None:
-        return
+        return False
     edge = float(opp["edge"])
-    min_edge = MIN_EDGE_PAPER if PAPER_MODE else MIN_EDGE_LIVE
-    if edge < min_edge:
-        return
-    mode = "PAPER" if PAPER_MODE else "LIVE"
+    if edge < MIN_EDGE:
+        return False
     ticker = opp["market_ticker"]
 
     # Per-ticker dedupe — never double up on the same market.
     with _positions_lock:
-        if ticker in _open_paper_positions:
-            return
+        if ticker in _open_positions:
+            return False
 
     # Kelly sizing with MAX_BET_USD cap
     price = float(opp["entry_price"])
@@ -1406,94 +1526,69 @@ def execute_opportunity(opp: dict) -> None:
     count = max(1, int(bet_usd / price))
     intended_cost = count * price
 
-    # ─── LIVE path ─────────────────────────────────────────────────────
-    if not PAPER_MODE:
-        # Hard gates beyond MIN_EDGE_LIVE — each one prevents a class of model error.
-        # Order: cheapest-to-evaluate first.
-        if edge > MAX_EDGE_LIVE:
-            log(f"  [LIVE] skip {ticker}: edge {edge:.1%} > MAX_EDGE_LIVE {MAX_EDGE_LIVE:.0%} (model likely wrong)")
-            return
-        mp = float(opp.get("model_prob", 0.0))
-        if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-            log(f"  [LIVE] skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
-            return
-        disagreement = float(opp.get("disagreement", 0.0))
-        if disagreement > MAX_DISAGREEMENT_F_LIVE:
-            log(f"  [LIVE] skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F_LIVE:.1f}°F")
-            return
-        # Mu-vs-running_min sanity: pre-sunrise, if forecast μ disagrees with the
-        # observed lowest by >5°F, the forecast is plainly wrong — don't trade.
-        rm = opp.get("running_min")
-        if rm is not None and not opp.get("post_sunrise_lock"):
-            mu = float(opp.get("mu", 0.0))
-            if abs(mu - float(rm)) > MAX_MU_VS_RM_DIFF_F:
-                log(f"  [LIVE] skip {ticker}: μ={mu:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
-                return
-        # Spread filter on the side we'd actually be buying.
-        side = "yes" if opp["action"] == "BUY_YES" else "no"
-        if side == "yes":
-            ya = opp.get("yes_ask"); yb = opp.get("yes_bid")
-            spread = (ya - yb) if (ya is not None and yb is not None) else 0
-        else:
-            na = opp.get("no_ask"); nb = opp.get("no_bid")
-            spread = (na - nb) if (na is not None and nb is not None) else 0
-        if spread > MAX_SPREAD_CENTS_LIVE:
-            log(f"  [LIVE] skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS_LIVE}c")
-            return
-        # Per-cycle / daily / per-event budget.
-        ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""))
-        if not ok:
-            log(f"  [LIVE] skip {ticker}: {reason}")
-            return
-        price_cents = int(round(price * 100))
-        order_id = place_kalshi_order(ticker, side, count, price_cents)
-        if not order_id:
-            return
-        status, filled = wait_for_fill(order_id, count, ORDER_FILL_TIMEOUT_SEC)
-        if filled <= 0:
-            # Try to cancel any resting remainder; ignore errors.
-            try:
-                kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
-            except Exception:
-                pass
-            log(f"  [LIVE] no fill on {ticker} (status={status}); cancelled")
-            return
-        if filled < count:
-            try:
-                kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
-            except Exception:
-                pass
-            log(f"  [LIVE] partial fill {filled}/{count} on {ticker}; cancelled remainder")
-        actual_cost = filled * price
-        _budget_record(actual_cost, opp.get("event_ticker", ""))
-        record = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "mode": "LIVE", "kind": "entry",
-            "market_ticker": ticker, "action": opp["action"],
-            "entry_price": price, "count": filled, "cost": actual_cost,
-            "order_id": order_id,
-            "edge": edge, "model_prob": opp["model_prob"],
-            "mu": opp["mu"], "sigma": opp["sigma"], "mu_source": opp["mu_source"],
-            "running_min": opp["running_min"],
-            "floor": opp.get("floor"), "cap": opp.get("cap"),
-            "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
-        }
-        _append_jsonl(TRADES_FILE, record)
-        with _positions_lock:
-            _open_paper_positions[ticker] = record
-        _save_paper_positions()
-        log(f"  [LIVE] {opp['action']} {filled}x @ {price_cents}c on {ticker} "
-            f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
-            f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
-            f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
-        return
-
-    # ─── PAPER path ────────────────────────────────────────────────────
+    # Hard gates beyond MIN_EDGE — each one prevents a class of model error.
+    # Order: cheapest-to-evaluate first.
+    if edge > MAX_EDGE:
+        log(f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
+        return False
+    mp = float(opp.get("model_prob", 0.0))
+    if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
+        log(f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+        return False
+    disagreement = float(opp.get("disagreement", 0.0))
+    if disagreement > MAX_DISAGREEMENT_F:
+        log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
+        return False
+    # Mu-vs-running_min sanity: pre-sunrise, if forecast μ disagrees with the
+    # observed lowest by >5°F, the forecast is plainly wrong — don't trade.
+    rm = opp.get("running_min")
+    if rm is not None and not opp.get("post_sunrise_lock"):
+        mu = float(opp.get("mu", 0.0))
+        if abs(mu - float(rm)) > MAX_MU_VS_RM_DIFF_F:
+            log(f"  skip {ticker}: μ={mu:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+            return False
+    # Spread filter on the side we'd actually be buying.
+    side = "yes" if opp["action"] == "BUY_YES" else "no"
+    if side == "yes":
+        ya = opp.get("yes_ask"); yb = opp.get("yes_bid")
+        spread = (ya - yb) if (ya is not None and yb is not None) else 0
+    else:
+        na = opp.get("no_ask"); nb = opp.get("no_bid")
+        spread = (na - nb) if (na is not None and nb is not None) else 0
+    if spread > MAX_SPREAD_CENTS:
+        log(f"  skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS}c")
+        return False
+    # Per-cycle / daily / per-event budget.
+    ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""))
+    if not ok:
+        log(f"  skip {ticker}: {reason}")
+        return False
+    price_cents = int(round(price * 100))
+    order_id = place_kalshi_order(ticker, side, count, price_cents)
+    if not order_id:
+        return False
+    status, filled = wait_for_fill(order_id, count, ORDER_FILL_TIMEOUT_SEC)
+    if filled <= 0:
+        try:
+            kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+        except Exception:
+            pass
+        log(f"  no fill on {ticker} (status={status}); cancelled")
+        return False
+    if filled < count:
+        try:
+            kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+        except Exception:
+            pass
+        log(f"  partial fill {filled}/{count} on {ticker}; cancelled remainder")
+    actual_cost = filled * price
+    _budget_record(actual_cost, opp.get("event_ticker", ""))
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": mode, "kind": "entry",
+        "kind": "entry",
         "market_ticker": ticker, "action": opp["action"],
-        "entry_price": price, "count": count, "cost": intended_cost,
+        "entry_price": price, "count": filled, "cost": actual_cost,
+        "order_id": order_id,
         "edge": edge, "model_prob": opp["model_prob"],
         "mu": opp["mu"], "sigma": opp["sigma"], "mu_source": opp["mu_source"],
         "running_min": opp["running_min"],
@@ -1502,11 +1597,14 @@ def execute_opportunity(opp: dict) -> None:
     }
     _append_jsonl(TRADES_FILE, record)
     with _positions_lock:
-        _open_paper_positions[ticker] = record
-    _save_paper_positions()
-    log(f"  [{mode}] {opp['action']} {count}x @ {price*100:.0f}c on {ticker} "
+        _open_positions[ticker] = record
+    _save_positions()
+    log(f"  ENTRY {opp['action']} {filled}x @ {price_cents}c on {ticker} "
         f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
-        f"σ={opp['sigma']:.1f}°F rm={opp['running_min']}")
+        f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
+        f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
+    notify_discord_entry(record, opp)
+    return True
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1514,11 +1612,11 @@ def execute_opportunity(opp: dict) -> None:
 # ═══════════════════════════════════════════════════════════════════════
 
 def check_settlements() -> int:
-    """Walk open paper positions; for each, check if the settlement CLI low
-    has been published. If so, compute P&L and archive."""
+    """Walk open positions; for each, check if the settlement CLI low has
+    been published. If so, compute P&L and archive."""
     settled = 0
     with _positions_lock:
-        positions = dict(_open_paper_positions)
+        positions = dict(_open_positions)
     for ticker, pos in positions.items():
         station = pos.get("station")
         date_str = pos.get("date_str")
@@ -1545,7 +1643,6 @@ def check_settlements() -> int:
         pnl = revenue - cost
         settlement = {
             "ts": datetime.now(timezone.utc).isoformat(),
-            "mode": pos.get("mode"),
             "kind": "settlement",
             "market_ticker": ticker, "action": action,
             "entry_price": price, "count": count, "cost": cost,
@@ -1561,12 +1658,13 @@ def check_settlements() -> int:
         }
         _append_jsonl(SETTLEMENTS_FILE, settlement)
         with _positions_lock:
-            _open_paper_positions.pop(ticker, None)
+            _open_positions.pop(ticker, None)
         settled += 1
         log(f"  SETTLED {ticker} | action={action} CLI_low={cli_low}°F "
             f"in={in_bracket} won={our_win} pnl=${pnl:+.2f}")
+        notify_discord_settlement(ticker, action, cli_low, in_bracket, our_win, pnl)
     if settled:
-        _save_paper_positions()
+        _save_positions()
     return settled
 
 
@@ -1584,7 +1682,7 @@ def _sig_handler(sig, frame):
 
 def scan_cycle() -> dict:
     """One full scan: settlements, forecasts refresh (throttled),
-    market discovery, opp find, log candidates, paper-execute taken ones."""
+    market discovery, opp find, log candidates, execute taken ones."""
     _reset_cycle_budget()  # zero per-cycle counter; rolls daily exposure at UTC midnight
     stats = {"settled": 0, "markets": 0, "candidates": 0, "opps": 0, "taken": 0}
     stats["settled"] = check_settlements()
@@ -1647,17 +1745,15 @@ def scan_cycle() -> dict:
     for opp in opps:
         record_candidate(opp)
     # Execute the takeable ones
-    min_edge = MIN_EDGE_PAPER if PAPER_MODE else MIN_EDGE_LIVE
-    taken = [o for o in opps if o.get("edge", 0) >= min_edge]
+    taken = [o for o in opps if o.get("edge", 0) >= MIN_EDGE]
     stats["opps"] = sum(1 for o in opps if o.get("edge", 0) > 0)
     for opp in taken:
         ticker = opp["market_ticker"]
-        # Skip if we already hold
         with _positions_lock:
-            if ticker in _open_paper_positions:
+            if ticker in _open_positions:
                 continue
-        execute_opportunity(opp)
-        stats["taken"] += 1
+        if execute_opportunity(opp):
+            stats["taken"] += 1
     return stats
 
 
@@ -1665,24 +1761,23 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
     log("=" * 60)
-    log(f"paper_min_bot starting (PAPER_MODE={PAPER_MODE} WALLET={WALLET})")
+    log(f"min_bot starting (WALLET={WALLET})")
     log(f"  cities: {len(CITIES)}")
     log(f"  obs DB: {OBS_DB_PATH}")
     log(f"  data dir: {DATA_DIR}")
-    if not PAPER_MODE:
-        log(f"  LIVE caps: max_bet=${MAX_BET_USD:.2f} per_cycle={MAX_NEW_POSITIONS_PER_CYCLE} "
-            f"daily_exposure=${DAILY_EXPOSURE_CAP_USD:.2f} min_edge={MIN_EDGE_LIVE:.0%}")
+    log(f"  caps: max_bet=${MAX_BET_USD:.2f} per_cycle={MAX_NEW_POSITIONS_PER_CYCLE} "
+        f"daily_exposure=${DAILY_EXPOSURE_CAP_USD:.2f} min_edge={MIN_EDGE:.0%}")
     log("=" * 60)
     _load_kalshi_auth()
-    if not PAPER_MODE:
-        bal = get_kalshi_balance()
-        if bal is None:
-            log("  WARNING: balance fetch failed at startup — proceeding anyway", "warn")
-        else:
-            log(f"  Kalshi balance: ${bal:.2f}")
-            if bal < BANKROLL_FLOOR_USD:
-                raise RuntimeError(f"Balance ${bal:.2f} < floor ${BANKROLL_FLOOR_USD:.2f}; aborting")
-    _load_paper_positions()
+    _start_discord_worker()
+    bal = get_kalshi_balance()
+    if bal is None:
+        log("  WARNING: balance fetch failed at startup — proceeding anyway", "warn")
+    else:
+        log(f"  Kalshi balance: ${bal:.2f}")
+        if bal < BANKROLL_FLOOR_USD:
+            raise RuntimeError(f"Balance ${bal:.2f} < floor ${BANKROLL_FLOOR_USD:.2f}; aborting")
+    _load_positions()
     _load_nbp_cache_from_disk()
     # Initial forecast fetches before first scan
     try:
@@ -1716,8 +1811,8 @@ def main() -> None:
 
         if time.time() - last_heartbeat > LOG_HEARTBEAT_SEC:
             with _positions_lock:
-                n_open = len(_open_paper_positions)
-            log(f"HEARTBEAT open_positions={n_open} mode={'PAPER' if PAPER_MODE else 'LIVE'}")
+                n_open = len(_open_positions)
+            log(f"HEARTBEAT open_positions={n_open}")
             last_heartbeat = time.time()
 
         # Faster scan during pre-dawn window (any city could be near its low)
@@ -1732,7 +1827,7 @@ def main() -> None:
         # Sleep but wake on shutdown
         _shutdown.wait(interval)
 
-    log("paper_min_bot exited cleanly")
+    log("min_bot exited cleanly")
 
 
 if __name__ == "__main__":
