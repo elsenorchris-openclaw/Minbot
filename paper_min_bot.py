@@ -1449,6 +1449,33 @@ def _set_insufficient_balance_cooldown() -> None:
     log(f"  insufficient_balance cooldown set for {INSUFFICIENT_BALANCE_COOLDOWN_SEC:.0f}s", "warn")
 
 
+def _compute_today_exposure() -> float:
+    """Sum of cost field over all 'entry' records in TRADES_FILE whose UTC
+    date matches today. Survives bot restarts: the daily cap is enforced
+    against actual on-disk spend, not just in-process state. Without this,
+    every restart resets _today_exposure_usd to $0 and the bot can spend
+    the full DAILY_EXPOSURE_CAP_USD again."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    total = 0.0
+    if not TRADES_FILE.exists():
+        return total
+    try:
+        with open(TRADES_FILE) as f:
+            for line in f:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                if rec.get("kind") != "entry":
+                    continue
+                if not rec.get("ts", "").startswith(today):
+                    continue
+                total += float(rec.get("cost", 0.0))
+    except Exception as e:
+        log(f"  today-exposure compute failed: {e}", "warn")
+    return total
+
+
 def _load_positions() -> None:
     """Load positions.json, dropping any whose climate day is more than
     POSITION_TTL_DAYS in the past. Defends against orphaned positions that
@@ -1791,6 +1818,12 @@ def main() -> None:
     log("=" * 60)
     _load_kalshi_auth()
     _start_discord_worker()
+    # Restore today's daily exposure from disk so DAILY_EXPOSURE_CAP_USD
+    # survives bot restarts. Resets only when UTC date rolls over.
+    global _today_date_utc, _today_exposure_usd
+    _today_date_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    _today_exposure_usd = _compute_today_exposure()
+    log(f"  today's exposure (from trades.jsonl): ${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
     bal = get_kalshi_balance()
     if bal is None:
         log("  WARNING: balance fetch failed at startup — proceeding anyway", "warn")

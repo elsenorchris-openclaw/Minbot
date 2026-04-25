@@ -11,6 +11,7 @@ tested via live runs.
 """
 from __future__ import annotations
 
+import json
 import os
 import sys
 import tempfile
@@ -410,6 +411,43 @@ class TestSettleKeepsDedupe(unittest.TestCase):
         self.assertEqual(pb._open_positions[ticker].get("cli_low"), 51)
         # NYC-T48 cap=47.5, cli=51 → not in bracket → BUY_NO won
         self.assertTrue(pb._open_positions[ticker].get("won"))
+
+
+class TestDailyExposurePersistence(unittest.TestCase):
+    """DAILY_EXPOSURE_CAP_USD must survive bot restarts: compute today's
+    spend from trades.jsonl on startup."""
+
+    def setUp(self):
+        self._tmp_trades = Path(_TMPDIR) / "test_trades.jsonl"
+        if self._tmp_trades.exists():
+            self._tmp_trades.unlink()
+        self._orig_trades_file = pb.TRADES_FILE
+        pb.TRADES_FILE = self._tmp_trades
+
+    def tearDown(self):
+        pb.TRADES_FILE = self._orig_trades_file
+
+    def _write(self, records):
+        with open(self._tmp_trades, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def test_returns_zero_when_no_file(self):
+        if self._tmp_trades.exists():
+            self._tmp_trades.unlink()
+        self.assertEqual(pb._compute_today_exposure(), 0.0)
+
+    def test_sums_only_today_entries(self):
+        from datetime import datetime, timezone, timedelta
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+        self._write([
+            {"ts": f"{today}T00:00:00+00:00", "kind": "entry", "cost": 0.50},
+            {"ts": f"{today}T01:00:00+00:00", "kind": "entry", "cost": 0.75},
+            {"ts": f"{yesterday}T23:00:00+00:00", "kind": "entry", "cost": 1.00},  # excluded
+            {"ts": f"{today}T02:00:00+00:00", "kind": "candidate", "cost": 0.25},  # excluded
+        ])
+        self.assertAlmostEqual(pb._compute_today_exposure(), 1.25, places=2)
 
 
 if __name__ == "__main__":
