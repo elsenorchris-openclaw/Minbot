@@ -1308,7 +1308,13 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         # Running min (only meaningful for today)
         rm = get_running_min(station, today_cd) if is_today else None
         # Post-sunrise lock
-        post_sr = is_today and _is_post_sunrise(tz) and rm is not None
+        # 2026-04-25: post_sunrise_lock DISABLED. The "low locks at sunrise"
+        # heuristic is empirically too tight — Apr 25 V1 positions had market
+        # prices nowhere near 99/1 at mid-morning, proving the daily low can
+        # still drop later in the climate day (cold-front passage, late-evening
+        # radiative cooling, post-frontal drop). Keep full NBP σ all day; the
+        # running_min+1°F truncation is the safety net (low can only go down).
+        post_sr = False
         model_prob = calc_bracket_probability_min(
             mu=mu, sigma=sigma,
             floor=m.get("floor"), cap=m.get("cap"),
