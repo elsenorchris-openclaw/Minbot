@@ -3,10 +3,10 @@
 Trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20 cities as
 V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-**Live since 2026-04-25 on the V2 Kalshi wallet** (key `7224fdb1...`,
-PEM `obs-pipeline-bot/kalshi_key_v2_account2.pem`). `PAPER_MODE=False`.
-Conservative live caps: $1 per entry, 3 entries per cycle, $20 daily exposure,
-20% min edge. Flip back with `PAPER_MODE=True`.
+**Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
+`KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
+`PAPER_MODE=False`. Conservative live caps: $1 per entry, 3 entries per cycle,
+$20 daily exposure, 20% min edge. Flip back with `PAPER_MODE=True`.
 
 ## Architecture
 
@@ -89,12 +89,25 @@ without maker-remainder / paused-cooldown logic.
 - `DAILY_EXPOSURE_CAP_USD = 20.00` — sum of fill costs since UTC midnight.
 - `MIN_EDGE_LIVE = 0.20` — bumped from 0.15 to skip the marginal 78c BUY_NO
   entries the model overproduces.
-- `BANKROLL_FLOOR_USD = 5.00` — startup refuses to run if V2 balance drops
-  below this.
+- `BANKROLL_FLOOR_USD = 5.00` — startup refuses to run if portfolio balance
+  drops below this.
 
-**Wallet selection.** `WALLET = "v2"` (default) loads
-`obs-pipeline-bot/kalshi_key_v2_account2.pem` and the hard-coded V2 key id.
-Set `WALLET = "v1"` to fall back to `~/.env` + `~/kalshi_key.pem`.
+**Wallet selection.** `WALLET = "v1"` (default) loads `~/.env` `KALSHI_KEY_ID`
+and `~/kalshi_key.pem`. Set `WALLET = "v2"` for the obs-pipeline-bot's
+secondary account.
+
+**Skip-if-resolved guard (2026-04-25).** `find_opportunities` skips any
+market whose `(station, climate-day)` pair already has a CLI low recorded
+in obs-pipeline. Prevents the post-CLI / pre-Kalshi-close window where the
+market is still tradeable but the answer is decided. Also skips any market
+whose climate day is already strictly in the past for the city's TZ.
+
+**+1°F obs-vs-CLI buffer (2026-04-25).** `running_min` (5-min ASOS samples)
+and Kalshi's settlement CLI (2-min averages, integer-rounded) can differ by
+~1°F. Mirrors the V1/V2 max-bot fix. In `calc_bracket_probability_min`:
+running_min is treated as `running_min + 1.0` for the truncation upper
+bound and the "bracket impossible" guard, and the post-sunrise lock uses
+σ=1.0°F (was 0.5°F).
 
 **Order flow.**
 1. `discover_markets()` returns quoted markets (REST) with WS BBO overlay.

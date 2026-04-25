@@ -59,11 +59,10 @@ import kalshi_ws  # WebSocket BBO client (V2 pattern, ported 2026-04-24)
 PAPER_MODE = False                # 2026-04-25: live cutover with V2 wallet + caps
 
 # Wallet selection. "v1" → ~/.env KALSHI_KEY_ID + ~/kalshi_key.pem (account 1).
-# "v2" → KALSHI_KEY_ID_V2 + obs-pipeline-bot/kalshi_key_v2_account2.pem
-# (account 2; sister to obs-pipeline-bot bot v2). Paper bot lives on V2 so its
-# orders share an account with the existing live V2 bot, simplifying balance
-# accounting.
-WALLET = "v2"
+# "v2" → _KALSHI_KEY_ID_V2 const + obs-pipeline-bot/kalshi_key_v2_account2.pem
+# Paper-min-bot trades KXLOWT* — distinct from V1's KXHIGH* — so wallet sharing
+# is fine. (Switched 2026-04-25 from v2→v1.)
+WALLET = "v1"
 
 # Path to the obs-pipeline sqlite DB (read-only queries for running_min).
 OBS_DB_PATH = "/home/ubuntu/obs-pipeline/data/obs.sqlite"
@@ -129,7 +128,7 @@ MIN_BET_USD = 0.50
 # ─── Live-mode safety caps (only enforced when PAPER_MODE=False) ─────────
 # Hard ceilings that gate execute_opportunity *before* place_order is called.
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # first cycle paper-mode took 55; cap live exposure
-DAILY_EXPOSURE_CAP_USD = 20.00      # sum of entry costs since UTC midnight
+DAILY_EXPOSURE_CAP_USD = 4.00       # 2026-04-25: V1 wallet ~$7 — keep cap < balance - floor
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
@@ -809,10 +808,12 @@ def calc_bracket_probability_min(
     # Post-sunrise: collapse forecast to the observed running_min with tight
     # residual noise. Skip the truncation conditioning below — the Gaussian
     # centered on rm already captures the remaining uncertainty (ASOS vs CLI
-    # sampling / rounding differences).
+    # sampling / rounding differences). Sigma 1.0°F (was 0.5) gives us a
+    # ±1°F obs-vs-CLI window — a 5-min ASOS reading and the CLI 2-min low can
+    # disagree by that much, even post-sunrise.
     if post_sunrise_lock and running_min is not None:
         mu = running_min
-        sigma = 0.5
+        sigma = 1.0
         lo_z = ((floor - mu) / sigma) if floor is not None else None
         hi_z = ((cap - mu) / sigma) if cap is not None else None
         p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
@@ -821,11 +822,18 @@ def calc_bracket_probability_min(
 
     # Pre-sunrise with running_min: apply truncation AND renormalize.
     # The posterior P(X in [floor, cap] | X ≤ rm) = P(X in [floor, min(cap,rm)]) / P(X ≤ rm)
+    #
+    # +1°F buffer (2026-04-25, mirrors V1/V2 max-bot fix): obs (5-min METAR)
+    # and Kalshi-settlement CLI (2-min averages, integer-rounded) can disagree
+    # by up to ~1°F. Treat running_min as `running_min + 1.0` in the
+    # "bracket impossible" guard so a bracket cap just barely above our obs
+    # isn't ruled out — its true CLI low could still land inside.
     if running_min is not None:
-        if floor is not None and floor > running_min:
-            return 0.0  # bracket entirely above rm — impossible
-        effective_cap = cap if (cap is None or running_min >= cap) else running_min
-        norm_z = (running_min - mu) / sigma
+        rm_buffered = running_min + 1.0
+        if floor is not None and floor > rm_buffered:
+            return 0.0  # bracket entirely above rm even after +1°F buffer — impossible
+        effective_cap = cap if (cap is None or rm_buffered >= cap) else rm_buffered
+        norm_z = (rm_buffered - mu) / sigma
         norm_denom = _gauss_cdf(norm_z)
         if norm_denom <= 0:
             return 0.0
@@ -1113,9 +1121,22 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         station = m["station"]
         date_str = m["date_str"]
         tz = m["tz"]
+        # OBS WINNER LOCK (2026-04-25): if obs-pipeline already has CLI low
+        # for this (station, climate-day), settlement is decided. Kalshi may
+        # still show the market open in the post-CLI / pre-Kalshi-close window,
+        # but our model has no edge — we'd just be buying losers (or wins
+        # already priced in). Skip outright.
+        if get_cli_low(station, date_str) is not None:
+            continue
         # Determine if this is today's or tomorrow's CD from obs-pipeline's POV
         today_cd = _climate_date_nws(tz)
         is_today = (date_str == today_cd)
+        # Past-date guard: if Kalshi still shows yesterday's market open and
+        # CLI hasn't published yet, we still shouldn't trade — the answer is
+        # known but our obs-pipeline lags. _climate_date_nws is per-TZ, so
+        # date_str < today_cd really does mean "yesterday or earlier."
+        if date_str < today_cd:
+            continue
         # Fetch ALL available forecasts so we can log disagreement + blend.
         nbp = get_nbp_forecast(m["series"], date_str)
         nbm = get_nbm_om_min(m["series"], date_str)

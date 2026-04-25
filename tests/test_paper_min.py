@@ -124,14 +124,17 @@ class TestBracketProbability(unittest.TestCase):
         self.assertAlmostEqual(p_rm, p_no_rm, places=3)
 
     def test_post_sunrise_lock_collapses_to_rm(self):
-        # Post-sunrise + rm=62 — we're essentially certain the min was 62±0.5.
-        # A bracket encompassing 62 should resolve near 100%; one far away
-        # should be near 0%.
+        # Post-sunrise + rm=62 — sigma collapsed to 1.0°F to reflect ASOS-vs-CLI
+        # ±1°F uncertainty (was 0.5°F before 2026-04-25 buffer fix). A bracket
+        # straddling 62 should still take the bulk of probability; one far away
+        # should be ~0%.
         p_hit = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
                                                  floor=61.5, cap=62.5,
                                                  running_min=62.0,
                                                  post_sunrise_lock=True)
-        self.assertGreater(p_hit, 0.60)
+        # sigma=1.0, bracket ±0.5 from rm: P ≈ Φ(0.5)-Φ(-0.5) ≈ 0.38
+        self.assertGreater(p_hit, 0.30)
+        self.assertLess(p_hit, 0.50)
         p_miss = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
                                                   floor=68.0, cap=69.0,
                                                   running_min=62.0,
@@ -243,8 +246,8 @@ class TestWalletConfig(unittest.TestCase):
         self.assertEqual(pb._KALSHI_KEY_ID_V2,
                          "7224fdb1-f5c9-4dc5-a1ce-b85013ad34d1")
 
-    def test_wallet_default_is_v2(self):
-        self.assertEqual(pb.WALLET, "v2")
+    def test_wallet_default_is_v1(self):
+        self.assertEqual(pb.WALLET, "v1")
 
     def test_live_config_caps_are_conservative(self):
         # Sanity: don't accidentally ship with $1000 caps.
@@ -252,6 +255,40 @@ class TestWalletConfig(unittest.TestCase):
         self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 25.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE_LIVE, 0.20)
+
+
+class TestObsCliBuffer(unittest.TestCase):
+    """+1°F obs-vs-CLI buffer in calc_bracket_probability_min."""
+
+    def test_running_min_just_above_cap_does_not_zero_probability(self):
+        # Bracket [68,69], running_min=69.8 (0.8°F above cap).
+        # Without the buffer, "bracket entirely above rm" zeros it out.
+        # With +1°F buffer the bracket is treated as still possible.
+        p = pb.calc_bracket_probability_min(
+            mu=67.1, sigma=2.5, floor=68.0, cap=69.0, running_min=69.8,
+        )
+        self.assertGreater(p, 0.0,
+            "running_min=69.8 vs cap=69.0 should leave nonzero P (CLI may round to 69)")
+
+    def test_running_min_well_above_cap_still_zero(self):
+        # 3°F above cap is well outside the +1°F buffer — still impossible.
+        p = pb.calc_bracket_probability_min(
+            mu=67.1, sigma=2.5, floor=70.0, cap=71.0, running_min=68.0,
+        )
+        self.assertEqual(p, 0.0,
+            "floor=70 vs running_min=68 (and +1 buffer=69) should be impossible")
+
+    def test_post_sunrise_sigma_widened_to_1F(self):
+        # With running_min=70, bracket [68,69], post_sunrise_lock=True.
+        # Sigma=1.0 (vs old 0.5) gives more probability mass within ±1°F.
+        p = pb.calc_bracket_probability_min(
+            mu=70.0, sigma=2.5,
+            floor=68.0, cap=69.0,
+            running_min=70.0, post_sunrise_lock=True,
+        )
+        # P(X in [68,69] | X ~ N(70, 1.0)) ≈ Φ(-1) - Φ(-2) ≈ 0.1587 - 0.0228 ≈ 0.136
+        self.assertGreater(p, 0.10)
+        self.assertLess(p, 0.25)
 
 
 if __name__ == "__main__":
