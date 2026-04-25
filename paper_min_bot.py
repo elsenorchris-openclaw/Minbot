@@ -1618,6 +1618,12 @@ def check_settlements() -> int:
     with _positions_lock:
         positions = dict(_open_positions)
     for ticker, pos in positions.items():
+        # Skip positions already marked settled. dedupe-survives-settle (commit
+        # bca506e) keeps them in _open_positions for re-entry blocking; without
+        # this guard the loop re-processes them every cycle, double-writing
+        # settlement records and spamming Discord.
+        if pos.get("settled"):
+            continue
         station = pos.get("station")
         date_str = pos.get("date_str")
         if not station or not date_str:

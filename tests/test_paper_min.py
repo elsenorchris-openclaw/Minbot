@@ -359,6 +359,29 @@ class TestSettleKeepsDedupe(unittest.TestCase):
         with pb._positions_lock:
             pb._open_positions.clear()
 
+    def test_already_settled_position_is_not_reprocessed(self):
+        """check_settlements must skip positions already marked settled.
+        Without this, every cycle re-writes settlement records + spams Discord."""
+        ticker = "KXLOWTNYC-26APR24-T48"
+        pb._open_positions[ticker] = {
+            "market_ticker": ticker, "action": "BUY_NO",
+            "entry_price": 0.07, "count": 10,
+            "station": "KNYC", "date_str": "2026-04-24",
+            "floor": None, "cap": 47.5,
+            "running_min": 51.0, "label": "NYC",
+            "settled": True, "cli_low": 51, "won": True, "pnl": 9.30,
+        }
+        original_get_cli = pb.get_cli_low
+        original_settlements_file = pb.SETTLEMENTS_FILE
+        try:
+            pb.get_cli_low = lambda station, date_str: 51
+            pb.SETTLEMENTS_FILE = Path(_TMPDIR) / "test_settlements_2.jsonl"
+            n = pb.check_settlements()
+        finally:
+            pb.get_cli_low = original_get_cli
+            pb.SETTLEMENTS_FILE = original_settlements_file
+        self.assertEqual(n, 0, "already-settled positions must not be reprocessed")
+
     def test_settled_ticker_stays_in_open_positions(self):
         ticker = "KXLOWTNYC-26APR24-T48"
         pb._open_positions[ticker] = {
