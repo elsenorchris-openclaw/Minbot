@@ -349,5 +349,45 @@ class TestLiveSafetyConstants(unittest.TestCase):
         self.assertEqual(pb.MAX_NEW_PER_EVENT_PER_CYCLE, 1)
 
 
+class TestSettleKeepsDedupe(unittest.TestCase):
+    """check_settlements must keep settled tickers in _open_positions so the
+    per-ticker dedupe still blocks re-entry. Otherwise the cascade bug
+    (50 orders, $21 lost on V2 wallet 04:09–04:26 UTC) recurs."""
+
+    def setUp(self):
+        # Fresh state per test
+        with pb._positions_lock:
+            pb._open_positions.clear()
+
+    def test_settled_ticker_stays_in_open_positions(self):
+        ticker = "KXLOWTNYC-26APR24-T48"
+        pb._open_positions[ticker] = {
+            "market_ticker": ticker, "action": "BUY_NO",
+            "entry_price": 0.07, "count": 10,
+            "station": "KNYC", "date_str": "2026-04-24",
+            "floor": None, "cap": 47.5,
+            "model_prob": 0.05, "mu": 50.0, "sigma": 2.5, "mu_source": "nbp",
+            "running_min": 51.0, "label": "NYC",
+        }
+
+        # Stub get_cli_low + dirs/files so check_settlements has somewhere to write
+        original_get_cli = pb.get_cli_low
+        original_settlements_file = pb.SETTLEMENTS_FILE
+        try:
+            pb.get_cli_low = lambda station, date_str: 51 if (station, date_str) == ("KNYC", "2026-04-24") else None
+            pb.SETTLEMENTS_FILE = Path(_TMPDIR) / "test_settlements.jsonl"
+            n = pb.check_settlements()
+        finally:
+            pb.get_cli_low = original_get_cli
+            pb.SETTLEMENTS_FILE = original_settlements_file
+
+        self.assertEqual(n, 1)
+        self.assertIn(ticker, pb._open_positions, "settled ticker must still be tracked for dedupe")
+        self.assertTrue(pb._open_positions[ticker].get("settled"))
+        self.assertEqual(pb._open_positions[ticker].get("cli_low"), 51)
+        # NYC-T48 cap=47.5, cli=51 → not in bracket → BUY_NO won
+        self.assertTrue(pb._open_positions[ticker].get("won"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

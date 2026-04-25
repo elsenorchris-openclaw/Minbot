@@ -1657,8 +1657,23 @@ def check_settlements() -> int:
             "label": pos.get("label"),
         }
         _append_jsonl(SETTLEMENTS_FILE, settlement)
+        # Don't pop — keep the record in _open_positions tagged as settled so
+        # the per-ticker dedupe (in scan_cycle and execute_opportunity) still
+        # blocks re-entry. Without this, the cascade bug (~50 V2-wallet orders
+        # on 04:09–04:26 UTC, $21 lost) recurs whenever the local CLI lands
+        # before Kalshi closes the market. POSITION_TTL_DAYS prunes on next
+        # restart so this can't grow unbounded.
         with _positions_lock:
-            _open_positions.pop(ticker, None)
+            existing = _open_positions.get(ticker)
+            if existing is not None:
+                existing.update({
+                    "settled": True,
+                    "settled_ts": settlement["ts"],
+                    "cli_low": cli_low,
+                    "in_bracket": in_bracket,
+                    "won": our_win,
+                    "pnl": pnl,
+                })
         settled += 1
         log(f"  SETTLED {ticker} | action={action} CLI_low={cli_low}°F "
             f"in={in_bracket} won={our_win} pnl=${pnl:+.2f}")
