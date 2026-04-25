@@ -91,6 +91,26 @@ without maker-remainder / paused-cooldown logic.
   entries the model overproduces.
 - `BANKROLL_FLOOR_USD = 5.00` — startup refuses to run if portfolio balance
   drops below this.
+- `MAX_EDGE_LIVE = 0.40` — skip if computed edge exceeds 40% (mirrors V1
+  trust zone; high edges almost always indicate model error).
+- `MIN_MODEL_PROB = 0.15` / `MAX_MODEL_PROB = 0.85` — gate at execute time,
+  not just record time. Skip wildly unlikely or near-certain trades.
+- `MAX_DISAGREEMENT_F_LIVE = 5.0` — skip if HRRR vs NBP / NBP vs NBM-OM
+  forecasts diverge by more than this; sigma inflation alone (capped at 1.5×)
+  doesn't cover that uncertainty.
+- `MAX_SPREAD_CENTS_LIVE = 10` — skip if (ask − bid) on the buying side
+  exceeds 10c; thin liquidity = bad fills.
+- `MAX_MU_VS_RM_DIFF_F = 5.0` — pre-sunrise sanity gate. If forecast μ
+  disagrees with the observed running_min by >5°F, the forecast is wrong
+  by definition.
+- `MAX_NEW_PER_EVENT_PER_CYCLE = 1` — don't pile correlated bracket bets
+  in the same city's event. V1 NO-CASCADE pattern.
+
+**Cooldowns (V2 H-2 fix port).** A 409 `trading_is_paused` from Kalshi arms a
+60-second per-ticker cooldown so we don't retry-storm; a 400
+`insufficient_balance` arms a 5-minute account-wide cooldown so we don't
+hammer the API with no-op orders. V1 logged 11k retries in one day before
+this fix.
 
 **Wallet selection.** `WALLET = "v1"` (default) loads `~/.env` `KALSHI_KEY_ID`
 and `~/kalshi_key.pem`. Set `WALLET = "v2"` for the obs-pipeline-bot's

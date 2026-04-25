@@ -115,10 +115,21 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 # Opportunity filters (paper mode logs everything; these gate what gets flagged in Discord)
 MIN_EDGE_PAPER = 0.10               # log ALL, but tag 'TAKEABLE' when >=10% edge
 MIN_EDGE_LIVE = 0.20                # live mode: 20% edge (raised from 0.15 at live cutover)
+MAX_EDGE_LIVE = 0.40                # mirror V1 trust zone: edges above this almost always come
+                                    # from model error (forecast vs market disagree wildly)
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
 MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
+
+# Live-mode safety gates (HIGH-impact: prevent the patterns that lost money on
+# the 04:09 UTC live cycle and that V1/V2 had to fix in production).
+MAX_DISAGREEMENT_F_LIVE = 5.0       # skip if HRRR vs NBP / NBP vs NBM disagree > this
+MAX_SPREAD_CENTS_LIVE = 10          # skip if (yes_ask − yes_bid) > 10c on the active side
+MAX_MU_VS_RM_DIFF_F = 5.0           # pre-sunrise sanity: skip if forecast μ disagrees with
+                                    # observed running_min by more than this — model is wrong
+MAX_NEW_PER_EVENT_PER_CYCLE = 1     # don't pile on multiple brackets of the same event
+                                    # (correlated bets — if forecast is wrong all lose)
 
 # Live-mode Kelly sizing (only used when PAPER_MODE=False)
 MAX_BET_USD = 1.00                  # 2026-04-25 live cutover: $1 cap per entry
@@ -302,8 +313,12 @@ def get_kalshi_balance() -> Optional[float]:
 def place_kalshi_order(ticker: str, side: str, count: int,
                        price_cents: int) -> Optional[str]:
     """Place a limit BUY at price_cents. Returns order_id or None on failure.
-    Mirrors V2's place_order without maker-remainder / paused-cooldown logic
-    (paper bot's small scale doesn't justify them yet)."""
+    Ports V2's 409-trading_paused + 400-insufficient_balance cooldown handling
+    (V2 H-2 fix 2026-04-16; without it V1 logged 11k retries in one day)."""
+    if _in_paused_cooldown(ticker):
+        return None
+    if _in_insufficient_balance_cooldown():
+        return None
     body = {
         "ticker": ticker, "action": "buy", "side": side,
         "type": "limit", "count": count,
@@ -320,6 +335,11 @@ def place_kalshi_order(ticker: str, side: str, count: int,
         log(f"  ORDER buy {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
         return oid
     except Exception as e:
+        emsg = str(e).lower()
+        if "409" in str(e) or "trading is paused" in emsg or "trading_is_paused" in emsg:
+            _set_paused_cooldown(ticker)
+        elif "insufficient_balance" in emsg or "insufficient balance" in emsg:
+            _set_insufficient_balance_cooldown()
         log(f"  ORDER FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
         return None
 
@@ -1254,34 +1274,70 @@ _cycle_budget_lock = threading.Lock()
 _cycle_new_count = 0                          # reset each cycle
 _today_exposure_usd = 0.0                     # cost of today's entries
 _today_date_utc: str = ""                     # tracks UTC midnight rollover
+_cycle_event_counts: dict[str, int] = {}      # event_ticker → entries this cycle
+
+# Per-ticker cooldowns ported from V2 (H-2 fix 2026-04-16): if Kalshi 409s a
+# market with "trading_is_paused", or 400s the account with insufficient_balance,
+# stop hammering it for a window. Without this V1 had an 11k retry storm.
+_cooldown_lock = threading.Lock()
+_paused_tickers: dict[str, float] = {}        # ticker → unix-time when cooldown ends
+_insufficient_balance_until: float = 0.0      # account-wide; 0 = no cooldown
+PAUSED_COOLDOWN_SEC = 60.0
+INSUFFICIENT_BALANCE_COOLDOWN_SEC = 300.0     # 5 min, since the bankroll is small
 
 
 def _reset_cycle_budget() -> None:
     """Called at the top of scan_cycle()."""
-    global _cycle_new_count, _today_exposure_usd, _today_date_utc
+    global _cycle_new_count, _today_exposure_usd, _today_date_utc, _cycle_event_counts
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with _cycle_budget_lock:
         _cycle_new_count = 0
+        _cycle_event_counts = {}
         if today != _today_date_utc:
             _today_date_utc = today
             _today_exposure_usd = 0.0
 
 
-def _budget_can_take(cost_usd: float) -> tuple[bool, str]:
+def _budget_can_take(cost_usd: float, event_ticker: str = "") -> tuple[bool, str]:
     """Check live-mode caps. Returns (ok, reason_if_blocked)."""
     with _cycle_budget_lock:
         if _cycle_new_count >= MAX_NEW_POSITIONS_PER_CYCLE:
             return False, f"cycle_cap({_cycle_new_count}/{MAX_NEW_POSITIONS_PER_CYCLE})"
         if _today_exposure_usd + cost_usd > DAILY_EXPOSURE_CAP_USD:
             return False, f"daily_cap(${_today_exposure_usd:.2f}+${cost_usd:.2f}>${DAILY_EXPOSURE_CAP_USD:.2f})"
+        if event_ticker and _cycle_event_counts.get(event_ticker, 0) >= MAX_NEW_PER_EVENT_PER_CYCLE:
+            return False, f"event_cap({event_ticker})"
     return True, ""
 
 
-def _budget_record(cost_usd: float) -> None:
+def _budget_record(cost_usd: float, event_ticker: str = "") -> None:
     global _cycle_new_count, _today_exposure_usd
     with _cycle_budget_lock:
         _cycle_new_count += 1
         _today_exposure_usd += cost_usd
+        if event_ticker:
+            _cycle_event_counts[event_ticker] = _cycle_event_counts.get(event_ticker, 0) + 1
+
+
+def _in_paused_cooldown(ticker: str) -> bool:
+    with _cooldown_lock:
+        until = _paused_tickers.get(ticker, 0.0)
+    return time.time() < until
+
+
+def _set_paused_cooldown(ticker: str) -> None:
+    with _cooldown_lock:
+        _paused_tickers[ticker] = time.time() + PAUSED_COOLDOWN_SEC
+
+
+def _in_insufficient_balance_cooldown() -> bool:
+    return time.time() < _insufficient_balance_until
+
+
+def _set_insufficient_balance_cooldown() -> None:
+    global _insufficient_balance_until
+    _insufficient_balance_until = time.time() + INSUFFICIENT_BALANCE_COOLDOWN_SEC
+    log(f"  insufficient_balance cooldown set for {INSUFFICIENT_BALANCE_COOLDOWN_SEC:.0f}s", "warn")
 
 
 def _load_paper_positions() -> None:
@@ -1352,11 +1408,43 @@ def execute_opportunity(opp: dict) -> None:
 
     # ─── LIVE path ─────────────────────────────────────────────────────
     if not PAPER_MODE:
-        ok, reason = _budget_can_take(intended_cost)
+        # Hard gates beyond MIN_EDGE_LIVE — each one prevents a class of model error.
+        # Order: cheapest-to-evaluate first.
+        if edge > MAX_EDGE_LIVE:
+            log(f"  [LIVE] skip {ticker}: edge {edge:.1%} > MAX_EDGE_LIVE {MAX_EDGE_LIVE:.0%} (model likely wrong)")
+            return
+        mp = float(opp.get("model_prob", 0.0))
+        if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
+            log(f"  [LIVE] skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+            return
+        disagreement = float(opp.get("disagreement", 0.0))
+        if disagreement > MAX_DISAGREEMENT_F_LIVE:
+            log(f"  [LIVE] skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F_LIVE:.1f}°F")
+            return
+        # Mu-vs-running_min sanity: pre-sunrise, if forecast μ disagrees with the
+        # observed lowest by >5°F, the forecast is plainly wrong — don't trade.
+        rm = opp.get("running_min")
+        if rm is not None and not opp.get("post_sunrise_lock"):
+            mu = float(opp.get("mu", 0.0))
+            if abs(mu - float(rm)) > MAX_MU_VS_RM_DIFF_F:
+                log(f"  [LIVE] skip {ticker}: μ={mu:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+                return
+        # Spread filter on the side we'd actually be buying.
+        side = "yes" if opp["action"] == "BUY_YES" else "no"
+        if side == "yes":
+            ya = opp.get("yes_ask"); yb = opp.get("yes_bid")
+            spread = (ya - yb) if (ya is not None and yb is not None) else 0
+        else:
+            na = opp.get("no_ask"); nb = opp.get("no_bid")
+            spread = (na - nb) if (na is not None and nb is not None) else 0
+        if spread > MAX_SPREAD_CENTS_LIVE:
+            log(f"  [LIVE] skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS_LIVE}c")
+            return
+        # Per-cycle / daily / per-event budget.
+        ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""))
         if not ok:
             log(f"  [LIVE] skip {ticker}: {reason}")
             return
-        side = "yes" if opp["action"] == "BUY_YES" else "no"
         price_cents = int(round(price * 100))
         order_id = place_kalshi_order(ticker, side, count, price_cents)
         if not order_id:
@@ -1377,7 +1465,7 @@ def execute_opportunity(opp: dict) -> None:
                 pass
             log(f"  [LIVE] partial fill {filled}/{count} on {ticker}; cancelled remainder")
         actual_cost = filled * price
-        _budget_record(actual_cost)
+        _budget_record(actual_cost, opp.get("event_ticker", ""))
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "mode": "LIVE", "kind": "entry",

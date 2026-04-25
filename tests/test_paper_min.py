@@ -291,5 +291,63 @@ class TestObsCliBuffer(unittest.TestCase):
         self.assertLess(p, 0.25)
 
 
+class TestPerEventCascade(unittest.TestCase):
+    """Per-event cycle cap — don't pile correlated bracket bets in same city."""
+
+    def setUp(self):
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+            pb._cycle_event_counts = {}
+        pb._reset_cycle_budget()
+
+    def test_per_event_cap(self):
+        ok, _ = pb._budget_can_take(0.10, "KXLOWTNYC-26APR25")
+        self.assertTrue(ok)
+        pb._budget_record(0.10, "KXLOWTNYC-26APR25")
+        # Second entry on same event should be blocked.
+        ok, reason = pb._budget_can_take(0.10, "KXLOWTNYC-26APR25")
+        self.assertFalse(ok)
+        self.assertIn("event_cap", reason)
+        # But a different event should still be allowed.
+        ok, _ = pb._budget_can_take(0.10, "KXLOWTCHI-26APR25")
+        self.assertTrue(ok)
+
+
+class TestCooldowns(unittest.TestCase):
+    """Cooldown helpers ported from V2 H-2 fix."""
+
+    def setUp(self):
+        with pb._cooldown_lock:
+            pb._paused_tickers.clear()
+        pb._insufficient_balance_until = 0.0
+
+    def test_paused_cooldown(self):
+        self.assertFalse(pb._in_paused_cooldown("KXLOWTNYC-26APR25-T45"))
+        pb._set_paused_cooldown("KXLOWTNYC-26APR25-T45")
+        self.assertTrue(pb._in_paused_cooldown("KXLOWTNYC-26APR25-T45"))
+        # Other tickers unaffected
+        self.assertFalse(pb._in_paused_cooldown("KXLOWTCHI-26APR25-T45"))
+
+    def test_insufficient_balance_cooldown(self):
+        self.assertFalse(pb._in_insufficient_balance_cooldown())
+        pb._set_insufficient_balance_cooldown()
+        self.assertTrue(pb._in_insufficient_balance_cooldown())
+
+
+class TestLiveSafetyConstants(unittest.TestCase):
+    def test_max_edge_is_set(self):
+        self.assertGreater(pb.MAX_EDGE_LIVE, pb.MIN_EDGE_LIVE)
+        self.assertLess(pb.MAX_EDGE_LIVE, 1.0)
+
+    def test_disagreement_threshold_reasonable(self):
+        self.assertGreater(pb.MAX_DISAGREEMENT_F_LIVE, 2.0)
+        self.assertLess(pb.MAX_DISAGREEMENT_F_LIVE, 10.0)
+
+    def test_per_event_per_cycle_is_one(self):
+        self.assertEqual(pb.MAX_NEW_PER_EVENT_PER_CYCLE, 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
