@@ -1470,6 +1470,11 @@ def _compute_today_exposure() -> float:
                     continue
                 if not rec.get("ts", "").startswith(today):
                     continue
+                # Skip legacy PAPER-mode records (no real money). Live records
+                # written post-rename have no `mode` field; pre-rename live
+                # records have mode="LIVE".
+                if rec.get("mode") == "PAPER":
+                    continue
                 total += float(rec.get("cost", 0.0))
     except Exception as e:
         log(f"  today-exposure compute failed: {e}", "warn")

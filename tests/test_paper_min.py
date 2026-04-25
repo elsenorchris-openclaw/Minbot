@@ -444,8 +444,9 @@ class TestDailyExposurePersistence(unittest.TestCase):
         self._write([
             {"ts": f"{today}T00:00:00+00:00", "kind": "entry", "cost": 0.50},
             {"ts": f"{today}T01:00:00+00:00", "kind": "entry", "cost": 0.75},
-            {"ts": f"{yesterday}T23:00:00+00:00", "kind": "entry", "cost": 1.00},  # excluded
-            {"ts": f"{today}T02:00:00+00:00", "kind": "candidate", "cost": 0.25},  # excluded
+            {"ts": f"{yesterday}T23:00:00+00:00", "kind": "entry", "cost": 1.00},  # excluded: not today
+            {"ts": f"{today}T02:00:00+00:00", "kind": "candidate", "cost": 0.25},  # excluded: not entry
+            {"ts": f"{today}T03:00:00+00:00", "kind": "entry", "cost": 99.99, "mode": "PAPER"},  # excluded: paper
         ])
         self.assertAlmostEqual(pb._compute_today_exposure(), 1.25, places=2)
 
