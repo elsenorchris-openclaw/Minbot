@@ -56,7 +56,14 @@ import kalshi_ws  # WebSocket BBO client (V2 pattern, ported 2026-04-24)
 # Execution mode. PAPER_MODE=True → no real Kalshi orders; everything else
 # runs identically (fetch forecasts, compute edges, record hypothetical
 # entries + settlements). Flip to False to run live.
-PAPER_MODE = True
+PAPER_MODE = False                # 2026-04-25: live cutover with V2 wallet + caps
+
+# Wallet selection. "v1" → ~/.env KALSHI_KEY_ID + ~/kalshi_key.pem (account 1).
+# "v2" → KALSHI_KEY_ID_V2 + obs-pipeline-bot/kalshi_key_v2_account2.pem
+# (account 2; sister to obs-pipeline-bot bot v2). Paper bot lives on V2 so its
+# orders share an account with the existing live V2 bot, simplifying balance
+# accounting.
+WALLET = "v2"
 
 # Path to the obs-pipeline sqlite DB (read-only queries for running_min).
 OBS_DB_PATH = "/home/ubuntu/obs-pipeline/data/obs.sqlite"
@@ -108,16 +115,23 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters (paper mode logs everything; these gate what gets flagged in Discord)
 MIN_EDGE_PAPER = 0.10               # log ALL, but tag 'TAKEABLE' when >=10% edge
-MIN_EDGE_LIVE = 0.15                # live mode: 15% edge
+MIN_EDGE_LIVE = 0.20                # live mode: 20% edge (raised from 0.15 at live cutover)
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
 MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
 
 # Live-mode Kelly sizing (only used when PAPER_MODE=False)
-MAX_BET_USD = 5.00                  # small to start live
+MAX_BET_USD = 1.00                  # 2026-04-25 live cutover: $1 cap per entry
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
+
+# ─── Live-mode safety caps (only enforced when PAPER_MODE=False) ─────────
+# Hard ceilings that gate execute_opportunity *before* place_order is called.
+MAX_NEW_POSITIONS_PER_CYCLE = 3     # first cycle paper-mode took 55; cap live exposure
+DAILY_EXPOSURE_CAP_USD = 20.00      # sum of entry costs since UTC midnight
+ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
+BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
 # Data paths
 DATA_DIR = Path("/home/ubuntu/paper_min_bot/data")
@@ -184,22 +198,32 @@ _KEY_ID: str = ""
 _PRIVATE_KEY = None
 _KALSHI_WS_STARTED = False
 
+# Hardcoded V2 wallet key id — same constant `obs-pipeline-bot/kalshi_weather_bot_v2.py`
+# uses. Account 2; rate-limit bucket is independent of the V1 account.
+_KALSHI_KEY_ID_V2 = "7224fdb1-f5c9-4dc5-a1ce-b85013ad34d1"
+
+
 def _load_kalshi_auth() -> None:
-    """Load Kalshi auth from /home/ubuntu/.env + kalshi_key.pem.
-    Auth is needed even in paper mode: Kalshi's market discovery and snapshot
-    endpoints require signed requests."""
+    """Load Kalshi auth based on WALLET.
+        v1 → ~/.env KALSHI_KEY_ID + ~/kalshi_key.pem
+        v2 → _KALSHI_KEY_ID_V2 const + obs-pipeline-bot/kalshi_key_v2_account2.pem
+    Auth is required even in paper mode (market discovery is signed)."""
     global _KEY_ID, _PRIVATE_KEY
-    try:
-        env_txt = ENV_FILE.read_text()
-        m = re.search(r"KALSHI_KEY_ID=(\S+)", env_txt)
-        if not m:
-            raise RuntimeError("KALSHI_KEY_ID missing from .env")
-        _KEY_ID = m.group(1)
-    except Exception as e:
-        raise RuntimeError(f"Failed loading .env: {e}") from e
-    pem_path = Path("/home/ubuntu/kalshi_key.pem")
+    if WALLET == "v2":
+        _KEY_ID = _KALSHI_KEY_ID_V2
+        pem_path = Path("/home/ubuntu/obs-pipeline-bot/kalshi_key_v2_account2.pem")
+    else:
+        try:
+            env_txt = ENV_FILE.read_text()
+            m = re.search(r"KALSHI_KEY_ID=(\S+)", env_txt)
+            if not m:
+                raise RuntimeError("KALSHI_KEY_ID missing from .env")
+            _KEY_ID = m.group(1)
+        except Exception as e:
+            raise RuntimeError(f"Failed loading .env: {e}") from e
+        pem_path = Path("/home/ubuntu/kalshi_key.pem")
     if not pem_path.exists():
-        raise RuntimeError(f"Kalshi PEM missing at {pem_path}")
+        raise RuntimeError(f"Kalshi PEM missing at {pem_path} (wallet={WALLET})")
     _PRIVATE_KEY = serialization.load_pem_private_key(pem_path.read_bytes(), password=None)
 
 
@@ -245,8 +269,90 @@ def _ensure_kalshi_ws() -> None:
 def kalshi_post(path: str, body: dict) -> dict:
     r = httpx.post(KALSHI_BASE + path, json=body, headers=_sign("POST", path),
                    timeout=KALSHI_TIMEOUT)
-    r.raise_for_status()
+    if r.status_code >= 400:
+        # Surface the response body so callers can pattern-match on errors.
+        raise httpx.HTTPStatusError(f"{r.status_code}: {r.text[:200]}",
+                                    request=r.request, response=r)
     return r.json()
+
+
+def kalshi_delete(path: str) -> dict:
+    r = httpx.delete(KALSHI_BASE + path, headers=_sign("DELETE", path),
+                     timeout=KALSHI_TIMEOUT)
+    r.raise_for_status()
+    try:
+        return r.json()
+    except Exception:
+        return {}
+
+
+def get_kalshi_balance() -> Optional[float]:
+    """Available portfolio balance in USD. Returns None on failure.
+    Kalshi /portfolio/balance returns balance in cents."""
+    try:
+        d = kalshi_get("/trade-api/v2/portfolio/balance")
+        bc = d.get("balance")
+        if bc is None:
+            return None
+        return float(bc) / 100.0
+    except Exception as e:
+        log(f"  balance fetch failed: {e}", "warn")
+        return None
+
+
+def place_kalshi_order(ticker: str, side: str, count: int,
+                       price_cents: int) -> Optional[str]:
+    """Place a limit BUY at price_cents. Returns order_id or None on failure.
+    Mirrors V2's place_order without maker-remainder / paused-cooldown logic
+    (paper bot's small scale doesn't justify them yet)."""
+    body = {
+        "ticker": ticker, "action": "buy", "side": side,
+        "type": "limit", "count": count,
+    }
+    if side == "yes":
+        body["yes_price"] = price_cents
+    else:
+        body["no_price"] = price_cents
+    try:
+        r = kalshi_post("/trade-api/v2/portfolio/orders", body)
+        order = r.get("order", {})
+        oid = order.get("order_id")
+        st = order.get("status", "?")
+        log(f"  ORDER buy {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
+        return oid
+    except Exception as e:
+        log(f"  ORDER FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
+        return None
+
+
+def wait_for_fill(order_id: str, expected_count: int,
+                  timeout_sec: float = 5.0) -> tuple[str, int]:
+    """Wait up to timeout_sec for `expected_count` fills. Returns
+    (status, filled_count). Polls kalshi_ws fill cache, falls back to REST."""
+    deadline = time.time() + timeout_sec
+    while time.time() < deadline:
+        if USE_KALSHI_WS:
+            try:
+                f = kalshi_ws.get_fill(order_id)
+                if f and f.get("total_count", 0) >= expected_count:
+                    return ("filled", int(f["total_count"]))
+            except Exception:
+                pass
+        time.sleep(0.1)
+    # REST fallback (authoritative)
+    try:
+        d = kalshi_get(f"/trade-api/v2/portfolio/orders/{order_id}")
+        o = d.get("order", {})
+        rc = o.get("remaining_count_fp")
+        remaining = int(float(rc)) if rc else o.get("remaining_count", expected_count)
+        filled = max(0, expected_count - remaining)
+        st = o.get("status", "unknown")
+        if st == "executed" or remaining == 0:
+            st = "filled"
+        return (st, filled)
+    except Exception as e:
+        log(f"  fill check failed for {order_id}: {e}", "warn")
+        return ("unknown", 0)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1122,6 +1228,40 @@ def _append_jsonl(path: Path, record: dict) -> None:
 _open_paper_positions: dict[str, dict] = {}  # market_ticker → position record
 _positions_lock = threading.Lock()
 
+# ─── Live-mode budgets (no-op in PAPER mode) ────────────────────────────
+_cycle_budget_lock = threading.Lock()
+_cycle_new_count = 0                          # reset each cycle
+_today_exposure_usd = 0.0                     # cost of today's entries
+_today_date_utc: str = ""                     # tracks UTC midnight rollover
+
+
+def _reset_cycle_budget() -> None:
+    """Called at the top of scan_cycle()."""
+    global _cycle_new_count, _today_exposure_usd, _today_date_utc
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    with _cycle_budget_lock:
+        _cycle_new_count = 0
+        if today != _today_date_utc:
+            _today_date_utc = today
+            _today_exposure_usd = 0.0
+
+
+def _budget_can_take(cost_usd: float) -> tuple[bool, str]:
+    """Check live-mode caps. Returns (ok, reason_if_blocked)."""
+    with _cycle_budget_lock:
+        if _cycle_new_count >= MAX_NEW_POSITIONS_PER_CYCLE:
+            return False, f"cycle_cap({_cycle_new_count}/{MAX_NEW_POSITIONS_PER_CYCLE})"
+        if _today_exposure_usd + cost_usd > DAILY_EXPOSURE_CAP_USD:
+            return False, f"daily_cap(${_today_exposure_usd:.2f}+${cost_usd:.2f}>${DAILY_EXPOSURE_CAP_USD:.2f})"
+    return True, ""
+
+
+def _budget_record(cost_usd: float) -> None:
+    global _cycle_new_count, _today_exposure_usd
+    with _cycle_budget_lock:
+        _cycle_new_count += 1
+        _today_exposure_usd += cost_usd
+
 
 def _load_paper_positions() -> None:
     global _open_paper_positions
@@ -1164,39 +1304,92 @@ def record_candidate(opp: dict) -> None:
 
 
 def execute_opportunity(opp: dict) -> None:
-    """PAPER mode: log a hypothetical entry. LIVE mode (not yet wired):
-    would call Kalshi's orders endpoint."""
+    """PAPER mode: log a hypothetical entry.
+    LIVE mode: enforce caps, place real Kalshi limit-buy at the ask, wait
+    up to ORDER_FILL_TIMEOUT_SEC for fill, cancel any unfilled remainder,
+    record actual fill_count + cost."""
     if opp.get("action") is None or opp.get("entry_price") is None:
         return
     edge = float(opp["edge"])
-    # Filter on minimum edge appropriate to mode
     min_edge = MIN_EDGE_PAPER if PAPER_MODE else MIN_EDGE_LIVE
     if edge < min_edge:
         return
     mode = "PAPER" if PAPER_MODE else "LIVE"
     ticker = opp["market_ticker"]
-    # Sizing: kelly with MAX_BET_USD cap
-    edge_frac = edge
+
+    # Per-ticker dedupe — never double up on the same market.
+    with _positions_lock:
+        if ticker in _open_paper_positions:
+            return
+
+    # Kelly sizing with MAX_BET_USD cap
     price = float(opp["entry_price"])
-    kelly = KELLY_FRACTION * edge_frac / max(1 - price, 0.01)
+    kelly = KELLY_FRACTION * edge / max(1 - price, 0.01)
     bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * MAX_BET_USD))
     count = max(1, int(bet_usd / price))
+    intended_cost = count * price
+
+    # ─── LIVE path ─────────────────────────────────────────────────────
+    if not PAPER_MODE:
+        ok, reason = _budget_can_take(intended_cost)
+        if not ok:
+            log(f"  [LIVE] skip {ticker}: {reason}")
+            return
+        side = "yes" if opp["action"] == "BUY_YES" else "no"
+        price_cents = int(round(price * 100))
+        order_id = place_kalshi_order(ticker, side, count, price_cents)
+        if not order_id:
+            return
+        status, filled = wait_for_fill(order_id, count, ORDER_FILL_TIMEOUT_SEC)
+        if filled <= 0:
+            # Try to cancel any resting remainder; ignore errors.
+            try:
+                kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+            except Exception:
+                pass
+            log(f"  [LIVE] no fill on {ticker} (status={status}); cancelled")
+            return
+        if filled < count:
+            try:
+                kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+            except Exception:
+                pass
+            log(f"  [LIVE] partial fill {filled}/{count} on {ticker}; cancelled remainder")
+        actual_cost = filled * price
+        _budget_record(actual_cost)
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": "LIVE", "kind": "entry",
+            "market_ticker": ticker, "action": opp["action"],
+            "entry_price": price, "count": filled, "cost": actual_cost,
+            "order_id": order_id,
+            "edge": edge, "model_prob": opp["model_prob"],
+            "mu": opp["mu"], "sigma": opp["sigma"], "mu_source": opp["mu_source"],
+            "running_min": opp["running_min"],
+            "floor": opp.get("floor"), "cap": opp.get("cap"),
+            "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
+        }
+        _append_jsonl(TRADES_FILE, record)
+        with _positions_lock:
+            _open_paper_positions[ticker] = record
+        _save_paper_positions()
+        log(f"  [LIVE] {opp['action']} {filled}x @ {price_cents}c on {ticker} "
+            f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
+            f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
+            f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
+        return
+
+    # ─── PAPER path ────────────────────────────────────────────────────
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
-        "mode": mode,
-        "kind": "entry",
-        "market_ticker": ticker,
-        "action": opp["action"],
-        "entry_price": price,
-        "count": count,
-        "cost": count * price,
-        "edge": edge,
-        "model_prob": opp["model_prob"],
+        "mode": mode, "kind": "entry",
+        "market_ticker": ticker, "action": opp["action"],
+        "entry_price": price, "count": count, "cost": intended_cost,
+        "edge": edge, "model_prob": opp["model_prob"],
         "mu": opp["mu"], "sigma": opp["sigma"], "mu_source": opp["mu_source"],
         "running_min": opp["running_min"],
         "floor": opp.get("floor"), "cap": opp.get("cap"),
-        "station": opp["station"], "date_str": opp["date_str"],
-        "label": opp["label"],
+        "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
     }
     _append_jsonl(TRADES_FILE, record)
     with _positions_lock:
@@ -1283,6 +1476,7 @@ def _sig_handler(sig, frame):
 def scan_cycle() -> dict:
     """One full scan: settlements, forecasts refresh (throttled),
     market discovery, opp find, log candidates, paper-execute taken ones."""
+    _reset_cycle_budget()  # zero per-cycle counter; rolls daily exposure at UTC midnight
     stats = {"settled": 0, "markets": 0, "candidates": 0, "opps": 0, "taken": 0}
     stats["settled"] = check_settlements()
 
@@ -1362,12 +1556,23 @@ def main() -> None:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
     log("=" * 60)
-    log(f"paper_min_bot starting (PAPER_MODE={PAPER_MODE})")
+    log(f"paper_min_bot starting (PAPER_MODE={PAPER_MODE} WALLET={WALLET})")
     log(f"  cities: {len(CITIES)}")
     log(f"  obs DB: {OBS_DB_PATH}")
     log(f"  data dir: {DATA_DIR}")
+    if not PAPER_MODE:
+        log(f"  LIVE caps: max_bet=${MAX_BET_USD:.2f} per_cycle={MAX_NEW_POSITIONS_PER_CYCLE} "
+            f"daily_exposure=${DAILY_EXPOSURE_CAP_USD:.2f} min_edge={MIN_EDGE_LIVE:.0%}")
     log("=" * 60)
     _load_kalshi_auth()
+    if not PAPER_MODE:
+        bal = get_kalshi_balance()
+        if bal is None:
+            log("  WARNING: balance fetch failed at startup — proceeding anyway", "warn")
+        else:
+            log(f"  Kalshi balance: ${bal:.2f}")
+            if bal < BANKROLL_FLOOR_USD:
+                raise RuntimeError(f"Balance ${bal:.2f} < floor ${BANKROLL_FLOOR_USD:.2f}; aborting")
     _load_paper_positions()
     _load_nbp_cache_from_disk()
     # Initial forecast fetches before first scan

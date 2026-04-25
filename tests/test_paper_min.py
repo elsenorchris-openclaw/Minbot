@@ -189,5 +189,70 @@ class TestBracketDetection(unittest.TestCase):
                             f"{series} → {nbp} should start with K (CONUS) or P (Pacific)")
 
 
+class TestLiveBudget(unittest.TestCase):
+    """Caps that gate execute_opportunity in LIVE mode."""
+
+    def setUp(self):
+        # Force a fully clean budget state per test (including daily totals,
+        # which _reset_cycle_budget only zeros at the date rollover).
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+
+    def test_reset_clears_cycle_count(self):
+        pb._budget_record(0.50)
+        pb._budget_record(0.50)
+        self.assertEqual(pb._cycle_new_count, 2)
+        pb._reset_cycle_budget()
+        self.assertEqual(pb._cycle_new_count, 0)
+
+    def test_per_cycle_cap(self):
+        for _ in range(pb.MAX_NEW_POSITIONS_PER_CYCLE):
+            ok, _ = pb._budget_can_take(0.10)
+            self.assertTrue(ok)
+            pb._budget_record(0.10)
+        ok, reason = pb._budget_can_take(0.10)
+        self.assertFalse(ok)
+        self.assertIn("cycle_cap", reason)
+
+    def test_daily_exposure_cap(self):
+        # Reset cycle count so per-cycle cap doesn't trigger first
+        pb._reset_cycle_budget()
+        # Bypass the per-cycle cap by manually loading exposure
+        with pb._cycle_budget_lock:
+            pb._today_exposure_usd = pb.DAILY_EXPOSURE_CAP_USD - 0.05
+        ok, reason = pb._budget_can_take(0.10)  # would push over
+        self.assertFalse(ok)
+        self.assertIn("daily_cap", reason)
+        ok, _ = pb._budget_can_take(0.04)  # fits
+        self.assertTrue(ok)
+
+    def test_utc_midnight_rolls_daily_exposure(self):
+        with pb._cycle_budget_lock:
+            pb._today_exposure_usd = 15.00
+            pb._today_date_utc = "2026-01-01"  # stale
+        pb._reset_cycle_budget()  # should detect rollover
+        self.assertEqual(pb._today_exposure_usd, 0.0)
+        self.assertNotEqual(pb._today_date_utc, "2026-01-01")
+
+
+class TestWalletConfig(unittest.TestCase):
+    def test_v2_constant_is_set(self):
+        self.assertEqual(pb._KALSHI_KEY_ID_V2,
+                         "7224fdb1-f5c9-4dc5-a1ce-b85013ad34d1")
+
+    def test_wallet_default_is_v2(self):
+        self.assertEqual(pb.WALLET, "v2")
+
+    def test_live_config_caps_are_conservative(self):
+        # Sanity: don't accidentally ship with $1000 caps.
+        self.assertLessEqual(pb.MAX_BET_USD, 1.00)
+        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 25.00)
+        self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
+        self.assertGreaterEqual(pb.MIN_EDGE_LIVE, 0.20)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -1,8 +1,12 @@
 # paper-min-bot
 
-Paper trading bot for Kalshi low-temperature markets (`KXLOWT*`). Hypothetical
-entries only — no real money — until `PAPER_MODE = False`. Same 20 cities as
+Trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20 cities as
 V1/V2 but opposite settlement: daily minimum instead of maximum.
+
+**Live since 2026-04-25 on the V2 Kalshi wallet** (key `7224fdb1...`,
+PEM `obs-pipeline-bot/kalshi_key_v2_account2.pem`). `PAPER_MODE=False`.
+Conservative live caps: $1 per entry, 3 entries per cycle, $20 daily exposure,
+20% min edge. Flip back with `PAPER_MODE=True`.
 
 ## Architecture
 
@@ -72,15 +76,40 @@ sudo journalctl -u paper-min-bot -f
 python3.12 /home/ubuntu/paper_min_bot/paper_min_bot.py
 ```
 
-## Flipping to live
+## Live mode (current)
 
-Edit `paper_min_bot.py`:
-- Set `PAPER_MODE = False`
-- (Optional) adjust `MAX_BET_USD`, `KELLY_FRACTION`, `MIN_EDGE_LIVE`
-- Restart the service
+Live executor placed at the limit-buy ask, fill-aware via `kalshi_ws`, with
+hard caps gating every entry. Order placement mirrors V2's `place_order`
+without maker-remainder / paused-cooldown logic.
 
-That's it. All upstream code (forecasts, obs, model, opp generation) is identical
-in paper and live modes. The only branch is inside `execute_opportunity()`.
+**Caps** (in `paper_min_bot.py`):
+- `MAX_BET_USD = 1.00` — Kelly-sized but capped per entry.
+- `MAX_NEW_POSITIONS_PER_CYCLE = 3` — first cycle of a fresh restart took 55
+  paper entries; the cycle cap stops a runaway.
+- `DAILY_EXPOSURE_CAP_USD = 20.00` — sum of fill costs since UTC midnight.
+- `MIN_EDGE_LIVE = 0.20` — bumped from 0.15 to skip the marginal 78c BUY_NO
+  entries the model overproduces.
+- `BANKROLL_FLOOR_USD = 5.00` — startup refuses to run if V2 balance drops
+  below this.
+
+**Wallet selection.** `WALLET = "v2"` (default) loads
+`obs-pipeline-bot/kalshi_key_v2_account2.pem` and the hard-coded V2 key id.
+Set `WALLET = "v1"` to fall back to `~/.env` + `~/kalshi_key.pem`.
+
+**Order flow.**
+1. `discover_markets()` returns quoted markets (REST) with WS BBO overlay.
+2. `find_opportunities()` filters; `execute_opportunity()` dedupes per ticker
+   and checks the cycle/daily caps.
+3. `place_kalshi_order()` POSTs a limit buy at the ask price.
+4. `wait_for_fill()` polls the `kalshi_ws` fill cache for up to 5 seconds,
+   falls back to REST `/portfolio/orders/{id}`.
+5. Partial / no-fill: cancel any resting remainder. Record actual `filled`
+   count to `paper_trades.jsonl`.
+
+**Kill switch:** `sudo systemctl stop paper-min-bot`. Open positions stay
+on Kalshi and self-settle from the `cli_reports` low.
+
+**Flipping back to paper:** set `PAPER_MODE = True` and restart.
 
 ## Files touched by the obs-pipeline extension (2026-04-24)
 
