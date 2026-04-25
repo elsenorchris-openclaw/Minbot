@@ -1481,6 +1481,13 @@ def _compute_today_exposure() -> float:
                 # records have mode="LIVE".
                 if rec.get("mode") == "PAPER":
                     continue
+                # 2026-04-25: only count entries on markets whose date_str is
+                # today UTC or later. Excludes the V2-wallet 04:09–04:26 cascade
+                # ($21 on Apr 24 markets) and any other prior-day backstop
+                # entries. Approximates wallet-scoping: V2 cascade hit Apr 24
+                # markets while V1's actual trades today are on Apr 25.
+                if rec.get("date_str", "") < today:
+                    continue
                 total += float(rec.get("cost", 0.0))
     except Exception as e:
         log(f"  today-exposure compute failed: {e}", "warn")
@@ -1595,21 +1602,25 @@ def _save_positions() -> None:
 def record_candidate(opp: dict) -> None:
     """Record a candidate opportunity for calibration analysis. Every
     generated opp goes here — not just taken ones — so we can back-test
-    the model's probability calibration against settled outcomes."""
+    the model's probability calibration against settled outcomes.
+
+    2026-04-25 fix: opp has its own `kind` field (bracket/tail_low/tail_high)
+    which was silently overwriting our `kind: candidate` discriminator via
+    dict-spread. Rename to bracket_kind so the candidate/entry filter works."""
+    fields = ("event_ticker", "market_ticker", "station", "series", "date_str",
+              "label", "floor", "cap",
+              "yes_bid", "yes_ask", "no_bid", "no_ask",
+              "volume", "mu", "sigma", "mu_source",
+              "mu_nbp", "sigma_nbp", "mu_nbm_om", "mu_hrrr", "disagreement",
+              "running_min",
+              "post_sunrise_lock", "is_today", "model_prob",
+              "yes_ask_frac", "no_ask_frac",
+              "action", "edge", "entry_price")
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "candidate",
-        **{k: opp.get(k) for k in (
-            "event_ticker", "market_ticker", "station", "series", "date_str",
-            "label", "floor", "cap", "kind",
-            "yes_bid", "yes_ask", "no_bid", "no_ask",
-            "volume", "mu", "sigma", "mu_source",
-            "mu_nbp", "sigma_nbp", "mu_nbm_om", "mu_hrrr", "disagreement",
-            "running_min",
-            "post_sunrise_lock", "is_today", "model_prob",
-            "yes_ask_frac", "no_ask_frac",
-            "action", "edge", "entry_price",
-        )},
+        "bracket_kind": opp.get("kind"),
+        **{k: opp.get(k) for k in fields},
     }
     _append_jsonl(TRADES_FILE, record)
 

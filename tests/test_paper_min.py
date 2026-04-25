@@ -450,11 +450,14 @@ class TestDailyExposurePersistence(unittest.TestCase):
         today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         yesterday = (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
         self._write([
-            {"ts": f"{today}T00:00:00+00:00", "kind": "entry", "cost": 0.50},
-            {"ts": f"{today}T01:00:00+00:00", "kind": "entry", "cost": 0.75},
-            {"ts": f"{yesterday}T23:00:00+00:00", "kind": "entry", "cost": 1.00},  # excluded: not today
-            {"ts": f"{today}T02:00:00+00:00", "kind": "candidate", "cost": 0.25},  # excluded: not entry
-            {"ts": f"{today}T03:00:00+00:00", "kind": "entry", "cost": 99.99, "mode": "PAPER"},  # excluded: paper
+            {"ts": f"{today}T00:00:00+00:00", "kind": "entry", "cost": 0.50, "date_str": today},
+            {"ts": f"{today}T01:00:00+00:00", "kind": "entry", "cost": 0.75, "date_str": today},
+            {"ts": f"{yesterday}T23:00:00+00:00", "kind": "entry", "cost": 1.00, "date_str": yesterday},  # excluded: not today
+            {"ts": f"{today}T02:00:00+00:00", "kind": "candidate", "cost": 0.25, "date_str": today},  # excluded: not entry
+            {"ts": f"{today}T03:00:00+00:00", "kind": "entry", "cost": 99.99, "mode": "PAPER", "date_str": today},  # excluded: paper
+            # The wallet-scope filter: an entry placed today on a market whose
+            # date_str is yesterday (V2 cascade pattern) is excluded.
+            {"ts": f"{today}T04:00:00+00:00", "kind": "entry", "cost": 21.00, "date_str": yesterday},
         ])
         self.assertAlmostEqual(pb._compute_today_exposure(), 1.25, places=2)
 
@@ -514,6 +517,30 @@ class TestKalshiReconcile(unittest.TestCase):
         }
         added = pb._reconcile_kalshi_positions()
         self.assertEqual(added, 0)
+
+
+class TestRecordCandidateKind(unittest.TestCase):
+    """record_candidate must write kind=candidate, not the bracket type."""
+
+    def test_kind_is_candidate_not_bracket(self):
+        # Capture what _append_jsonl receives
+        captured = []
+        orig = pb._append_jsonl
+        pb._append_jsonl = lambda path, rec: captured.append(rec)
+        try:
+            pb.record_candidate({
+                "kind": "bracket",  # opp's bracket kind
+                "market_ticker": "KXLOWTNYC-26APR25-B42.5",
+                "floor": 42.0, "cap": 43.0,
+                "model_prob": 0.20, "edge": 0.10,
+                "yes_bid": 5, "yes_ask": 10,
+            })
+        finally:
+            pb._append_jsonl = orig
+        self.assertEqual(len(captured), 1)
+        rec = captured[0]
+        self.assertEqual(rec["kind"], "candidate", "discriminator must be 'candidate'")
+        self.assertEqual(rec["bracket_kind"], "bracket", "opp.kind preserved as bracket_kind")
 
 
 if __name__ == "__main__":
