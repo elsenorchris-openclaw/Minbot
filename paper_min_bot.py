@@ -134,7 +134,7 @@ MIN_BET_USD = 0.50
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
-DAILY_EXPOSURE_CAP_USD = 4.00       # day scope (UTC midnight)
+DAILY_EXPOSURE_CAP_USD = 15.00      # day scope (UTC midnight); raised 2026-04-25 from $4 (V1 has ~$37)
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
