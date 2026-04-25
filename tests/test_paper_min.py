@@ -29,6 +29,14 @@ pb.DATA_DIR = Path(_TMPDIR) / "data"
 pb.LOG_DIR = Path(_TMPDIR) / "logs"
 pb.DATA_DIR.mkdir(parents=True, exist_ok=True)
 pb.LOG_DIR.mkdir(parents=True, exist_ok=True)
+# CRITICAL: per-file Path constants are bound at module import time, before
+# we can override DATA_DIR. Re-bind them now so tests that call
+# _save_positions / _append_jsonl never write to production data files.
+pb.POSITIONS_FILE = pb.DATA_DIR / "positions.json"
+pb.TRADES_FILE = pb.DATA_DIR / "trades.jsonl"
+pb.SETTLEMENTS_FILE = pb.DATA_DIR / "settlements.jsonl"
+pb.STATS_FILE = pb.DATA_DIR / "stats.json"
+pb.NBP_CACHE_FILE = pb.DATA_DIR / "nbp_cache.json"
 
 
 class TestBracketParse(unittest.TestCase):
