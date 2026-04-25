@@ -27,6 +27,7 @@ DATA:
 from __future__ import annotations
 
 import base64
+import concurrent.futures
 import json
 import math
 import os
@@ -45,6 +46,8 @@ from zoneinfo import ZoneInfo
 import httpx
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import padding
+
+import kalshi_ws  # WebSocket BBO client (V2 pattern, ported 2026-04-24)
 
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
@@ -138,6 +141,11 @@ ENV_FILE = Path("/home/ubuntu/.env")
 KALSHI_BASE = "https://api.elections.kalshi.com"
 KALSHI_TIMEOUT = 15.0
 
+# WebSocket BBO live overlay (mirrors V2). When True, kalshi_ws subscribes to
+# every discovered market_ticker and live BBO replaces the REST snapshot
+# returned by /markets — typical freshness drops from ~30s to <100ms.
+USE_KALSHI_WS = True
+
 # ═══════════════════════════════════════════════════════════════════════
 # LOGGING
 # ═══════════════════════════════════════════════════════════════════════
@@ -174,6 +182,7 @@ def _atomic_write_json(path: Path, data: Any) -> None:
 
 _KEY_ID: str = ""
 _PRIVATE_KEY = None
+_KALSHI_WS_STARTED = False
 
 def _load_kalshi_auth() -> None:
     """Load Kalshi auth from /home/ubuntu/.env + kalshi_key.pem.
@@ -217,6 +226,20 @@ def kalshi_get(path: str, params: dict | None = None) -> dict:
                   timeout=KALSHI_TIMEOUT)
     r.raise_for_status()
     return r.json()
+
+
+def _ensure_kalshi_ws() -> None:
+    """Start the WebSocket BBO client once auth is loaded. Idempotent."""
+    global _KALSHI_WS_STARTED
+    if _KALSHI_WS_STARTED or not USE_KALSHI_WS:
+        return
+    if _PRIVATE_KEY is None:
+        _load_kalshi_auth()
+    try:
+        kalshi_ws.start(_sign, log_fn=lambda s: log(s))
+        _KALSHI_WS_STARTED = True
+    except Exception as e:
+        log(f"kalshi_ws.start failed: {e}", "warn")
 
 
 def kalshi_post(path: str, body: dict) -> dict:
@@ -780,49 +803,153 @@ def resolve_tail_bracket(market: dict, all_markets_in_event: list[dict]) -> dict
 # KALSHI MARKET DISCOVERY
 # ═══════════════════════════════════════════════════════════════════════
 
+_MON_MAP = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
+            "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
+
+
+def _event_date_from_ticker(event_ticker: str) -> Optional[str]:
+    m = re.match(r".*-(\d{2})([A-Z]{3})(\d{2})$", event_ticker)
+    if not m:
+        return None
+    yy, mon_s, dd = m.groups()
+    return f"20{yy}-{_MON_MAP.get(mon_s, '01')}-{dd}"
+
+
+def _quote_cents(mkt: dict, dollars_field: str, cents_field: str) -> Optional[int]:
+    """Return a quote in integer cents from a Kalshi /markets entry.
+
+    Kalshi's /markets endpoint populates *_dollars (fraction) but leaves the
+    legacy cents-form fields as None; /events?with_nested_markets does the
+    opposite (and ships zeros). Prefer the dollars form, fall back to cents,
+    return None when neither is set."""
+    d = mkt.get(dollars_field)
+    if d is not None:
+        try:
+            return int(round(float(d) * 100))
+        except (TypeError, ValueError):
+            pass
+    c = mkt.get(cents_field)
+    if c is not None:
+        try:
+            return int(c)
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _fetch_series_markets(series: str) -> Optional[list[dict]]:
+    """One Kalshi call: /trade-api/v2/markets?series_ticker=X&status=open.
+    Returns the raw markets list or None on error.
+
+    Mirrors V2's discover path (obs-pipeline-bot/kalshi_weather_bot_v2.py).
+    The /events?with_nested_markets path returns markets with all quote
+    fields = None and is unsuitable for trading."""
+    try:
+        data = kalshi_get("/trade-api/v2/markets", {
+            "series_ticker": series, "status": "open", "limit": 200,
+        })
+        return data.get("markets", [])
+    except Exception as e:
+        log(f"  market discovery failed for {series}: {e}", "warn")
+        return None
+
+
+def _overlay_ws_bbo(markets: list[dict]) -> int:
+    """Override yes_bid/yes_ask (cents) with fresh WS BBO when available.
+    kalshi_ws stores BBO as fractions (0.0–1.0); we convert to cents to
+    match the rest of the bot's downstream math."""
+    if not USE_KALSHI_WS:
+        return 0
+    n = 0
+    for m in markets:
+        tkr = m.get("market_ticker")
+        if not tkr:
+            continue
+        bbo = kalshi_ws.get_bbo(tkr)
+        if bbo is None:
+            continue
+        m["yes_bid"] = int(round(float(bbo["yes_bid"]) * 100))
+        m["yes_ask"] = int(round(float(bbo["yes_ask"]) * 100))
+        m["_ws_ts"] = bbo["ts"]
+        n += 1
+    if n > 0:
+        try:
+            s = kalshi_ws.get_stats()
+            log(f"  WS BBO: {n} tickers overlaid (sub={s['subscribed']} cached={s['cached']} deltas={s['deltas']})")
+        except Exception:
+            pass
+    return n
+
+
 def discover_markets() -> list[dict]:
-    """Pull open events + their markets for all 20 KXLOWT* series.
-    Returns a flat list: [{event_ticker, market_ticker, yes_bid, yes_ask,
-                           floor, cap, kind, station, series, date_str, subtitle}]"""
+    """Pull open markets for all 20 KXLOWT* series. Returns a flat list:
+        [{event_ticker, market_ticker, yes_bid, yes_ask, no_bid, no_ask (cents),
+          floor, cap, kind, station, series, date_str, subtitle, tz, label, volume}]
+
+    Strategy (V2 pattern, 2026-04-24):
+      1. /trade-api/v2/markets?series_ticker=X&status=open per city, in parallel
+         (5-at-a-time ThreadPool, 15s as_completed timeout).
+      2. Group results by event_ticker, parse each market via the bracket parser.
+      3. Quotes come from yes_*_dollars / no_*_dollars (fraction) → cents.
+      4. Subscribe every discovered ticker to kalshi_ws and overlay live BBO.
+
+    Replaces the prior /events?with_nested_markets=true path, which Kalshi
+    serves with all yes_bid/yes_ask = None."""
+    _ensure_kalshi_ws()
+
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=5, thread_name_prefix="kdisco")
+    results: dict[str, Optional[list[dict]]] = {}
+    try:
+        future_to_series = {ex.submit(_fetch_series_markets, s): s for s in CITIES}
+        try:
+            for fut in concurrent.futures.as_completed(future_to_series, timeout=15):
+                s = future_to_series[fut]
+                try:
+                    results[s] = fut.result(timeout=0)
+                except Exception as e:
+                    log(f"  discover thread for {s} crashed: {e}", "error")
+                    results[s] = None
+        except concurrent.futures.TimeoutError:
+            n_pending = sum(1 for f in future_to_series if not f.done())
+            for f in future_to_series:
+                if not f.done():
+                    f.cancel()
+                    results[future_to_series[f]] = None
+            log(f"  kdisco: {n_pending} series timed out after 15s", "warn")
+    finally:
+        ex.shutdown(wait=False)
+
     out: list[dict] = []
     for series, meta in CITIES.items():
-        try:
-            data = kalshi_get("/trade-api/v2/events", {
-                "series_ticker": series,
-                "status": "open",
-                "with_nested_markets": True,
-                "limit": 10,
-            })
-        except Exception as e:
-            log(f"  market discovery failed for {series}: {e}", "warn")
+        markets = results.get(series)
+        if not markets:
             continue
-        for ev in data.get("events", []):
-            ev_tk = ev.get("event_ticker", "")
-            # Parse date from event ticker: KXLOWTAUS-26APR25 → 2026-04-25
-            m = re.match(r".*-(\d{2})([A-Z]{3})(\d{2})$", ev_tk)
-            if not m:
+        # Group by event so resolve_tail_bracket sees siblings.
+        by_event: dict[str, list[dict]] = {}
+        for mkt in markets:
+            et = mkt.get("event_ticker", "")
+            if et:
+                by_event.setdefault(et, []).append(mkt)
+        for ev_tk, mkts in by_event.items():
+            date_str = _event_date_from_ticker(ev_tk)
+            if not date_str:
                 continue
-            yy, mon_s, dd = m.groups()
-            mon_map = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
-                       "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
-            date_str = f"20{yy}-{mon_map.get(mon_s, '01')}-{dd}"
-            markets = ev.get("markets", [])
-            for mkt in markets:
+            for mkt in mkts:
                 tkr = mkt.get("ticker", "")
                 br = parse_market_bracket(tkr)
                 if not br:
                     continue
                 if br["kind"] == "tail":
-                    br = resolve_tail_bracket(mkt, markets)
+                    br = resolve_tail_bracket(mkt, mkts)
                     if not br:
                         continue
                 out.append({
                     "event_ticker": ev_tk,
                     "market_ticker": tkr,
-                    "yes_bid": mkt.get("yes_bid"),
-                    "yes_ask": mkt.get("yes_ask"),
-                    "no_bid": mkt.get("no_bid"),
-                    "no_ask": mkt.get("no_ask"),
+                    "yes_bid": _quote_cents(mkt, "yes_bid_dollars", "yes_bid"),
+                    "yes_ask": _quote_cents(mkt, "yes_ask_dollars", "yes_ask"),
+                    "no_bid":  _quote_cents(mkt, "no_bid_dollars",  "no_bid"),
+                    "no_ask":  _quote_cents(mkt, "no_ask_dollars",  "no_ask"),
                     "floor": br.get("floor"),
                     "cap": br.get("cap"),
                     "kind": br.get("kind"),
@@ -832,8 +959,15 @@ def discover_markets() -> list[dict]:
                     "subtitle": mkt.get("subtitle") or mkt.get("yes_sub_title", ""),
                     "tz": meta["tz"],
                     "label": meta["label"],
-                    "volume": mkt.get("volume", 0),
+                    "volume": mkt.get("volume") or mkt.get("volume_24h") or 0,
                 })
+
+    if out and USE_KALSHI_WS:
+        try:
+            kalshi_ws.subscribe([m["market_ticker"] for m in out if m.get("market_ticker")])
+        except Exception as e:
+            log(f"  kalshi_ws.subscribe failed: {e}", "warn")
+        _overlay_ws_bbo(out)
     return out
 
 

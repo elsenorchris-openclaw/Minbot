@@ -32,8 +32,23 @@ ingests ASOS/MADIS/AWC
 AWS S3 NBM Probabilistic     →  refresh_nbp_forecasts()
 Open-Meteo NBM daily min     →  refresh_nbm_om_forecasts()
 
-Kalshi REST                   → discover_markets() / place_order
+Kalshi REST  /markets         → discover_markets() (per-series, parallel)
+Kalshi WS    orderbook_delta  → kalshi_ws.get_bbo() (sub-100ms BBO overlay)
 ```
+
+## Kalshi quote source (2026-04-24)
+
+Discovery uses `/trade-api/v2/markets?series_ticker=X&status=open`, parsed via
+`yes_bid_dollars` / `yes_ask_dollars` (the `/events?with_nested_markets` path
+returns those fields as `None` and is unsuitable for trading). Per-cycle cost
+is 20 calls, parallelized 5-at-a-time (~500 ms wall). Pattern ported from
+`obs-pipeline-bot/kalshi_weather_bot_v2.py`.
+
+`kalshi_ws.py` (also ported from V2) maintains a WebSocket subscription to
+`orderbook_delta` for every discovered ticker. `_overlay_ws_bbo()` overrides
+the REST snapshot with cached BBO when fresh (≤10 s), dropping quote staleness
+from one cycle (~60 s) to ~50 ms. WS BBO is for read-side only — order
+placement still routes through REST. Disable with `USE_KALSHI_WS = False`.
 
 ## Data dir
 
