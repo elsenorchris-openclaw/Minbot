@@ -1,0 +1,21 @@
+[Unit]
+Description=paper-min-bot (Kalshi low-temperature paper trading)
+After=network-online.target obs-pipeline.service
+Wants=network-online.target
+# Needs obs-pipeline's DB; starts after it but will retry if DB not ready
+Requires=obs-pipeline.service
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/home/ubuntu/paper_min_bot
+ExecStart=/usr/bin/python3.12 /home/ubuntu/paper_min_bot/paper_min_bot.py
+Restart=on-failure
+RestartSec=10
+MemoryMax=512M
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

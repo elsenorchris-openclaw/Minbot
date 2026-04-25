@@ -1,0 +1,1291 @@
+#!/usr/bin/env python3.12
+"""
+paper_min_bot.py — Kalshi daily-low temperature paper trading bot.
+
+Trades hypothetically on KXLOWT* markets (2026-04-24 onward). Uses the
+obs-pipeline's running_min tracking + forecast fetchers to predict overnight
+lows, compares to Kalshi's live bracket quotes, logs opportunities with full
+context. When PAPER_MODE is True, no real orders are placed.
+
+ARCHITECTURE:
+  PAPER_MODE flag controls executor: True → log_hypothetical_trade();
+  False → place_kalshi_order(). All upstream code (forecast, obs, model,
+  opp generation) is identical in both modes — one flag flip enables live.
+
+SAFETY:
+  - Separate Kalshi key file (optional; live mode only)
+  - Separate systemd unit (paper-min-bot.service)
+  - Separate data dir (/home/ubuntu/paper_min_bot/data)
+  - Does NOT touch V1/V2 positions, trades, stats, or logs
+
+DATA:
+  - Reads obs from obs-pipeline sqlite (/home/ubuntu/obs-pipeline/data/obs.sqlite)
+  - Fetches NBP sigma + mu from NBM Probabilistic text bulletins on AWS S3
+  - Fetches NBM hourly min via Open-Meteo
+  - Writes hypothetical trades + settlement outcomes to data/paper_trades.jsonl
+"""
+from __future__ import annotations
+
+import base64
+import json
+import math
+import os
+import re
+import signal
+import sqlite3
+import sys
+import threading
+import time
+from dataclasses import dataclass, asdict, field
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo
+
+import httpx
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import padding
+
+# ═══════════════════════════════════════════════════════════════════════
+# CONFIG
+# ═══════════════════════════════════════════════════════════════════════
+
+# Execution mode. PAPER_MODE=True → no real Kalshi orders; everything else
+# runs identically (fetch forecasts, compute edges, record hypothetical
+# entries + settlements). Flip to False to run live.
+PAPER_MODE = True
+
+# Path to the obs-pipeline sqlite DB (read-only queries for running_min).
+OBS_DB_PATH = "/home/ubuntu/obs-pipeline/data/obs.sqlite"
+OBS_SNAPSHOT_URL = "http://127.0.0.1:8089/snapshot"
+
+# 20-city roster — matches V1/V2. Series ticker is the KXLOWT* prefix.
+# station: the ASOS ICAO that Kalshi settles against.
+CITIES: dict[str, dict[str, Any]] = {
+    "KXLOWTNYC":  {"station": "KNYC", "lat": 40.7833, "lon": -73.9667, "tz": "America/New_York",    "label": "NYC"},
+    "KXLOWTCHI":  {"station": "KMDW", "lat": 41.7842, "lon": -87.7553, "tz": "America/Chicago",     "label": "Chicago"},
+    "KXLOWTMIA":  {"station": "KMIA", "lat": 25.7906, "lon": -80.3164, "tz": "America/New_York",    "label": "Miami"},
+    "KXLOWTLAX":  {"station": "KLAX", "lat": 33.9381, "lon": -118.3889,"tz": "America/Los_Angeles", "label": "LA"},
+    "KXLOWTDEN":  {"station": "KDEN", "lat": 39.8466, "lon": -104.6562,"tz": "America/Denver",      "label": "Denver"},
+    "KXLOWTAUS":  {"station": "KAUS", "lat": 30.1830, "lon": -97.6799, "tz": "America/Chicago",     "label": "Austin"},
+    "KXLOWTPHIL": {"station": "KPHL", "lat": 39.8733, "lon": -75.2268, "tz": "America/New_York",    "label": "Philadelphia"},
+    "KXLOWTATL":  {"station": "KATL", "lat": 33.6407, "lon": -84.4277, "tz": "America/New_York",    "label": "Atlanta"},
+    "KXLOWTBOS":  {"station": "KBOS", "lat": 42.3606, "lon": -71.0106, "tz": "America/New_York",    "label": "Boston"},
+    "KXLOWTDAL":  {"station": "KDFW", "lat": 32.8974, "lon": -97.0220, "tz": "America/Chicago",     "label": "Dallas"},
+    "KXLOWTDC":   {"station": "KDCA", "lat": 38.8483, "lon": -77.0342, "tz": "America/New_York",    "label": "Washington DC"},
+    "KXLOWTHOU":  {"station": "KHOU", "lat": 29.6375, "lon": -95.2825, "tz": "America/Chicago",     "label": "Houston"},
+    "KXLOWTLV":   {"station": "KLAS", "lat": 36.0719, "lon": -115.1634,"tz": "America/Los_Angeles", "label": "Las Vegas"},
+    "KXLOWTMIN":  {"station": "KMSP", "lat": 44.8831, "lon": -93.2289, "tz": "America/Chicago",     "label": "Minneapolis"},
+    "KXLOWTNOLA": {"station": "KMSY", "lat": 29.9928, "lon": -90.2508, "tz": "America/Chicago",     "label": "New Orleans"},
+    "KXLOWTOKC":  {"station": "KOKC", "lat": 35.3931, "lon": -97.6007, "tz": "America/Chicago",     "label": "Oklahoma City"},
+    "KXLOWTPHX":  {"station": "KPHX", "lat": 33.4373, "lon": -112.008, "tz": "America/Phoenix",     "label": "Phoenix"},
+    "KXLOWTSATX": {"station": "KSAT", "lat": 29.5328, "lon": -98.4636, "tz": "America/Chicago",     "label": "San Antonio"},
+    "KXLOWTSEA":  {"station": "KSEA", "lat": 47.4447, "lon": -122.3136,"tz": "America/Los_Angeles", "label": "Seattle"},
+    "KXLOWTSFO":  {"station": "KSFO", "lat": 37.6196, "lon": -122.3656,"tz": "America/Los_Angeles", "label": "San Francisco"},
+}
+
+# NBM Probabilistic product station IDs (same as v1/v2 use for max).
+# These are the 3-letter NBP identifiers; mapping from series ticker.
+# Source: NBM bulletin headers (NBPCWL, NBPWD, etc.)
+NBP_STATION_MAP: dict[str, str] = {
+    # NBM NBP bulletins identify stations by 4-letter ICAO (e.g. KAUS, KNYC).
+    "KXLOWTNYC":  "KNYC", "KXLOWTCHI":  "KMDW", "KXLOWTMIA":  "KMIA",
+    "KXLOWTLAX":  "KLAX", "KXLOWTDEN":  "KDEN", "KXLOWTAUS":  "KAUS",
+    "KXLOWTPHIL": "KPHL", "KXLOWTATL":  "KATL", "KXLOWTBOS":  "KBOS",
+    "KXLOWTDAL":  "KDFW", "KXLOWTDC":   "KDCA", "KXLOWTHOU":  "KHOU",
+    "KXLOWTLV":   "KLAS", "KXLOWTMIN":  "KMSP", "KXLOWTNOLA": "KMSY",
+    "KXLOWTOKC":  "KOKC", "KXLOWTPHX":  "KPHX", "KXLOWTSATX": "KSAT",
+    "KXLOWTSEA":  "KSEA", "KXLOWTSFO":  "KSFO",
+}
+
+# Scan cadence
+SCAN_INTERVAL_SEC = 60              # 60s normal; low-temp markets move slowly
+FAST_SCAN_INTERVAL_SEC = 15         # pre-dawn (1h before sunrise → 1h after)
+LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
+
+# Opportunity filters (paper mode logs everything; these gate what gets flagged in Discord)
+MIN_EDGE_PAPER = 0.10               # log ALL, but tag 'TAKEABLE' when >=10% edge
+MIN_EDGE_LIVE = 0.15                # live mode: 15% edge
+MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
+MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
+MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
+MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
+
+# Live-mode Kelly sizing (only used when PAPER_MODE=False)
+MAX_BET_USD = 5.00                  # small to start live
+KELLY_FRACTION = 0.25
+MIN_BET_USD = 0.50
+
+# Data paths
+DATA_DIR = Path("/home/ubuntu/paper_min_bot/data")
+LOG_DIR = Path("/home/ubuntu/paper_min_bot/logs")
+try:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+except OSError:
+    # Non-VPS environments (tests, dev boxes) may not have /home/ubuntu.
+    # Tests override DATA_DIR/LOG_DIR before calling anything that writes.
+    pass
+
+POSITIONS_FILE = DATA_DIR / "paper_positions.json"
+TRADES_FILE = DATA_DIR / "paper_trades.jsonl"       # every candidate + decision
+SETTLEMENTS_FILE = DATA_DIR / "paper_settlements.jsonl"
+STATS_FILE = DATA_DIR / "paper_stats.json"
+NBP_CACHE_FILE = DATA_DIR / "paper_nbp_cache.json"
+ENV_FILE = Path("/home/ubuntu/.env")
+
+# Kalshi
+KALSHI_BASE = "https://api.elections.kalshi.com"
+KALSHI_TIMEOUT = 15.0
+
+# ═══════════════════════════════════════════════════════════════════════
+# LOGGING
+# ═══════════════════════════════════════════════════════════════════════
+
+_LOG_LOCK = threading.Lock()
+_LOG_FILE_PATH = LOG_DIR / f"paper_min_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+
+def log(msg: str, level: str = "info") -> None:
+    ts = datetime.now(timezone.utc).strftime("%H:%M:%S.%f")[:-3]
+    line = f"[{ts}] {msg}"
+    with _LOG_LOCK:
+        print(line, flush=True)
+        try:
+            # Rotate log by date
+            global _LOG_FILE_PATH
+            today_path = LOG_DIR / f"paper_min_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.log"
+            _LOG_FILE_PATH = today_path
+            with open(today_path, "a") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
+def _atomic_write_json(path: Path, data: Any) -> None:
+    tmp = Path(str(path) + ".tmp")
+    with open(tmp, "w") as f:
+        json.dump(data, f, default=str)
+    os.replace(tmp, path)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# KALSHI CLIENT + AUTH
+# ═══════════════════════════════════════════════════════════════════════
+
+_KEY_ID: str = ""
+_PRIVATE_KEY = None
+
+def _load_kalshi_auth() -> None:
+    """Load Kalshi auth from /home/ubuntu/.env + kalshi_key.pem.
+    Auth is needed even in paper mode: Kalshi's market discovery and snapshot
+    endpoints require signed requests."""
+    global _KEY_ID, _PRIVATE_KEY
+    try:
+        env_txt = ENV_FILE.read_text()
+        m = re.search(r"KALSHI_KEY_ID=(\S+)", env_txt)
+        if not m:
+            raise RuntimeError("KALSHI_KEY_ID missing from .env")
+        _KEY_ID = m.group(1)
+    except Exception as e:
+        raise RuntimeError(f"Failed loading .env: {e}") from e
+    pem_path = Path("/home/ubuntu/kalshi_key.pem")
+    if not pem_path.exists():
+        raise RuntimeError(f"Kalshi PEM missing at {pem_path}")
+    _PRIVATE_KEY = serialization.load_pem_private_key(pem_path.read_bytes(), password=None)
+
+
+def _sign(method: str, path: str) -> dict[str, str]:
+    if _PRIVATE_KEY is None:
+        _load_kalshi_auth()
+    ts_ms = str(int(time.time() * 1000))
+    msg = (ts_ms + method + path).encode()
+    sig = _PRIVATE_KEY.sign(
+        msg,
+        padding.PSS(mgf=padding.MGF1(hashes.SHA256()), salt_length=padding.PSS.DIGEST_LENGTH),
+        hashes.SHA256(),
+    )
+    return {
+        "KALSHI-ACCESS-KEY": _KEY_ID,
+        "KALSHI-ACCESS-SIGNATURE": base64.b64encode(sig).decode(),
+        "KALSHI-ACCESS-TIMESTAMP": ts_ms,
+        "Content-Type": "application/json",
+    }
+
+
+def kalshi_get(path: str, params: dict | None = None) -> dict:
+    r = httpx.get(KALSHI_BASE + path, params=params, headers=_sign("GET", path),
+                  timeout=KALSHI_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def kalshi_post(path: str, body: dict) -> dict:
+    r = httpx.post(KALSHI_BASE + path, json=body, headers=_sign("POST", path),
+                   timeout=KALSHI_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OBS READER — running_min + snapshot from obs-pipeline
+# ═══════════════════════════════════════════════════════════════════════
+
+def _climate_date_nws(tz_name: str, now_utc: datetime | None = None) -> str:
+    """NWS LST climate day (no DST). Mirrors obs-pipeline's function."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    jan = datetime(now_utc.year, 1, 15, 12, 0, tzinfo=ZoneInfo(tz_name))
+    std_offset = jan.utcoffset() or timedelta(0)
+    lst = now_utc + std_offset
+    return lst.strftime("%Y-%m-%d")
+
+
+def get_running_min(station: str, climate_date: str) -> Optional[float]:
+    """Read running_min from obs-pipeline sqlite for (station, climate_date).
+    Returns None if no obs recorded yet."""
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT min_f FROM running_min WHERE station=? AND climate_date=?",
+            (station, climate_date),
+        ).fetchone()
+        conn.close()
+        return float(row[0]) if row else None
+    except sqlite3.Error as e:
+        log(f"  obs-pipeline DB read error for {station} {climate_date}: {e}", "warn")
+        return None
+
+
+def get_latest_obs(station: str) -> Optional[dict]:
+    """Latest observation (temp_f, obs_time) from obs-pipeline — used for
+    current-temperature snapshot and model sigma collapse decisions."""
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT temp_f, obs_time, source FROM observations "
+            "WHERE station=? AND temp_f IS NOT NULL "
+            "ORDER BY obs_time DESC LIMIT 1",
+            (station,),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return None
+        return {"temp_f": float(row[0]), "obs_time": int(row[1]), "source": row[2]}
+    except sqlite3.Error as e:
+        log(f"  obs-pipeline latest-obs read error: {e}", "warn")
+        return None
+
+
+def get_cli_low(station: str, climate_date: str) -> Optional[int]:
+    """Read CLI settlement low (if published) from obs-pipeline cli_reports."""
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT low_f FROM cli_reports WHERE station=? AND climate_date=? "
+            "ORDER BY issued_time DESC LIMIT 1",
+            (station, climate_date),
+        ).fetchone()
+        conn.close()
+        return int(row[0]) if row and row[0] is not None else None
+    except sqlite3.Error as e:
+        log(f"  cli_low read error: {e}", "warn")
+        return None
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NBP FETCHER — NBM Probabilistic bulletins for TNNMN (min mu) + TNNSD (min sigma)
+# ═══════════════════════════════════════════════════════════════════════
+#
+# NBM Probabilistic text bulletins are published every 6h on AWS S3.
+# Format: /noaa-nbm-grib2-pds/blend.YYYYMMDD/HH/text/blend_nbstx.tHHz
+# Parsed sections include TNNMN (min-temperature mean, °F) and TNNSD
+# (standard deviation, °F). Mirrors V2's NBP fetcher for max (TXNMN/TXNSD)
+# but with opposite variables.
+#
+# Cache: 6h. Disk-persisted so restart doesn't lose recent NBP data.
+
+_nbp_cache: dict[str, dict] = {}      # {station: {'date_str': {'mu': f, 'sigma': f, 'fetched': ts}}}
+_nbp_cache_lock = threading.Lock()
+_nbp_cache_ts: float = 0.0
+
+NBP_CYCLES = ["00", "06", "12", "18"]  # bulletins available every 6h
+NBP_MAX_AGE_SEC = 8 * 3600             # 8h — one cycle past
+
+def _load_nbp_cache_from_disk() -> None:
+    global _nbp_cache, _nbp_cache_ts
+    try:
+        if NBP_CACHE_FILE.exists():
+            with open(NBP_CACHE_FILE) as f:
+                data = json.load(f)
+            with _nbp_cache_lock:
+                _nbp_cache = data.get("cache", {})
+                _nbp_cache_ts = float(data.get("ts", 0.0))
+            log(f"  NBP cache loaded: {sum(len(v) for v in _nbp_cache.values())} entries")
+    except Exception as e:
+        log(f"  NBP cache load failed (non-critical): {e}", "warn")
+
+
+def _save_nbp_cache_to_disk() -> None:
+    try:
+        with _nbp_cache_lock:
+            snap = {"cache": dict(_nbp_cache), "ts": _nbp_cache_ts}
+        _atomic_write_json(NBP_CACHE_FILE, snap)
+    except Exception as e:
+        log(f"  NBP cache save failed: {e}", "warn")
+
+
+def _nbp_parse_bulletin(text: str, cycle_hour: int, bulletin_date: str) -> dict[str, dict]:
+    """Parse NBP text bulletin — extract TXNMN + TXNSD rows per station, indexed
+    at 12z UTC columns (which carry the MIN-temp values — 00z = max, 12z = min).
+
+    NBM NBP bulletin format (learned 2026-04-24 by inspecting live bulletin):
+      - Station block begins with ` {STATION}    NBM V4.3 NBP GUIDANCE ...`
+      - Header row: SAT 25 | SUN 26 | ... (day-of-week + date)
+      - UTC row: `12| 00  12| 00  12|...` — 12z=MinT, 00z=MaxT
+      - FHR row: forecast hours from bulletin init
+      - TXNMN row: temperature mean °F (MIN at UTC==12, MAX at UTC==00)
+      - TXNSD row: standard deviation °F (same column semantics)
+
+    Date mapping: the 12z forecast for "SAT 25" (day name + date header) is
+    the MIN for SAT 25. We derive the target date from the bulletin init +
+    FHR (adjusted back 1h since the 12z forecast hour lands at the START of
+    morning, which is still the same calendar day as the overnight low).
+
+    Returns: {station: {date_str: {'mu': f, 'sigma': f}}}.
+    """
+    result: dict[str, dict] = {}
+    bull_dt = datetime.strptime(bulletin_date, "%Y%m%d")
+    stations_to_find = set(NBP_STATION_MAP.values())
+
+    for station in stations_to_find:
+        idx = text.find(f" {station} ")
+        if idx < 0:
+            continue
+        start = max(0, text.rfind("\n", 0, idx) + 1)
+        block_lines = text[start:start + 2000].splitlines()
+
+        all_vals: dict[str, list[Optional[int]]] = {}
+        for line in block_lines:
+            parts = line.split("|")
+            if len(parts) < 2:
+                continue
+            field = line[:7].strip()
+            if not field or field in ("MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"):
+                continue
+            vals: list[Optional[int]] = []
+            pre = parts[0][7:].strip()
+            if pre:
+                for tok in pre.split():
+                    try:
+                        vals.append(int(tok))
+                    except ValueError:
+                        vals.append(None)
+            for p in parts[1:]:
+                for tok in p.strip().split():
+                    try:
+                        vals.append(int(tok))
+                    except ValueError:
+                        vals.append(None)
+            all_vals[field] = vals
+
+        utc_vals = all_vals.get("UTC", [])
+        fhr_vals = all_vals.get("FHR", [])
+        # TXNMN + TXNSD are used for BOTH max and min — disambiguated by UTC col
+        txnmn = all_vals.get("TXNMN", [])
+        txnsd = all_vals.get("TXNSD", [])
+
+        # 12z columns carry the MinT values we want.
+        mint_indices = [i for i, v in enumerate(utc_vals) if v == 12]
+
+        station_data: dict[str, dict] = {}
+        for i in mint_indices:
+            if i >= len(fhr_vals) or fhr_vals[i] is None:
+                continue
+            fhr = fhr_vals[i]
+            # Target date for the 12z forecast: bulletin init + (cycle_hour +
+            # fhr) hours. The 12z forecast represents the overnight low whose
+            # calendar date aligns with the DAY-OF-WEEK header in the block.
+            # Simplest correct mapping: UTC 12z for MinT → the calendar date
+            # of the target hour in LST (i.e. the day you'd wake up on).
+            target_dt = bull_dt + timedelta(hours=cycle_hour + fhr)
+            # The 12z forecast time is 7am CDT / 6am CST / 5am MST / 4am PST —
+            # well inside the climate day it belongs to. No offset needed.
+            target_date = target_dt.strftime("%Y-%m-%d")
+
+            mu = txnmn[i] if i < len(txnmn) else None
+            sigma = txnsd[i] if i < len(txnsd) else None
+            if mu is None or sigma is None:
+                continue
+            station_data[target_date] = {
+                "mu": float(mu),
+                "sigma": float(sigma) if sigma > 0 else 2.5,
+            }
+        if station_data:
+            result[station] = station_data
+    return result
+
+
+def _nbp_fetch_latest_bulletin() -> Optional[tuple[str, int, str]]:
+    """Fetch the most recent NBP bulletin text from AWS S3.
+    Returns (text, cycle_hour, bulletin_date_YYYYMMDD) or None.
+
+    Uses blend_nbptx (longer-range bulletin with TXNMN/TXNSD). NBM Probabilistic
+    cycles run 01/07/13/19 UTC; 06z/18z are short-range and omit TXNMN.
+    """
+    now = datetime.now(timezone.utc)
+    today = now.strftime("%Y%m%d")
+    yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
+    cycle_order = [
+        (today, "19"), (today, "13"), (today, "07"), (today, "01"),
+        (yesterday, "19"), (yesterday, "13"), (yesterday, "07"),
+    ]
+    for d, h in cycle_order:
+        url = ("https://noaa-nbm-grib2-pds.s3.amazonaws.com/"
+               f"blend.{d}/{h}/text/blend_nbptx.t{h}z")
+        try:
+            r = httpx.get(url, timeout=30.0)
+            if r.status_code != 200:
+                continue
+            data = r.text
+            # Sanity check: TXNMN present (present on 01/07/13/19 cycles).
+            if "TXNMN" not in data[:500000]:
+                continue
+            if len(data) < 1000000:
+                continue
+            log(f"  NBP: fetched blend.{d}/{h} ({len(data)//1024}KB)")
+            return data, int(h), d
+        except Exception:
+            continue
+    return None
+
+
+def refresh_nbp_forecasts() -> None:
+    """Fetch NBP bulletin + parse + update cache. Idempotent; call periodically."""
+    global _nbp_cache, _nbp_cache_ts
+    fetched = _nbp_fetch_latest_bulletin()
+    if not fetched:
+        log("  NBP: fetch failed — keeping stale cache", "warn")
+        return
+    text, cycle_hour, bulletin_date = fetched
+    parsed = _nbp_parse_bulletin(text, cycle_hour, bulletin_date)
+    with _nbp_cache_lock:
+        for st, dates in parsed.items():
+            _nbp_cache.setdefault(st, {}).update(dates)
+        _nbp_cache_ts = time.time()
+    _save_nbp_cache_to_disk()
+    log(f"  NBP: parsed {len(parsed)} stations")
+
+
+def get_nbp_forecast(series: str, date_str: str) -> Optional[dict]:
+    """Get cached NBP (mu, sigma) for a series' station on date_str.
+    Returns None if not in cache."""
+    nbp_station = NBP_STATION_MAP.get(series)
+    if not nbp_station:
+        return None
+    with _nbp_cache_lock:
+        return _nbp_cache.get(nbp_station, {}).get(date_str)
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NBM OPEN-METEO FETCHER — hourly min via Open-Meteo's NBM endpoint
+# ═══════════════════════════════════════════════════════════════════════
+
+_nbm_om_cache: dict[str, dict] = {}
+_nbm_om_cache_lock = threading.Lock()
+NBM_OM_TTL_SEC = 3600      # refresh hourly
+
+_hrrr_cache: dict[str, dict] = {}
+_hrrr_cache_lock = threading.Lock()
+HRRR_TTL_SEC = 600         # refresh every 10 min; HRRR updates hourly
+
+
+def _fetch_open_meteo_daily_min(model: str, cache: dict, cache_lock: threading.Lock,
+                                  label: str) -> None:
+    """Generic Open-Meteo daily min fetcher. Shared by NBM + HRRR."""
+    for series, meta in CITIES.items():
+        try:
+            r = httpx.get(
+                "https://api.open-meteo.com/v1/forecast",
+                params={
+                    "latitude": meta["lat"], "longitude": meta["lon"],
+                    "models": model,
+                    "daily": "temperature_2m_min",
+                    "temperature_unit": "fahrenheit",
+                    "timezone": meta["tz"],
+                    "forecast_days": 3,
+                },
+                timeout=10.0,
+            )
+            r.raise_for_status()
+            data = r.json()
+            daily = data.get("daily", {})
+            dates = daily.get("time", [])
+            mins = daily.get("temperature_2m_min", [])
+            by_date = {}
+            for d, m in zip(dates, mins):
+                if m is not None:
+                    by_date[d] = {"min_f": float(m), "fetched": time.time()}
+            with cache_lock:
+                cache[series] = by_date
+        except Exception as e:
+            log(f"  {label} fetch {series}: {e}", "warn")
+
+
+def refresh_nbm_om_forecasts() -> None:
+    """Fetch NBM daily min via Open-Meteo for all 20 cities."""
+    _fetch_open_meteo_daily_min("best_match", _nbm_om_cache, _nbm_om_cache_lock, "NBM-OM")
+
+
+# Open-Meteo paid endpoint — required for HRRR access. Same key as V1/V2.
+_OPEN_METEO_API_KEY: Optional[str] = None
+_HRRR_DISABLED = False  # set True after first 400 to stop retrying
+
+def _load_open_meteo_key() -> None:
+    global _OPEN_METEO_API_KEY
+    if _OPEN_METEO_API_KEY is not None:
+        return
+    try:
+        env_txt = ENV_FILE.read_text()
+        m = re.search(r"OPEN_METEO_API_KEY=(\S+)", env_txt)
+        if m:
+            _OPEN_METEO_API_KEY = m.group(1)
+            log(f"  Open-Meteo paid key loaded (HRRR enabled)")
+    except Exception as e:
+        log(f"  Open-Meteo key load failed: {e}", "warn")
+
+
+def refresh_hrrr_forecasts() -> None:
+    """Fetch HRRR hourly temperatures via Open-Meteo's PAID endpoint
+    (customer-api.open-meteo.com) using `models=hrrr_conus`. Computes daily
+    min from hourly trajectory. Free endpoint does NOT support HRRR.
+
+    HRRR is high-res (3km), updates hourly, ~48h horizon — best available
+    nowcast for upcoming overnight lows.
+    """
+    global _HRRR_DISABLED
+    if _HRRR_DISABLED:
+        return
+    _load_open_meteo_key()
+    if not _OPEN_METEO_API_KEY:
+        _HRRR_DISABLED = True
+        log("  HRRR disabled: OPEN_METEO_API_KEY not in .env", "warn")
+        return
+
+    paid_url = "https://customer-api.open-meteo.com/v1/forecast"
+    fetched_count = 0
+    for series, meta in CITIES.items():
+        try:
+            r = httpx.get(
+                paid_url,
+                params={
+                    "latitude": meta["lat"], "longitude": meta["lon"],
+                    "models": "ncep_hrrr_conus", "hourly": "temperature_2m",
+                    "temperature_unit": "fahrenheit",
+                    "timezone": meta["tz"],
+                    "forecast_days": 3,
+                    "apikey": _OPEN_METEO_API_KEY,
+                },
+                timeout=10.0,
+            )
+            if r.status_code == 401 or r.status_code == 403:
+                _HRRR_DISABLED = True
+                log(f"  HRRR disabled: paid endpoint auth failed ({r.status_code})", "warn")
+                return
+            r.raise_for_status()
+            data = r.json()
+            hourly = data.get("hourly", {})
+            times = hourly.get("time", [])
+            temps = hourly.get("temperature_2m", [])
+            by_date: dict[str, float] = {}
+            for t, temp in zip(times, temps):
+                if temp is None:
+                    continue
+                date_str = t[:10]
+                if date_str not in by_date or temp < by_date[date_str]:
+                    by_date[date_str] = float(temp)
+            if by_date:
+                with _hrrr_cache_lock:
+                    _hrrr_cache[series] = {
+                        d: {"min_f": v, "fetched": time.time()}
+                        for d, v in by_date.items()
+                    }
+                fetched_count += 1
+        except Exception as e:
+            log(f"  HRRR fetch {series}: {e}", "warn")
+    if fetched_count:
+        log(f"  HRRR: fetched {fetched_count}/{len(CITIES)} cities (paid Open-Meteo)")
+
+
+def get_nbm_om_min(series: str, date_str: str) -> Optional[float]:
+    with _nbm_om_cache_lock:
+        entry = _nbm_om_cache.get(series, {}).get(date_str)
+    if not entry:
+        return None
+    if time.time() - entry.get("fetched", 0) > NBM_OM_TTL_SEC * 2:
+        return None  # stale
+    return float(entry["min_f"])
+
+
+def get_hrrr_min(series: str, date_str: str) -> Optional[float]:
+    with _hrrr_cache_lock:
+        entry = _hrrr_cache.get(series, {}).get(date_str)
+    if not entry:
+        return None
+    if time.time() - entry.get("fetched", 0) > HRRR_TTL_SEC * 3:
+        return None
+    return float(entry["min_f"])
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MIN-TEMP PROBABILITY MODEL
+# ═══════════════════════════════════════════════════════════════════════
+
+def _gauss_cdf(x: float) -> float:
+    """Standard normal CDF via erf approximation (no scipy dep)."""
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+
+
+def calc_bracket_probability_min(
+    mu: float, sigma: float,
+    floor: Optional[float], cap: Optional[float],
+    running_min: Optional[float] = None,
+    post_sunrise_lock: bool = False,
+) -> float:
+    """P(daily_min falls in bracket [floor, cap]) under Gaussian(mu, sigma),
+    with two physics-based refinements:
+
+    1. **running_min as HARD CEILING**: once we've observed a low of X today,
+       the final daily min is ≤ X with certainty. If running_min is below cap,
+       truncate the distribution above running_min. If running_min ≤ floor,
+       the bracket is already guaranteed LOSER (P=0 unless low must be above
+       floor; tails below floor resolve T64 = "63° or below" YES, not bracket).
+
+       Bracket semantics: 'B64.5' means 'low between 64 and 65 inclusive'.
+       Tail 'T64' means 'low ≤ 63°F'. Tail 'T71' means 'low ≥ 72°F'.
+
+    2. **post-sunrise lock**: once sunrise has passed + obs is warming, the
+       min is essentially fixed. Caller sets post_sunrise_lock=True and we
+       collapse sigma to 0.5°F residual ASOS-vs-CLI noise.
+
+    Bracket convention (from Kalshi KXLOWT markets):
+      - B-brackets are 2°F wide, centered on integer+0.5 (e.g. B64.5 = [64, 65])
+      - T-low is ≤ (T_val - 1), e.g. T64 = low ≤ 63
+      - T-high is ≥ (T_val + 1), e.g. T71 = low ≥ 72
+    Caller passes floor/cap as the actual bounds (B64.5 → floor=64.0, cap=65.0;
+    T64 → floor=None, cap=63.5; T71 → floor=71.5, cap=None).
+    """
+    if sigma <= 0:
+        sigma = 0.5
+
+    # Post-sunrise: collapse forecast to the observed running_min with tight
+    # residual noise. Skip the truncation conditioning below — the Gaussian
+    # centered on rm already captures the remaining uncertainty (ASOS vs CLI
+    # sampling / rounding differences).
+    if post_sunrise_lock and running_min is not None:
+        mu = running_min
+        sigma = 0.5
+        lo_z = ((floor - mu) / sigma) if floor is not None else None
+        hi_z = ((cap - mu) / sigma) if cap is not None else None
+        p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
+        p_hi = _gauss_cdf(hi_z) if hi_z is not None else 1.0
+        return max(0.0, min(1.0, p_hi - p_lo))
+
+    # Pre-sunrise with running_min: apply truncation AND renormalize.
+    # The posterior P(X in [floor, cap] | X ≤ rm) = P(X in [floor, min(cap,rm)]) / P(X ≤ rm)
+    if running_min is not None:
+        if floor is not None and floor > running_min:
+            return 0.0  # bracket entirely above rm — impossible
+        effective_cap = cap if (cap is None or running_min >= cap) else running_min
+        norm_z = (running_min - mu) / sigma
+        norm_denom = _gauss_cdf(norm_z)
+        if norm_denom <= 0:
+            return 0.0
+        lo_z = ((floor - mu) / sigma) if floor is not None else None
+        hi_z = ((effective_cap - mu) / sigma) if effective_cap is not None else norm_z
+        p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
+        p_hi = _gauss_cdf(hi_z)
+        prob = (p_hi - p_lo) / norm_denom
+        return max(0.0, min(1.0, prob))
+
+    # No running_min constraint — unconditional Gaussian.
+    lo_z = ((floor - mu) / sigma) if floor is not None else None
+    hi_z = ((cap - mu) / sigma) if cap is not None else None
+    p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
+    p_hi = _gauss_cdf(hi_z) if hi_z is not None else 1.0
+    return max(0.0, min(1.0, p_hi - p_lo))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# BRACKET / MARKET PARSER
+# ═══════════════════════════════════════════════════════════════════════
+
+_TAIL_LO = re.compile(r"-T(\d+)$")     # e.g. -T64
+_BRACKET = re.compile(r"-B(\d+\.?\d*)$")  # e.g. -B64.5
+
+def parse_market_bracket(ticker: str) -> Optional[dict]:
+    """Parse a KXLOWT market ticker → bracket bounds.
+
+    Bracket convention:
+      B<val> → [val-0.5, val+0.5] i.e. 2°F wide centered on val.
+      Actually from Kalshi subtitles:
+        'B64.5' = '64° to 65°' → floor=64, cap=65
+      T low-tail:
+        'T64' = '63° or below' → floor=None, cap=63.5
+      T high-tail:
+        'T71' = '72° or above' → floor=71.5, cap=None
+
+    We determine T-direction by position: if the T value is below the event's
+    bracket range (first market) it's the LOW tail; if above (last market) it's
+    the HIGH tail. Without access to the full event, we make a best guess from
+    magnitude.
+    """
+    m = _BRACKET.search(ticker)
+    if m:
+        val = float(m.group(1))
+        # 'B64.5' bracket goes from (val - 0.5) to (val + 0.5)
+        return {"kind": "bracket", "floor": val - 0.5, "cap": val + 0.5, "value": val}
+    m = _TAIL_LO.search(ticker)
+    if m:
+        val = int(m.group(1))
+        # Need event context to know if LOW or HIGH tail. Defer; caller decides.
+        return {"kind": "tail", "value": val}
+    return None
+
+
+def resolve_tail_bracket(market: dict, all_markets_in_event: list[dict]) -> dict:
+    """Given a tail market + the full event's market list, determine whether
+    this is the LOW tail or the HIGH tail and return proper floor/cap."""
+    bracket = parse_market_bracket(market.get("ticker", ""))
+    if not bracket or bracket["kind"] != "tail":
+        return bracket or {}
+    val = bracket["value"]
+    # Find all B-brackets in the event; their range tells us tail direction.
+    b_vals: list[float] = []
+    for m in all_markets_in_event:
+        b = parse_market_bracket(m.get("ticker", ""))
+        if b and b["kind"] == "bracket":
+            b_vals.append(b["value"])
+    if not b_vals:
+        # No brackets found; fall back to subtitle inspection
+        sub = (market.get("subtitle") or market.get("yes_sub_title") or "").lower()
+        if "below" in sub:
+            return {"kind": "tail_low", "floor": None, "cap": float(val) - 0.5, "value": val}
+        return {"kind": "tail_high", "floor": float(val) + 0.5, "cap": None, "value": val}
+    if val <= min(b_vals):
+        return {"kind": "tail_low", "floor": None, "cap": float(val) - 0.5, "value": val}
+    return {"kind": "tail_high", "floor": float(val) + 0.5, "cap": None, "value": val}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# KALSHI MARKET DISCOVERY
+# ═══════════════════════════════════════════════════════════════════════
+
+def discover_markets() -> list[dict]:
+    """Pull open events + their markets for all 20 KXLOWT* series.
+    Returns a flat list: [{event_ticker, market_ticker, yes_bid, yes_ask,
+                           floor, cap, kind, station, series, date_str, subtitle}]"""
+    out: list[dict] = []
+    for series, meta in CITIES.items():
+        try:
+            data = kalshi_get("/trade-api/v2/events", {
+                "series_ticker": series,
+                "status": "open",
+                "with_nested_markets": True,
+                "limit": 10,
+            })
+        except Exception as e:
+            log(f"  market discovery failed for {series}: {e}", "warn")
+            continue
+        for ev in data.get("events", []):
+            ev_tk = ev.get("event_ticker", "")
+            # Parse date from event ticker: KXLOWTAUS-26APR25 → 2026-04-25
+            m = re.match(r".*-(\d{2})([A-Z]{3})(\d{2})$", ev_tk)
+            if not m:
+                continue
+            yy, mon_s, dd = m.groups()
+            mon_map = {"JAN":"01","FEB":"02","MAR":"03","APR":"04","MAY":"05","JUN":"06",
+                       "JUL":"07","AUG":"08","SEP":"09","OCT":"10","NOV":"11","DEC":"12"}
+            date_str = f"20{yy}-{mon_map.get(mon_s, '01')}-{dd}"
+            markets = ev.get("markets", [])
+            for mkt in markets:
+                tkr = mkt.get("ticker", "")
+                br = parse_market_bracket(tkr)
+                if not br:
+                    continue
+                if br["kind"] == "tail":
+                    br = resolve_tail_bracket(mkt, markets)
+                    if not br:
+                        continue
+                out.append({
+                    "event_ticker": ev_tk,
+                    "market_ticker": tkr,
+                    "yes_bid": mkt.get("yes_bid"),
+                    "yes_ask": mkt.get("yes_ask"),
+                    "no_bid": mkt.get("no_bid"),
+                    "no_ask": mkt.get("no_ask"),
+                    "floor": br.get("floor"),
+                    "cap": br.get("cap"),
+                    "kind": br.get("kind"),
+                    "station": meta["station"],
+                    "series": series,
+                    "date_str": date_str,
+                    "subtitle": mkt.get("subtitle") or mkt.get("yes_sub_title", ""),
+                    "tz": meta["tz"],
+                    "label": meta["label"],
+                    "volume": mkt.get("volume", 0),
+                })
+    return out
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# OPPORTUNITY FINDER
+# ═══════════════════════════════════════════════════════════════════════
+
+def _hours_to_sunrise(tz_name: str, lat: float, lon: float) -> float:
+    """Approximate hours until local sunrise. Negative if sunrise already
+    passed today; in that case returns hours until tomorrow's sunrise.
+
+    Rough US-mainland approximation: sunrise is at 6 AM local year-round
+    within ±1.5h depending on season/latitude. Good enough for the binary
+    "past sunrise" decision + sigma collapse.
+    """
+    now_local = datetime.now(ZoneInfo(tz_name))
+    sunrise_today = now_local.replace(hour=6, minute=30, second=0, microsecond=0)
+    if now_local > sunrise_today + timedelta(hours=1):
+        # Already past morning; next sunrise is tomorrow.
+        sunrise_tomorrow = sunrise_today + timedelta(days=1)
+        return (sunrise_tomorrow - now_local).total_seconds() / 3600.0
+    return (sunrise_today - now_local).total_seconds() / 3600.0
+
+
+def _is_post_sunrise(tz_name: str) -> bool:
+    """True if we've passed today's sunrise by at least 1 hour — at that
+    point, the daily min is almost certainly already observed."""
+    now_local = datetime.now(ZoneInfo(tz_name))
+    return now_local.hour >= 8  # safe blanket: after 8 AM local, min is set
+
+
+def find_opportunities(markets: list[dict]) -> list[dict]:
+    """For each market, compute model_prob, edge vs yes_ask, and return
+    opportunities sorted by absolute edge."""
+    opps: list[dict] = []
+    for m in markets:
+        station = m["station"]
+        date_str = m["date_str"]
+        tz = m["tz"]
+        # Determine if this is today's or tomorrow's CD from obs-pipeline's POV
+        today_cd = _climate_date_nws(tz)
+        is_today = (date_str == today_cd)
+        # Fetch ALL available forecasts so we can log disagreement + blend.
+        nbp = get_nbp_forecast(m["series"], date_str)
+        nbm = get_nbm_om_min(m["series"], date_str)
+        hrrr = get_hrrr_min(m["series"], date_str)
+        mu: Optional[float] = None
+        sigma: Optional[float] = None
+        mu_source = ""
+        # Priority:
+        #   - day-0 (today): HRRR first (freshest nowcast for upcoming overnight).
+        #     But HRRR has no sigma, so pair it with NBP's sigma if we have it,
+        #     otherwise use a conservative default.
+        #   - day-1+ (future): NBP first (has sigma), else NBM-OM.
+        if is_today and hrrr is not None:
+            mu = hrrr
+            sigma = nbp["sigma"] if nbp else 2.5
+            mu_source = "hrrr"
+        elif nbp:
+            mu = nbp["mu"]
+            sigma = nbp["sigma"]
+            mu_source = "nbp"
+        elif nbm is not None:
+            mu = nbm
+            sigma = 2.5
+            mu_source = "nbm_om"
+        if mu is None:
+            continue
+        # Inflate sigma if HRRR and NBP (or NBM) disagree significantly —
+        # disagreement = model uncertainty we haven't captured.
+        disagreement = 0.0
+        if hrrr is not None and nbp is not None:
+            disagreement = max(disagreement, abs(hrrr - nbp["mu"]))
+        if hrrr is not None and nbm is not None:
+            disagreement = max(disagreement, abs(hrrr - nbm))
+        if nbp is not None and nbm is not None:
+            disagreement = max(disagreement, abs(nbp["mu"] - nbm))
+        if disagreement > 2.0:
+            # Linear inflation: 1x at 2°F disagreement, 1.5x at 5°F+
+            inflation = min(1.5, 1.0 + (disagreement - 2.0) * 0.15)
+            sigma = sigma * inflation
+        # Running min (only meaningful for today)
+        rm = get_running_min(station, today_cd) if is_today else None
+        # Post-sunrise lock
+        post_sr = is_today and _is_post_sunrise(tz) and rm is not None
+        model_prob = calc_bracket_probability_min(
+            mu=mu, sigma=sigma,
+            floor=m.get("floor"), cap=m.get("cap"),
+            running_min=rm,
+            post_sunrise_lock=post_sr,
+        )
+        # Filter wildly unlikely / crowded
+        if model_prob < MIN_MODEL_PROB or model_prob > MAX_MODEL_PROB:
+            # still LOG the candidate with a low-prob tag
+            pass
+        yes_ask = m.get("yes_ask")
+        yes_bid = m.get("yes_bid")
+        no_ask = m.get("no_ask")
+        # 2026-04-24: permissive — log EVERY bracket with a forecast as a
+        # candidate, even when market has no liquidity (yes_ask=100) or
+        # edges are negative. This builds a calibration dataset: we can
+        # later measure model_prob vs settled outcome regardless of whether
+        # we'd have traded. Untradeable candidates get action=None.
+        yes_ask_v = yes_ask if yes_ask is not None else 100
+        yes_bid_v = yes_bid if yes_bid is not None else 0
+        no_ask_v = no_ask if no_ask is not None else (100 - yes_bid_v)
+        yes_ask_frac = yes_ask_v / 100.0
+        no_ask_frac = no_ask_v / 100.0
+        buy_yes_edge = model_prob - yes_ask_frac
+        buy_no_edge = (1 - model_prob) - no_ask_frac
+        action = None
+        edge = max(buy_yes_edge, buy_no_edge)
+        entry_price = None
+        if buy_yes_edge > buy_no_edge and buy_yes_edge > 0 and yes_ask_frac >= MIN_ORDER_PRICE:
+            action = "BUY_YES"
+            edge = buy_yes_edge
+            entry_price = yes_ask_frac
+        elif buy_no_edge > 0 and no_ask_frac >= MIN_ORDER_PRICE:
+            action = "BUY_NO"
+            edge = buy_no_edge
+            entry_price = no_ask_frac
+        # else: action=None, edge may be negative — record as calibration only
+        opps.append({
+            **m,
+            "mu": mu, "sigma": sigma, "mu_source": mu_source,
+            "mu_nbp": nbp["mu"] if nbp else None,
+            "sigma_nbp": nbp["sigma"] if nbp else None,
+            "mu_nbm_om": nbm, "mu_hrrr": hrrr,
+            "disagreement": disagreement,
+            "running_min": rm, "post_sunrise_lock": post_sr,
+            "is_today": is_today,
+            "model_prob": model_prob,
+            "yes_ask_frac": yes_ask_frac, "no_ask_frac": no_ask_frac,
+            "action": action, "edge": edge, "entry_price": entry_price,
+        })
+    opps.sort(key=lambda o: o["edge"], reverse=True)
+    return opps
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# PAPER EXECUTOR
+# ═══════════════════════════════════════════════════════════════════════
+
+def _append_jsonl(path: Path, record: dict) -> None:
+    try:
+        with open(path, "a") as f:
+            f.write(json.dumps(record, default=str) + "\n")
+    except Exception as e:
+        log(f"  jsonl append failed {path}: {e}", "warn")
+
+
+_open_paper_positions: dict[str, dict] = {}  # market_ticker → position record
+_positions_lock = threading.Lock()
+
+
+def _load_paper_positions() -> None:
+    global _open_paper_positions
+    try:
+        if POSITIONS_FILE.exists():
+            with open(POSITIONS_FILE) as f:
+                _open_paper_positions = json.load(f)
+            log(f"  loaded {len(_open_paper_positions)} paper positions")
+    except Exception as e:
+        log(f"  paper positions load failed: {e}", "warn")
+
+
+def _save_paper_positions() -> None:
+    with _positions_lock:
+        snap = dict(_open_paper_positions)
+    _atomic_write_json(POSITIONS_FILE, snap)
+
+
+def record_candidate(opp: dict) -> None:
+    """Record a candidate opportunity for calibration analysis. Every
+    generated opp goes here — not just taken ones — so we can back-test
+    the model's probability calibration against settled outcomes."""
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": "PAPER" if PAPER_MODE else "LIVE",
+        "kind": "candidate",
+        **{k: opp.get(k) for k in (
+            "event_ticker", "market_ticker", "station", "series", "date_str",
+            "label", "floor", "cap", "kind",
+            "yes_bid", "yes_ask", "no_bid", "no_ask",
+            "volume", "mu", "sigma", "mu_source",
+            "mu_nbp", "sigma_nbp", "mu_nbm_om", "mu_hrrr", "disagreement",
+            "running_min",
+            "post_sunrise_lock", "is_today", "model_prob",
+            "yes_ask_frac", "no_ask_frac",
+            "action", "edge", "entry_price",
+        )},
+    }
+    _append_jsonl(TRADES_FILE, record)
+
+
+def execute_opportunity(opp: dict) -> None:
+    """PAPER mode: log a hypothetical entry. LIVE mode (not yet wired):
+    would call Kalshi's orders endpoint."""
+    if opp.get("action") is None or opp.get("entry_price") is None:
+        return
+    edge = float(opp["edge"])
+    # Filter on minimum edge appropriate to mode
+    min_edge = MIN_EDGE_PAPER if PAPER_MODE else MIN_EDGE_LIVE
+    if edge < min_edge:
+        return
+    mode = "PAPER" if PAPER_MODE else "LIVE"
+    ticker = opp["market_ticker"]
+    # Sizing: kelly with MAX_BET_USD cap
+    edge_frac = edge
+    price = float(opp["entry_price"])
+    kelly = KELLY_FRACTION * edge_frac / max(1 - price, 0.01)
+    bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * MAX_BET_USD))
+    count = max(1, int(bet_usd / price))
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "mode": mode,
+        "kind": "entry",
+        "market_ticker": ticker,
+        "action": opp["action"],
+        "entry_price": price,
+        "count": count,
+        "cost": count * price,
+        "edge": edge,
+        "model_prob": opp["model_prob"],
+        "mu": opp["mu"], "sigma": opp["sigma"], "mu_source": opp["mu_source"],
+        "running_min": opp["running_min"],
+        "floor": opp.get("floor"), "cap": opp.get("cap"),
+        "station": opp["station"], "date_str": opp["date_str"],
+        "label": opp["label"],
+    }
+    _append_jsonl(TRADES_FILE, record)
+    with _positions_lock:
+        _open_paper_positions[ticker] = record
+    _save_paper_positions()
+    log(f"  [{mode}] {opp['action']} {count}x @ {price*100:.0f}c on {ticker} "
+        f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
+        f"σ={opp['sigma']:.1f}°F rm={opp['running_min']}")
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# SETTLEMENT
+# ═══════════════════════════════════════════════════════════════════════
+
+def check_settlements() -> int:
+    """Walk open paper positions; for each, check if the settlement CLI low
+    has been published. If so, compute P&L and archive."""
+    settled = 0
+    with _positions_lock:
+        positions = dict(_open_paper_positions)
+    for ticker, pos in positions.items():
+        station = pos.get("station")
+        date_str = pos.get("date_str")
+        if not station or not date_str:
+            continue
+        cli_low = get_cli_low(station, date_str)
+        if cli_low is None:
+            continue  # settlement not yet available
+        # Determine outcome
+        floor = pos.get("floor")
+        cap = pos.get("cap")
+        in_bracket = True
+        if floor is not None and cli_low < floor:
+            in_bracket = False
+        if cap is not None and cli_low > cap:
+            in_bracket = False
+        action = pos.get("action")
+        yes_wins = in_bracket
+        our_win = (yes_wins if action == "BUY_YES" else (not yes_wins))
+        count = int(pos.get("count", 0))
+        price = float(pos.get("entry_price", 0.0))
+        cost = count * price
+        revenue = count * 1.0 if our_win else 0.0
+        pnl = revenue - cost
+        settlement = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "mode": pos.get("mode"),
+            "kind": "settlement",
+            "market_ticker": ticker, "action": action,
+            "entry_price": price, "count": count, "cost": cost,
+            "cli_low": cli_low, "floor": floor, "cap": cap,
+            "in_bracket": in_bracket, "won": our_win,
+            "revenue": revenue, "pnl": pnl,
+            "model_prob": pos.get("model_prob"),
+            "mu": pos.get("mu"), "sigma": pos.get("sigma"),
+            "mu_source": pos.get("mu_source"),
+            "running_min_at_entry": pos.get("running_min"),
+            "station": station, "date_str": date_str,
+            "label": pos.get("label"),
+        }
+        _append_jsonl(SETTLEMENTS_FILE, settlement)
+        with _positions_lock:
+            _open_paper_positions.pop(ticker, None)
+        settled += 1
+        log(f"  SETTLED {ticker} | action={action} CLI_low={cli_low}°F "
+            f"in={in_bracket} won={our_win} pnl=${pnl:+.2f}")
+    if settled:
+        _save_paper_positions()
+    return settled
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MAIN LOOP
+# ═══════════════════════════════════════════════════════════════════════
+
+_shutdown = threading.Event()
+
+
+def _sig_handler(sig, frame):
+    log(f"received signal {sig}, shutting down")
+    _shutdown.set()
+
+
+def scan_cycle() -> dict:
+    """One full scan: settlements, forecasts refresh (throttled),
+    market discovery, opp find, log candidates, paper-execute taken ones."""
+    stats = {"settled": 0, "markets": 0, "candidates": 0, "opps": 0, "taken": 0}
+    stats["settled"] = check_settlements()
+
+    # Forecast refresh (throttled by internal TTL)
+    global _nbp_cache_ts
+    with _nbp_cache_lock:
+        nbp_age = time.time() - _nbp_cache_ts
+    if nbp_age > 6 * 3600:
+        try:
+            refresh_nbp_forecasts()
+        except Exception as e:
+            log(f"  NBP refresh failed: {e}", "warn")
+
+    # NBM-OM refresh (check cached per-series freshness)
+    try:
+        # Simple: refresh once per cycle if any entry is older than 1h
+        need_refresh = False
+        with _nbm_om_cache_lock:
+            for series in CITIES:
+                entries = _nbm_om_cache.get(series, {})
+                if not entries:
+                    need_refresh = True
+                    break
+                newest = max((e.get("fetched", 0) for e in entries.values()), default=0)
+                if time.time() - newest > NBM_OM_TTL_SEC:
+                    need_refresh = True
+                    break
+        if need_refresh:
+            refresh_nbm_om_forecasts()
+    except Exception as e:
+        log(f"  NBM-OM refresh failed: {e}", "warn")
+
+    # HRRR refresh — more frequent (10-min TTL) since HRRR updates hourly
+    try:
+        need_refresh = False
+        with _hrrr_cache_lock:
+            for series in CITIES:
+                entries = _hrrr_cache.get(series, {})
+                if not entries:
+                    need_refresh = True
+                    break
+                newest = max((e.get("fetched", 0) for e in entries.values()), default=0)
+                if time.time() - newest > HRRR_TTL_SEC:
+                    need_refresh = True
+                    break
+        if need_refresh:
+            refresh_hrrr_forecasts()
+    except Exception as e:
+        log(f"  HRRR refresh failed: {e}", "warn")
+
+    try:
+        markets = discover_markets()
+    except Exception as e:
+        log(f"  market discovery failed: {e}", "warn")
+        return stats
+    stats["markets"] = len(markets)
+    opps = find_opportunities(markets)
+    stats["candidates"] = len(opps)
+    for opp in opps:
+        record_candidate(opp)
+    # Execute the takeable ones
+    min_edge = MIN_EDGE_PAPER if PAPER_MODE else MIN_EDGE_LIVE
+    taken = [o for o in opps if o.get("edge", 0) >= min_edge]
+    stats["opps"] = sum(1 for o in opps if o.get("edge", 0) > 0)
+    for opp in taken:
+        ticker = opp["market_ticker"]
+        # Skip if we already hold
+        with _positions_lock:
+            if ticker in _open_paper_positions:
+                continue
+        execute_opportunity(opp)
+        stats["taken"] += 1
+    return stats
+
+
+def main() -> None:
+    signal.signal(signal.SIGINT, _sig_handler)
+    signal.signal(signal.SIGTERM, _sig_handler)
+    log("=" * 60)
+    log(f"paper_min_bot starting (PAPER_MODE={PAPER_MODE})")
+    log(f"  cities: {len(CITIES)}")
+    log(f"  obs DB: {OBS_DB_PATH}")
+    log(f"  data dir: {DATA_DIR}")
+    log("=" * 60)
+    _load_kalshi_auth()
+    _load_paper_positions()
+    _load_nbp_cache_from_disk()
+    # Initial forecast fetches before first scan
+    try:
+        refresh_nbp_forecasts()
+    except Exception as e:
+        log(f"  initial NBP fetch failed: {e}", "warn")
+    try:
+        refresh_nbm_om_forecasts()
+    except Exception as e:
+        log(f"  initial NBM-OM fetch failed: {e}", "warn")
+    try:
+        refresh_hrrr_forecasts()
+    except Exception as e:
+        log(f"  initial HRRR fetch failed: {e}", "warn")
+
+    last_heartbeat = 0.0
+    while not _shutdown.is_set():
+        t0 = time.monotonic()
+        try:
+            stats = scan_cycle()
+        except Exception as e:
+            log(f"  scan_cycle error: {e}", "error")
+            import traceback
+            log(traceback.format_exc(), "error")
+            stats = {}
+        elapsed = time.monotonic() - t0
+        log(f"cycle done: markets={stats.get('markets',0)} "
+            f"cands={stats.get('candidates',0)} opps={stats.get('opps',0)} "
+            f"taken={stats.get('taken',0)} settled={stats.get('settled',0)} "
+            f"({elapsed:.1f}s)")
+
+        if time.time() - last_heartbeat > LOG_HEARTBEAT_SEC:
+            with _positions_lock:
+                n_open = len(_open_paper_positions)
+            log(f"HEARTBEAT open_positions={n_open} mode={'PAPER' if PAPER_MODE else 'LIVE'}")
+            last_heartbeat = time.time()
+
+        # Faster scan during pre-dawn window (any city could be near its low)
+        # Simple: check if any of our cities is between 4-8 AM local.
+        fast = False
+        for series, meta in CITIES.items():
+            h = datetime.now(ZoneInfo(meta["tz"])).hour
+            if 4 <= h < 8:
+                fast = True
+                break
+        interval = FAST_SCAN_INTERVAL_SEC if fast else SCAN_INTERVAL_SEC
+        # Sleep but wake on shutdown
+        _shutdown.wait(interval)
+
+    log("paper_min_bot exited cleanly")
+
+
+if __name__ == "__main__":
+    main()

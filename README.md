@@ -1,0 +1,97 @@
+# paper-min-bot
+
+Paper trading bot for Kalshi low-temperature markets (`KXLOWT*`). Hypothetical
+entries only — no real money — until `PAPER_MODE = False`. Same 20 cities as
+V1/V2 but opposite settlement: daily minimum instead of maximum.
+
+## Architecture
+
+- **obs-pipeline dependency**: reads `running_min` from obs-pipeline's SQLite
+  DB for real-time overnight-low tracking (added 2026-04-24 alongside existing
+  `running_max`).
+- **Forecasts**: NBP (NBM Probabilistic text bulletins on AWS S3, `TNNMN`/`TNNSD`
+  for min-temp mu + sigma). Fallback to NBM via Open-Meteo daily
+  `temperature_2m_min`.
+- **Model**: truncated Gaussian bounded above by `running_min` (the final daily
+  min cannot exceed the lowest observed temperature so far). Post-sunrise, sigma
+  collapses to 0.5°F residual ASOS-vs-CLI noise — the min is essentially fixed
+  once the sun's been up for an hour.
+- **Settlement**: reads CLI daily low from obs-pipeline's `cli_reports.low_f`
+  field (same source V1/V2 use for CLI high).
+
+## Data flow
+
+```
+obs-pipeline                   paper-min-bot
+─────────────                  ──────────────
+ingests ASOS/MADIS/AWC
+  → running_min table       →  get_running_min(station, date)
+  → observations           →  get_latest_obs(station)
+  → cli_reports.low_f       →  check_settlements()
+
+AWS S3 NBM Probabilistic     →  refresh_nbp_forecasts()
+Open-Meteo NBM daily min     →  refresh_nbm_om_forecasts()
+
+Kalshi REST                   → discover_markets() / place_order
+```
+
+## Data dir
+
+`/home/ubuntu/paper_min_bot/data/`:
+- `paper_trades.jsonl` — every candidate + entry (full context for calibration)
+- `paper_positions.json` — currently open hypothetical positions
+- `paper_settlements.jsonl` — settled outcomes + P&L
+- `paper_stats.json` — aggregates
+- `paper_nbp_cache.json` — persisted NBP forecasts across restarts
+
+## Running
+
+```bash
+# systemd
+sudo systemctl enable paper-min-bot.service
+sudo systemctl start paper-min-bot.service
+sudo systemctl status paper-min-bot.service
+sudo journalctl -u paper-min-bot -f
+
+# manual (development)
+python3.12 /home/ubuntu/paper_min_bot/paper_min_bot.py
+```
+
+## Flipping to live
+
+Edit `paper_min_bot.py`:
+- Set `PAPER_MODE = False`
+- (Optional) adjust `MAX_BET_USD`, `KELLY_FRACTION`, `MIN_EDGE_LIVE`
+- Restart the service
+
+That's it. All upstream code (forecasts, obs, model, opp generation) is identical
+in paper and live modes. The only branch is inside `execute_opportunity()`.
+
+## Files touched by the obs-pipeline extension (2026-04-24)
+
+To support this bot, obs-pipeline gained parallel min-tracking alongside its
+existing max-tracking:
+
+- `pipeline/storage/db.py`: new `running_min` / `running_min_local` tables +
+  `upsert_running_min()` (lowest-wins) + `_OBS_RUNNING_MIN_SOURCES` allow-list
+- `pipeline/storage/snapshot.py`: `StationSnapshot` gained `min_f_nws`,
+  `min_f_local`, `min_obs_time`, `min_source`, `cli_low`, `dsm_low` fields
+  (defaults to None — backward-compatible with V2)
+- `pipeline/sources/{awc_metar,ldm_files,madis_netcdf,nws_obs}.py`: each call
+  to `upsert_running_max` is now paired with `upsert_running_min` of the same
+  obs; snapshot updates now include min fields.
+- `tests/test_running_min.py`: 10 unit tests covering lowest-wins, source
+  allow-list, parallel-to-max regression, snapshot field preservation.
+
+V2 is unaffected — still reads `max_f_nws`/`max_f_local` from `/snapshot`,
+ignoring the new min fields.
+
+## Not yet implemented (backlog)
+
+- HRRR overnight nowcast blending (HRRR 0-18h min trajectory)
+- NWS gridpoint minTemperature as tertiary mu source
+- `seed_running_min_from_observations()` wired into obs-pipeline startup
+  (so fresh restarts correctly initialize today's running_min from the
+  observations table instead of whatever obs arrives first post-restart)
+- Discord alerts (route paper bot alerts to a separate channel)
+- Web dashboard (calibration curve, P&L by city, rolling Brier score)

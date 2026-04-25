@@ -1,0 +1,193 @@
+"""Unit tests for paper_min_bot core functions.
+
+Covers:
+  - Bracket parsing (B/T-low/T-high detection, correct floor/cap)
+  - Min-temp probability math (Gaussian CDF, running_min truncation, post-sunrise lock)
+  - Hours-to-sunrise heuristic
+  - Climate date helper
+
+Does NOT exercise Kalshi, obs-pipeline DB, or NBP fetch — those are integration
+tested via live runs.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+# Point DATA_DIR at a temp location before import
+_TMPDIR = tempfile.mkdtemp(prefix="paper_min_test_")
+os.environ["HOME"] = _TMPDIR
+sys.path.insert(0, "/tmp/paper_min_bot")
+
+# Override paths BEFORE import
+import paper_min_bot as pb
+pb.DATA_DIR = Path(_TMPDIR) / "data"
+pb.LOG_DIR = Path(_TMPDIR) / "logs"
+pb.DATA_DIR.mkdir(parents=True, exist_ok=True)
+pb.LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+
+class TestBracketParse(unittest.TestCase):
+    def test_bracket_b_parsed_correctly(self):
+        b = pb.parse_market_bracket("KXLOWTAUS-26APR25-B64.5")
+        self.assertEqual(b["kind"], "bracket")
+        self.assertEqual(b["floor"], 64.0)
+        self.assertEqual(b["cap"], 65.0)
+
+    def test_bracket_b_integer_val(self):
+        b = pb.parse_market_bracket("KXLOWTCHI-26APR25-B50.5")
+        self.assertAlmostEqual(b["floor"], 50.0)
+        self.assertAlmostEqual(b["cap"], 51.0)
+
+    def test_tail_unclassified_needs_event_context(self):
+        t = pb.parse_market_bracket("KXLOWTAUS-26APR25-T64")
+        self.assertEqual(t["kind"], "tail")
+        self.assertEqual(t["value"], 64)
+
+    def test_tail_low_resolved_from_event(self):
+        t_market = {"ticker": "KXLOWTAUS-26APR25-T64", "subtitle": "63° or below"}
+        event = [
+            {"ticker": "KXLOWTAUS-26APR25-T64"},
+            {"ticker": "KXLOWTAUS-26APR25-B64.5"},
+            {"ticker": "KXLOWTAUS-26APR25-B66.5"},
+            {"ticker": "KXLOWTAUS-26APR25-B68.5"},
+            {"ticker": "KXLOWTAUS-26APR25-T71"},
+        ]
+        r = pb.resolve_tail_bracket(t_market, event)
+        self.assertEqual(r["kind"], "tail_low")
+        self.assertIsNone(r["floor"])
+        self.assertEqual(r["cap"], 63.5)
+
+    def test_tail_high_resolved_from_event(self):
+        t_market = {"ticker": "KXLOWTAUS-26APR25-T71"}
+        event = [
+            {"ticker": "KXLOWTAUS-26APR25-T64"},
+            {"ticker": "KXLOWTAUS-26APR25-B64.5"},
+            {"ticker": "KXLOWTAUS-26APR25-B68.5"},
+            {"ticker": "KXLOWTAUS-26APR25-T71"},
+        ]
+        r = pb.resolve_tail_bracket(t_market, event)
+        self.assertEqual(r["kind"], "tail_high")
+        self.assertEqual(r["floor"], 71.5)
+        self.assertIsNone(r["cap"])
+
+
+class TestBracketProbability(unittest.TestCase):
+    def test_gaussian_without_truncation(self):
+        # N(65, 2) → P(64 < X < 66) should be ~38% (about ±0.5σ)
+        p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                              floor=64.0, cap=66.0)
+        self.assertTrue(0.30 < p < 0.45)
+
+    def test_running_min_truncates_above(self):
+        # Running min = 62 means the daily min can't exceed 62. The bracket
+        # 64-66 requires low ≥ 64, which is impossible if low ≤ 62.
+        p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                              floor=64.0, cap=66.0,
+                                              running_min=62.0)
+        self.assertAlmostEqual(p, 0.0, places=5)
+
+    def test_running_min_conditions_probability_correctly(self):
+        # Running min 65.5 imposes "low ≤ 65.5". The posterior P(bracket | X ≤ 65.5)
+        # renormalizes — since the bracket 64-65.5 occupies most of the conditional
+        # support, posterior prob should be higher than unconditional.
+        p_no_rm = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                                    floor=64.0, cap=66.0)
+        p_rm = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                                 floor=64.0, cap=66.0,
+                                                 running_min=65.5)
+        # Conditional posterior should be higher (we've ruled out most of upper tail)
+        self.assertGreater(p_rm, p_no_rm)
+        # But still valid probability
+        self.assertLessEqual(p_rm, 1.0)
+        self.assertGreaterEqual(p_rm, 0.0)
+
+    def test_running_min_below_bracket_gives_zero(self):
+        # Running min 62 — low definitely ≤62, so bracket 64-66 is impossible.
+        p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                              floor=64.0, cap=66.0,
+                                              running_min=62.0)
+        self.assertEqual(p, 0.0)
+
+    def test_running_min_far_above_bracket_negligible_impact(self):
+        # Running min way above bracket — the rm constraint barely affects
+        # the lower tail where the bracket lives.
+        p_no_rm = pb.calc_bracket_probability_min(mu=50.0, sigma=3.0,
+                                                    floor=48.0, cap=50.0)
+        p_rm = pb.calc_bracket_probability_min(mu=50.0, sigma=3.0,
+                                                 floor=48.0, cap=50.0,
+                                                 running_min=80.0)  # impossible ceiling
+        # Both should be nearly equal (rm=80 barely constrains)
+        self.assertAlmostEqual(p_rm, p_no_rm, places=3)
+
+    def test_post_sunrise_lock_collapses_to_rm(self):
+        # Post-sunrise + rm=62 — we're essentially certain the min was 62±0.5.
+        # A bracket encompassing 62 should resolve near 100%; one far away
+        # should be near 0%.
+        p_hit = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
+                                                 floor=61.5, cap=62.5,
+                                                 running_min=62.0,
+                                                 post_sunrise_lock=True)
+        self.assertGreater(p_hit, 0.60)
+        p_miss = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
+                                                  floor=68.0, cap=69.0,
+                                                  running_min=62.0,
+                                                  post_sunrise_lock=True)
+        self.assertLess(p_miss, 0.05)
+
+    def test_low_tail_no_floor(self):
+        # "T64" = low ≤ 63°F. Under N(65, 2), should be small.
+        p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                              floor=None, cap=63.5)
+        self.assertTrue(0.15 < p < 0.30)
+
+    def test_high_tail_no_cap(self):
+        # "T71" = low ≥ 72°F. Under N(65, 2), should be tiny.
+        p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
+                                              floor=71.5, cap=None)
+        self.assertLess(p, 0.01)
+
+    def test_sigma_zero_does_not_crash(self):
+        # Edge case: sigma == 0 (post-sunrise with perfect obs)
+        p = pb.calc_bracket_probability_min(mu=62.0, sigma=0.0,
+                                              floor=61.5, cap=62.5,
+                                              running_min=62.0)
+        self.assertGreaterEqual(p, 0.0)
+        self.assertLessEqual(p, 1.0)
+
+
+class TestClimateDate(unittest.TestCase):
+    def test_eastern_lst_year_round(self):
+        # Climate date uses LST (no DST) — for America/New_York at UTC 15:00
+        # on 2026-04-15 (during DST), LST date is 2026-04-15 (since 15 UTC
+        # is 10 AM EST = 10 AM LST, same day).
+        from datetime import datetime, timezone
+        dt = datetime(2026, 4, 15, 15, 0, tzinfo=timezone.utc)
+        self.assertEqual(pb._climate_date_nws("America/New_York", dt), "2026-04-15")
+
+    def test_utc_midnight_previous_day_in_lst(self):
+        # At 04:00 UTC, EST = 23:00 previous day. So climate date = yesterday.
+        from datetime import datetime, timezone
+        dt = datetime(2026, 4, 15, 4, 0, tzinfo=timezone.utc)
+        self.assertEqual(pb._climate_date_nws("America/New_York", dt), "2026-04-14")
+
+
+class TestBracketDetection(unittest.TestCase):
+    def test_all_20_cities_have_nbp_mapping(self):
+        # Every series in CITIES should have a corresponding NBP station code
+        for series in pb.CITIES:
+            self.assertIn(series, pb.NBP_STATION_MAP,
+                           f"missing NBP mapping for {series}")
+
+    def test_nbp_mapping_is_4_char_icao(self):
+        for series, nbp in pb.NBP_STATION_MAP.items():
+            self.assertEqual(len(nbp), 4, f"{series} → {nbp} is not 4 chars")
+            self.assertTrue(nbp.startswith("K") or nbp.startswith("P"),
+                            f"{series} → {nbp} should start with K (CONUS) or P (Pacific)")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

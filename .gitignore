@@ -1,0 +1,10 @@
+# Runtime data — large + rotates frequently, do not version
+data/
+logs/
+__pycache__/
+*.pyc
+.pytest_cache/
+*.log
+
+# Local backups
+*.bak.*
