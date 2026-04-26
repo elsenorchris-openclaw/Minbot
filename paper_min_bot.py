@@ -135,6 +135,11 @@ MAX_BET_USD = 3.00                  # $3 cap per entry (raised 2026-04-26 from $
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 
+MIN_ABS_DISTANCE_F = 1.0            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
+                                    # Even when edge math passes, mu near bracket = coin-flip;
+                                    # small forecast error flips outcome. Ported from V2 max-bot
+                                    # 2026-04-26 (V2: +$206 net on 480 trades).
+
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 30.00      # day scope (UTC midnight); $4 → $15 → $30 (2026-04-26)
@@ -1756,6 +1761,27 @@ def execute_opportunity(opp: dict) -> bool:
     if action == "BUY_YES" and mp <= 0.50:
         log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} ≤ 50% (action vs model disagree)")
         return False
+    # ABS DISTANCE GATE (BUY_NO only). When mu is close to the bracket
+    # midpoint, even a small forecast error flips the outcome — coin flip.
+    # Ported from V2 max-bot. BUY_YES is NOT gated: mu near bracket center
+    # is the BUY_YES sweet spot, not the danger zone.
+    if action == "BUY_NO":
+        fl = opp.get("floor"); cp = opp.get("cap")
+        if fl is not None and cp is not None:
+            bracket_mid = (float(fl) + float(cp)) / 2.0
+        elif fl is not None:
+            bracket_mid = float(fl)
+        elif cp is not None:
+            bracket_mid = float(cp)
+        else:
+            bracket_mid = None
+        if bracket_mid is not None:
+            mu_val = float(opp.get("mu", 0.0))
+            abs_dist = abs(mu_val - bracket_mid)
+            if abs_dist < MIN_ABS_DISTANCE_F:
+                log(f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
+                    f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F (min {MIN_ABS_DISTANCE_F:.1f}°F)")
+                return False
     disagreement = float(opp.get("disagreement", 0.0))
     if disagreement > MAX_DISAGREEMENT_F:
         log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")

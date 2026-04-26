@@ -91,6 +91,7 @@ All in `paper_min_bot.py`:
 | `MAX_EDGE` | `0.40` | Skip edges > 40% (V1 trust-zone — model error) |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain |
 | **Directional consistency** | `mp 0.50` | BUY_NO requires `mp < 0.50`; BUY_YES requires `mp > 0.50`. Don't bet against your own model. The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. Added 2026-04-26 after first-day data showed 5/5 BUY_NO losers had `mp ≥ 50%`. |
+| `MIN_ABS_DISTANCE_F` | `1.0°F` | **BUY_NO only** — skip when `\|mu − bracket_mid\| < 1°F`. Even with edge math passing, mu near bracket = coin-flip; small forecast error flips outcome. Bracket mid is `(floor+cap)/2` for B-range, single edge for tail brackets. Ported from V2 max-bot 2026-04-26 (V2: +$206 net on 480 trades). BUY_YES intentionally not gated — mu near bracket center is the BUY_YES sweet spot. |
 | `MAX_DISAGREEMENT_F` | `5.0°F` | Skip if HRRR vs NBP / NBP vs NBM diverge > this |
 | `MAX_SPREAD_CENTS` | `10c` | Skip if ask − bid > 10c on buying side |
 | `MAX_MU_VS_RM_DIFF_F` | `5.0°F` | Pre-sunrise: forecast μ vs observed rm sanity gate |

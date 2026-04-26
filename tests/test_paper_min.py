@@ -734,6 +734,8 @@ class TestDirectionalConsistency(unittest.TestCase):
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, action, model_prob, **overrides):
+        # mu chosen 2.5°F from bracket midpoint (45.5) so ABS DISTANCE GATE
+        # doesn't fire — these tests target the directional filter only.
         base = {
             "market_ticker": "KXLOWTNYC-26APR25-B45.5",
             "event_ticker": "KXLOWTNYC-26APR25",
@@ -743,7 +745,8 @@ class TestDirectionalConsistency(unittest.TestCase):
             "entry_price": 0.30 if action == "BUY_NO" else 0.10,
             "yes_bid": 65, "yes_ask": 70,
             "no_bid": 28, "no_ask": 32,
-            "mu": 45.0, "sigma": 2.5, "mu_source": "nws_primary",
+            "mu": 43.0 if action == "BUY_NO" else 45.5,
+            "sigma": 2.5, "mu_source": "nws_primary",
             "running_min": None, "post_sunrise_lock": False,
             "disagreement": 1.0,
             "floor": 45.0, "cap": 46.0,
@@ -758,7 +761,7 @@ class TestDirectionalConsistency(unittest.TestCase):
         self.assertEqual(self._order_calls, [], "place_kalshi_order should not have been called")
 
     def test_buy_no_with_low_mp_allowed_through_gate(self):
-        """BUY_NO with mp < 50% reaches the order-placement step."""
+        """BUY_NO with mp < 50% (and mu far enough from bracket) reaches order placement."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.30))
         self.assertEqual(len(self._order_calls), 1, "place_kalshi_order should have been called once")
 
@@ -777,6 +780,96 @@ class TestDirectionalConsistency(unittest.TestCase):
         rather than betting on a coin flip."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.50))
         pb.execute_opportunity(self._opp("BUY_YES", 0.50))
+        self.assertEqual(self._order_calls, [])
+
+
+class TestAbsDistanceGate(unittest.TestCase):
+    """ABS DISTANCE GATE (BUY_NO only): skip when |mu − bracket_mid| < 1°F.
+    Ported from V2 max-bot. The directional consistency filter alone catches
+    the "model agrees with bracket" case; ABS DISTANCE catches "model is so
+    near the bracket boundary that small forecast error flips outcome" even
+    when model_prob looks low. PHIL-B44.5 lost on 2026-04-25 with mp=18%
+    but mu=44.6 right on bracket midpoint 44.5."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._order_calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._order_calls.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, action, mu, floor, cap, model_prob=None, **overrides):
+        if model_prob is None:
+            model_prob = 0.30 if action == "BUY_NO" else 0.65
+        base = {
+            "market_ticker": "KXLOWTNYC-26APR25-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR25",
+            "action": action,
+            "model_prob": model_prob,
+            "edge": 0.25,
+            "entry_price": 0.30 if action == "BUY_NO" else 0.10,
+            "yes_bid": 65, "yes_ask": 70,
+            "no_bid": 28, "no_ask": 32,
+            "mu": mu, "sigma": 2.5, "mu_source": "nws_primary",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": floor, "cap": cap,
+            "station": "KNYC", "date_str": "2026-04-25", "label": "New York",
+        }
+        base.update(overrides)
+        return base
+
+    def test_constant_is_one(self):
+        self.assertEqual(pb.MIN_ABS_DISTANCE_F, 1.0)
+
+    def test_buy_no_blocked_at_bracket_center(self):
+        """PHIL-B44.5 reconstruction: mu exactly at bracket midpoint."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=44.5, floor=44.0, cap=45.0))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_blocked_just_under_threshold(self):
+        """mu 0.1°F from midpoint must block."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=44.6, floor=44.0, cap=45.0))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_passes_at_threshold(self):
+        """mu exactly 1.0°F from midpoint passes (strict less-than)."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=43.5, floor=44.0, cap=45.0))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_no_passes_well_above_threshold(self):
+        """mu 2°F from midpoint passes."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=42.5, floor=44.0, cap=45.0))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_yes_not_gated_at_center(self):
+        """BUY_YES at bracket center is the SWEET SPOT, must not be blocked."""
+        pb.execute_opportunity(self._opp("BUY_YES", mu=44.5, floor=44.0, cap=45.0))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_no_tail_low_uses_cap_as_mid(self):
+        """T-low (cap=47.5, no floor): mid is the cap. mu=47.4 → blocked."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=47.4, floor=None, cap=47.5))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_tail_low_passes_far(self):
+        """T-low: mu well below cap is the BUY_NO sweet spot."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=44.0, floor=None, cap=47.5))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_no_tail_high_uses_floor_as_mid(self):
+        """T-high (floor=66.5, no cap): mid is the floor. mu=66.6 → blocked."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=66.6, floor=66.5, cap=None))
         self.assertEqual(self._order_calls, [])
 
 
