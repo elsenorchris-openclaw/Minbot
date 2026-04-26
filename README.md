@@ -84,7 +84,7 @@ All in `paper_min_bot.py`:
 |---|---|---|
 | `MAX_BET_USD` | `$1.00` | Kelly-sized but capped per entry |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
-| `MAX_NEW_PER_EVENT_PER_CYCLE` | `1` | Don't pile correlated bracket bets in same city |
+| `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |
 | `DAILY_EXPOSURE_CAP_USD` | `$4.00` | Sized for the V1 wallet (~$25); raise as bankroll grows |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
@@ -139,6 +139,23 @@ python3.12 /home/ubuntu/paper_min_bot/paper_min_bot.py
 
 `sudo systemctl stop paper-min-bot`. Open positions stay on Kalshi and
 self-settle from the `cli_reports` low.
+
+## Startup self-heal
+
+On boot, the bot runs three reconciliation passes in order so it never
+double-buys after a deploy or crash:
+
+1. `_load_positions()` — reads `positions.json` (TTL filter).
+2. `_reconcile_kalshi_positions()` — pulls `/portfolio/positions` and adds
+   any KXLOWT* holding the bot doesn't track (the original "ghost
+   position" defense).
+3. `_reconcile_from_trades_log()` — reads today's `kind=entry` records
+   from `trades.jsonl` and adds any whose ticker is missing from
+   `_open_positions` *and* not already in `settlements.jsonl`. Closes
+   the Kalshi `/portfolio/positions` API-lag window. Without this,
+   KXLOWTCHI-26APR25-T48 was bought twice on 2026-04-25 (16 min apart,
+   between back-to-back deploy restarts) because positions.json was
+   clobbered AND Kalshi hadn't propagated the fill yet.
 
 ## Files touched by the obs-pipeline extension (2026-04-24)
 

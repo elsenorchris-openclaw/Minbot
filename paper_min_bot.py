@@ -124,8 +124,11 @@ MAX_DISAGREEMENT_F = 5.0            # skip if HRRR vs NBP / NBP vs NBM disagree 
 MAX_SPREAD_CENTS = 10               # skip if (yes_ask − yes_bid) > 10c on the active side
 MAX_MU_VS_RM_DIFF_F = 5.0           # pre-sunrise sanity: skip if forecast μ disagrees with
                                     # observed running_min by more than this — model is wrong
-MAX_NEW_PER_EVENT_PER_CYCLE = 1     # don't pile on multiple brackets of the same event
-                                    # (correlated bets — if forecast is wrong all lose)
+MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per event_ticker.
+                                    # Lifetime cap (counts against _open_positions, not just
+                                    # this cycle). Prior per-cycle version let CHI-26APR25
+                                    # accumulate 4 brackets across cycles 2026-04-25.
+                                    # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
 MAX_BET_USD = 1.00                  # $1 cap per entry
@@ -1389,7 +1392,6 @@ _cycle_budget_lock = threading.Lock()
 _cycle_new_count = 0                          # reset each cycle
 _today_exposure_usd = 0.0                     # cost of today's entries
 _today_date_utc: str = ""                     # tracks UTC midnight rollover
-_cycle_event_counts: dict[str, int] = {}      # event_ticker → entries this cycle
 
 # Per-ticker cooldowns ported from V2 (H-2 fix 2026-04-16): if Kalshi 409s a
 # market with "trading_is_paused", or 400s the account with insufficient_balance,
@@ -1403,25 +1405,41 @@ INSUFFICIENT_BALANCE_COOLDOWN_SEC = 300.0     # 5 min, since the bankroll is sma
 
 def _reset_cycle_budget() -> None:
     """Called at the top of scan_cycle()."""
-    global _cycle_new_count, _today_exposure_usd, _today_date_utc, _cycle_event_counts
+    global _cycle_new_count, _today_exposure_usd, _today_date_utc
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     with _cycle_budget_lock:
         _cycle_new_count = 0
-        _cycle_event_counts = {}
         if today != _today_date_utc:
             _today_date_utc = today
             _today_exposure_usd = 0.0
 
 
+def _open_count_for_event(event_ticker: str) -> int:
+    """Count currently-open (non-settled) positions on a given event."""
+    if not event_ticker:
+        return 0
+    with _positions_lock:
+        return sum(
+            1 for tk, pos in _open_positions.items()
+            if not pos.get("settled") and tk.rsplit("-", 1)[0] == event_ticker
+        )
+
+
 def _budget_can_take(cost_usd: float, event_ticker: str = "") -> tuple[bool, str]:
-    """Check live-mode caps. Returns (ok, reason_if_blocked)."""
+    """Check live-mode caps. Returns (ok, reason_if_blocked).
+
+    Per-event cap counts against `_open_positions` (lifetime, not per-cycle),
+    so once any bracket on an event is open we won't add another bracket on
+    the same event until that one settles. Correlated-bet protection."""
+    if event_ticker:
+        open_n = _open_count_for_event(event_ticker)
+        if open_n >= MAX_OPEN_PER_EVENT:
+            return False, f"event_cap({event_ticker} open={open_n})"
     with _cycle_budget_lock:
         if _cycle_new_count >= MAX_NEW_POSITIONS_PER_CYCLE:
             return False, f"cycle_cap({_cycle_new_count}/{MAX_NEW_POSITIONS_PER_CYCLE})"
         if _today_exposure_usd + cost_usd > DAILY_EXPOSURE_CAP_USD:
             return False, f"daily_cap(${_today_exposure_usd:.2f}+${cost_usd:.2f}>${DAILY_EXPOSURE_CAP_USD:.2f})"
-        if event_ticker and _cycle_event_counts.get(event_ticker, 0) >= MAX_NEW_PER_EVENT_PER_CYCLE:
-            return False, f"event_cap({event_ticker})"
     return True, ""
 
 
@@ -1430,8 +1448,6 @@ def _budget_record(cost_usd: float, event_ticker: str = "") -> None:
     with _cycle_budget_lock:
         _cycle_new_count += 1
         _today_exposure_usd += cost_usd
-        if event_ticker:
-            _cycle_event_counts[event_ticker] = _cycle_event_counts.get(event_ticker, 0) + 1
 
 
 def _in_paused_cooldown(ticker: str) -> bool:
@@ -1565,6 +1581,77 @@ def _reconcile_kalshi_positions() -> int:
     if added:
         _save_positions()
         log(f"  reconciliation: recovered {added} ghost positions from Kalshi")
+    return added
+
+
+def _reconcile_from_trades_log() -> int:
+    """Closes the Kalshi `/portfolio/positions` API-lag window after a deploy
+    or rapid restart where positions.json was clobbered before Kalshi had
+    propagated our recent fills.
+
+    Reads today's `kind=entry` records from TRADES_FILE and adds any whose
+    market_ticker is missing from `_open_positions` *and* not already in
+    SETTLEMENTS_FILE. Worst-case false-positive (manually-closed-then-not-
+    re-entered) is benign — it just blocks a redundant entry until next
+    cycle's reconcile catches up. The bug it prevents (CHI T48 double-entry
+    2026-04-25) is much worse: real money on correlated dupes.
+    """
+    if not TRADES_FILE.exists():
+        return 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    settled_tk: set[str] = set()
+    if SETTLEMENTS_FILE.exists():
+        try:
+            with open(SETTLEMENTS_FILE) as f:
+                for line in f:
+                    try:
+                        s = json.loads(line)
+                    except Exception:
+                        continue
+                    tk = s.get("market_ticker")
+                    if tk:
+                        settled_tk.add(tk)
+        except Exception as e:
+            log(f"  trade-log reconcile: settlements read failed: {e}", "warn")
+
+    entries: dict[str, dict] = {}
+    try:
+        with open(TRADES_FILE) as f:
+            for line in f:
+                try:
+                    t = json.loads(line)
+                except Exception:
+                    continue
+                if t.get("kind") != "entry":
+                    continue
+                if t.get("mode") == "PAPER":
+                    continue
+                ts = t.get("ts", "")
+                if not ts.startswith(today):
+                    continue
+                tk = t.get("market_ticker")
+                if not tk or tk in settled_tk:
+                    continue
+                entries[tk] = t
+    except Exception as e:
+        log(f"  trade-log reconcile read failed: {e}", "warn")
+        return 0
+
+    added = 0
+    with _positions_lock:
+        for tk, t in entries.items():
+            if tk in _open_positions:
+                continue
+            stub = dict(t)
+            stub["_recovered_from_trades_log"] = True
+            _open_positions[tk] = stub
+            added += 1
+            log(f"  recovered from trades.jsonl: {tk} ({t.get('action')} "
+                f"{t.get('count')}x @ {int(float(t.get('entry_price',0))*100)}c)")
+    if added:
+        _save_positions()
+        log(f"  trade-log reconciliation: recovered {added} entries (Kalshi API hadn't propagated)")
     return added
 
 
@@ -1935,6 +2022,15 @@ def main() -> None:
         _reconcile_kalshi_positions()
     except Exception as e:
         log(f"  reconcile failed: {e}", "warn")
+    # Belt-and-suspenders: Kalshi /portfolio/positions can lag fresh fills by
+    # minutes. If positions.json was clobbered in the same window, that lag
+    # let CHI-26APR25-T48 get bought twice on 04-25 (16 min apart, between
+    # back-to-back deploy restarts). Trades.jsonl is our own append-only
+    # log; reconciling from it closes the lag-window gap.
+    try:
+        _reconcile_from_trades_log()
+    except Exception as e:
+        log(f"  trade-log reconcile failed: {e}", "warn")
     _load_nbp_cache_from_disk()
     # Initial forecast fetches before first scan
     try:

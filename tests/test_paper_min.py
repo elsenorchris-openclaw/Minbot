@@ -301,27 +301,64 @@ class TestObsCliBuffer(unittest.TestCase):
 
 
 class TestPerEventCascade(unittest.TestCase):
-    """Per-event cycle cap — don't pile correlated bracket bets in same city."""
+    """Per-event lifetime cap — don't pile correlated bracket bets in same
+    event. The cap counts against `_open_positions`, not a per-cycle dict,
+    so once a bracket on an event is open, all other brackets on the same
+    event are blocked until that one settles. CHI-26APR25 accumulated
+    4 brackets across cycles 2026-04-25 under the prior per-cycle rule."""
 
     def setUp(self):
         with pb._cycle_budget_lock:
             pb._cycle_new_count = 0
             pb._today_exposure_usd = 0.0
             pb._today_date_utc = ""
-            pb._cycle_event_counts = {}
+        with pb._positions_lock:
+            pb._open_positions.clear()
         pb._reset_cycle_budget()
 
-    def test_per_event_cap(self):
+    def _add_open(self, ticker, settled=False):
+        with pb._positions_lock:
+            pb._open_positions[ticker] = {
+                "market_ticker": ticker, "kind": "entry",
+                "settled": settled,
+            }
+
+    def test_per_event_cap_blocks_second_bracket(self):
         ok, _ = pb._budget_can_take(0.10, "KXLOWTNYC-26APR25")
         self.assertTrue(ok)
-        pb._budget_record(0.10, "KXLOWTNYC-26APR25")
-        # Second entry on same event should be blocked.
+        self._add_open("KXLOWTNYC-26APR25-T48")
+        # Different bracket on same event should be blocked.
         ok, reason = pb._budget_can_take(0.10, "KXLOWTNYC-26APR25")
         self.assertFalse(ok)
         self.assertIn("event_cap", reason)
         # But a different event should still be allowed.
         ok, _ = pb._budget_can_take(0.10, "KXLOWTCHI-26APR25")
         self.assertTrue(ok)
+
+    def test_event_cap_holds_across_cycles(self):
+        """The pre-fix bug: per-cycle counter wiped every scan. CHI-26APR25
+        accumulated B47.5 → T48 → B43.5 → T41 across 4 cycles."""
+        self._add_open("KXLOWTCHI-26APR25-B47.5")
+        # Simulate scan_cycle()'s reset — must NOT clear the event guard.
+        pb._reset_cycle_budget()
+        ok, reason = pb._budget_can_take(0.10, "KXLOWTCHI-26APR25")
+        self.assertFalse(ok)
+        self.assertIn("event_cap", reason)
+
+    def test_settled_position_does_not_block(self):
+        """Once a position settles, the event slot frees up for the next day."""
+        self._add_open("KXLOWTNYC-26APR25-T48", settled=True)
+        ok, _ = pb._budget_can_take(0.10, "KXLOWTNYC-26APR25")
+        self.assertTrue(ok)
+
+    def test_open_count_helper_counts_only_unsettled(self):
+        self._add_open("KXLOWTNYC-26APR25-T48", settled=False)
+        self._add_open("KXLOWTNYC-26APR25-B45.5", settled=True)
+        self._add_open("KXLOWTCHI-26APR25-T48", settled=False)
+        self.assertEqual(pb._open_count_for_event("KXLOWTNYC-26APR25"), 1)
+        self.assertEqual(pb._open_count_for_event("KXLOWTCHI-26APR25"), 1)
+        self.assertEqual(pb._open_count_for_event("KXLOWTSEA-26APR25"), 0)
+        self.assertEqual(pb._open_count_for_event(""), 0)
 
 
 class TestCooldowns(unittest.TestCase):
@@ -354,8 +391,8 @@ class TestLiveSafetyConstants(unittest.TestCase):
         self.assertGreater(pb.MAX_DISAGREEMENT_F, 2.0)
         self.assertLess(pb.MAX_DISAGREEMENT_F, 10.0)
 
-    def test_per_event_per_cycle_is_one(self):
-        self.assertEqual(pb.MAX_NEW_PER_EVENT_PER_CYCLE, 1)
+    def test_max_open_per_event_is_one(self):
+        self.assertEqual(pb.MAX_OPEN_PER_EVENT, 1)
 
 
 class TestSettleKeepsDedupe(unittest.TestCase):
@@ -517,6 +554,152 @@ class TestKalshiReconcile(unittest.TestCase):
         }
         added = pb._reconcile_kalshi_positions()
         self.assertEqual(added, 0)
+
+
+class TestTradesLogReconcile(unittest.TestCase):
+    """`_reconcile_from_trades_log` closes the Kalshi /portfolio/positions
+    API-lag window after deploy churn. KXLOWTCHI-26APR25-T48 was bought
+    twice on 2026-04-25 (16 min apart, between back-to-back deploy restarts)
+    because positions.json was clobbered AND Kalshi hadn't propagated the
+    fill before the per-ticker dedupe ran."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        self._tmp_trades = Path(_TMPDIR) / "tlog_trades.jsonl"
+        self._tmp_settles = Path(_TMPDIR) / "tlog_settles.jsonl"
+        for p in (self._tmp_trades, self._tmp_settles):
+            if p.exists():
+                p.unlink()
+        self._orig_trades = pb.TRADES_FILE
+        self._orig_settles = pb.SETTLEMENTS_FILE
+        self._orig_save = pb._save_positions
+        pb.TRADES_FILE = self._tmp_trades
+        pb.SETTLEMENTS_FILE = self._tmp_settles
+        pb._save_positions = lambda: None
+
+    def tearDown(self):
+        pb.TRADES_FILE = self._orig_trades
+        pb.SETTLEMENTS_FILE = self._orig_settles
+        pb._save_positions = self._orig_save
+
+    def _write_trades(self, records):
+        with open(self._tmp_trades, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def _write_settles(self, records):
+        with open(self._tmp_settles, "w") as f:
+            for r in records:
+                f.write(json.dumps(r) + "\n")
+
+    def _today(self):
+        from datetime import datetime, timezone
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    def _yday(self):
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def test_no_trades_file_returns_zero(self):
+        if self._tmp_trades.exists():
+            self._tmp_trades.unlink()
+        self.assertEqual(pb._reconcile_from_trades_log(), 0)
+
+    def test_recovers_today_entry_missing_from_open_positions(self):
+        today = self._today()
+        self._write_trades([{
+            "ts": f"{today}T05:27:57.721+00:00", "kind": "entry",
+            "market_ticker": "KXLOWTCHI-26APR25-T48", "action": "BUY_YES",
+            "entry_price": 0.08, "count": 6, "cost": 0.48,
+            "station": "KMDW", "date_str": "2026-04-25", "label": "Chicago",
+            "floor": 48.5, "cap": None,
+        }])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 1)
+        self.assertIn("KXLOWTCHI-26APR25-T48", pb._open_positions)
+        rec = pb._open_positions["KXLOWTCHI-26APR25-T48"]
+        self.assertTrue(rec["_recovered_from_trades_log"])
+        self.assertEqual(rec["action"], "BUY_YES")
+        self.assertEqual(rec["count"], 6)
+
+    def test_skips_already_in_open_positions(self):
+        today = self._today()
+        with pb._positions_lock:
+            pb._open_positions["KXLOWTCHI-26APR25-T48"] = {"market_ticker": "KXLOWTCHI-26APR25-T48"}
+        self._write_trades([{
+            "ts": f"{today}T05:27:57+00:00", "kind": "entry",
+            "market_ticker": "KXLOWTCHI-26APR25-T48", "action": "BUY_YES",
+            "entry_price": 0.08, "count": 6, "cost": 0.48,
+        }])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 0)
+
+    def test_skips_settled_tickers(self):
+        today = self._today()
+        self._write_trades([{
+            "ts": f"{today}T05:27:57+00:00", "kind": "entry",
+            "market_ticker": "KXLOWTNYC-26APR25-T48", "action": "BUY_NO",
+            "entry_price": 0.07, "count": 10, "cost": 0.70,
+        }])
+        self._write_settles([{
+            "ts": f"{today}T11:00:00+00:00", "kind": "settlement",
+            "market_ticker": "KXLOWTNYC-26APR25-T48",
+        }])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 0)
+        self.assertNotIn("KXLOWTNYC-26APR25-T48", pb._open_positions)
+
+    def test_skips_yesterday_entries(self):
+        """Yesterday's open positions should already be picked up by
+        `_reconcile_kalshi_positions` if still on Kalshi; if not, they
+        settled. Either way, the trade-log fallback is for *today's*
+        propagation lag only."""
+        yday = self._yday()
+        self._write_trades([{
+            "ts": f"{yday}T05:27:57+00:00", "kind": "entry",
+            "market_ticker": "KXLOWTCHI-26APR24-T48", "action": "BUY_YES",
+            "entry_price": 0.08, "count": 6, "cost": 0.48,
+        }])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 0)
+
+    def test_skips_paper_mode(self):
+        today = self._today()
+        self._write_trades([{
+            "ts": f"{today}T05:27:57+00:00", "kind": "entry",
+            "mode": "PAPER",
+            "market_ticker": "KXLOWTCHI-26APR25-T48", "action": "BUY_YES",
+            "entry_price": 0.08, "count": 6, "cost": 0.48,
+        }])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 0)
+
+    def test_skips_non_entry_kinds(self):
+        today = self._today()
+        self._write_trades([
+            {"ts": f"{today}T05:00:00+00:00", "kind": "candidate",
+             "market_ticker": "KXLOWTCHI-26APR25-T48"},
+            {"ts": f"{today}T05:30:00+00:00", "kind": "settlement",
+             "market_ticker": "KXLOWTCHI-26APR25-T48"},
+        ])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 0)
+
+    def test_dedupes_multiple_entries_to_latest(self):
+        """If trades.jsonl has two entry records for the same ticker (the
+        exact bug we're guarding against), recovery adds it once."""
+        today = self._today()
+        self._write_trades([
+            {"ts": f"{today}T05:27:57+00:00", "kind": "entry",
+             "market_ticker": "KXLOWTCHI-26APR25-T48",
+             "action": "BUY_YES", "entry_price": 0.08, "count": 6, "cost": 0.48},
+            {"ts": f"{today}T05:43:05+00:00", "kind": "entry",
+             "market_ticker": "KXLOWTCHI-26APR25-T48",
+             "action": "BUY_YES", "entry_price": 0.08, "count": 3, "cost": 0.24},
+        ])
+        added = pb._reconcile_from_trades_log()
+        self.assertEqual(added, 1)
 
 
 class TestRecordCandidateKind(unittest.TestCase):
