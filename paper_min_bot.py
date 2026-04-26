@@ -131,13 +131,13 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 1.00                  # $1 cap per entry
+MAX_BET_USD = 3.00                  # $3 cap per entry (raised 2026-04-26 from $1)
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
-DAILY_EXPOSURE_CAP_USD = 15.00      # day scope (UTC midnight); raised 2026-04-25 from $4 (V1 has ~$37)
+DAILY_EXPOSURE_CAP_USD = 30.00      # day scope (UTC midnight); $4 → $15 → $30 (2026-04-26)
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
@@ -1744,6 +1744,17 @@ def execute_opportunity(opp: dict) -> bool:
     mp = float(opp.get("model_prob", 0.0))
     if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
         log(f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+        return False
+    # Directional consistency: never bet against our own model. The edge
+    # formula assumes a calibrated model, but our +1.24°F NBP-cool bias
+    # compounds when action and model direction disagree. First-day data
+    # 2026-04-26 (cascade-corrected): BUY_NO with mp ≥ 50% lost 5/5.
+    action = opp["action"]
+    if action == "BUY_NO" and mp >= 0.50:
+        log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} ≥ 50% (action vs model disagree)")
+        return False
+    if action == "BUY_YES" and mp <= 0.50:
+        log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} ≤ 50% (action vs model disagree)")
         return False
     disagreement = float(opp.get("disagreement", 0.0))
     if disagreement > MAX_DISAGREEMENT_F:

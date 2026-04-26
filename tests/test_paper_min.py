@@ -260,8 +260,8 @@ class TestWalletConfig(unittest.TestCase):
 
     def test_live_config_caps_are_conservative(self):
         # Sanity: don't accidentally ship with $1000 caps.
-        self.assertLessEqual(pb.MAX_BET_USD, 1.00)
-        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 25.00)
+        self.assertLessEqual(pb.MAX_BET_USD, 5.00)
+        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 50.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
 
@@ -700,6 +700,94 @@ class TestTradesLogReconcile(unittest.TestCase):
         ])
         added = pb._reconcile_from_trades_log()
         self.assertEqual(added, 1)
+
+
+class TestDirectionalConsistency(unittest.TestCase):
+    """Don't bet against your own model. The MIN_EDGE/MAX_EDGE math assumes
+    a calibrated model; with the +1.24°F NBP-cool bias we see in min_bot,
+    edge alone misleads when action and model direction disagree.
+
+    First-day data 2026-04-26 (cascade-corrected n=21): BUY_NO entries
+    where mp ≥ 50% lost 5/5 (-$1.53). BUY_YES with mp ≤ 50% lost the
+    one trade in sample (CHI-T41).
+
+    Test pattern: stub `place_kalshi_order` to a sentinel that records
+    when it was called. If the gate blocked, place_kalshi_order is never
+    called. If the gate passed, the order attempt is recorded (then we
+    return None to fail-fast out of execute_opportunity)."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._order_calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._order_calls.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, action, model_prob, **overrides):
+        base = {
+            "market_ticker": "KXLOWTNYC-26APR25-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR25",
+            "action": action,
+            "model_prob": model_prob,
+            "edge": 0.25,
+            "entry_price": 0.30 if action == "BUY_NO" else 0.10,
+            "yes_bid": 65, "yes_ask": 70,
+            "no_bid": 28, "no_ask": 32,
+            "mu": 45.0, "sigma": 2.5, "mu_source": "nws_primary",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KNYC", "date_str": "2026-04-25", "label": "New York",
+        }
+        base.update(overrides)
+        return base
+
+    def test_buy_no_with_high_mp_blocked(self):
+        """BUY_NO with mp ≥ 50% must be skipped — model says YES is more likely."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.55))
+        self.assertEqual(self._order_calls, [], "place_kalshi_order should not have been called")
+
+    def test_buy_no_with_low_mp_allowed_through_gate(self):
+        """BUY_NO with mp < 50% reaches the order-placement step."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.30))
+        self.assertEqual(len(self._order_calls), 1, "place_kalshi_order should have been called once")
+
+    def test_buy_yes_with_low_mp_blocked(self):
+        """BUY_YES with mp ≤ 50% must be skipped — model says NO is more likely."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.40))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_yes_with_high_mp_allowed_through_gate(self):
+        """BUY_YES with mp > 50% reaches the order-placement step."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.70))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_exact_50_blocks_both_actions(self):
+        """At mp=0.50 the model is indifferent — block both directions
+        rather than betting on a coin flip."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.50))
+        pb.execute_opportunity(self._opp("BUY_YES", 0.50))
+        self.assertEqual(self._order_calls, [])
+
+
+class TestCapBumpsApril26(unittest.TestCase):
+    """Cap bump from $1/$15 to $3/$30 on 2026-04-26."""
+
+    def test_max_bet_is_3(self):
+        self.assertEqual(pb.MAX_BET_USD, 3.00)
+
+    def test_daily_cap_is_30(self):
+        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 30.00)
 
 
 class TestRecordCandidateKind(unittest.TestCase):

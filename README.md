@@ -82,14 +82,15 @@ All in `paper_min_bot.py`:
 
 | Constant | Value | Why |
 |---|---|---|
-| `MAX_BET_USD` | `$1.00` | Kelly-sized but capped per entry |
+| `MAX_BET_USD` | `$3.00` | Kelly-sized but capped per entry (raised 2026-04-26 from $1) |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
 | `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |
-| `DAILY_EXPOSURE_CAP_USD` | `$4.00` | Sized for the V1 wallet (~$25); raise as bankroll grows |
+| `DAILY_EXPOSURE_CAP_USD` | `$30.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
 | `MAX_EDGE` | `0.40` | Skip edges > 40% (V1 trust-zone — model error) |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain |
+| **Directional consistency** | `mp 0.50` | BUY_NO requires `mp < 0.50`; BUY_YES requires `mp > 0.50`. Don't bet against your own model. The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. Added 2026-04-26 after first-day data showed 5/5 BUY_NO losers had `mp ≥ 50%`. |
 | `MAX_DISAGREEMENT_F` | `5.0°F` | Skip if HRRR vs NBP / NBP vs NBM diverge > this |
 | `MAX_SPREAD_CENTS` | `10c` | Skip if ask − bid > 10c on buying side |
 | `MAX_MU_VS_RM_DIFF_F` | `5.0°F` | Pre-sunrise: forecast μ vs observed rm sanity gate |
