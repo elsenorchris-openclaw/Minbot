@@ -260,7 +260,7 @@ class TestWalletConfig(unittest.TestCase):
 
     def test_live_config_caps_are_conservative(self):
         # Sanity: don't accidentally ship with $1000 caps.
-        self.assertLessEqual(pb.MAX_BET_USD, 5.00)
+        self.assertLessEqual(pb.MAX_BET_USD, 15.00)
         self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 100.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
@@ -965,10 +965,11 @@ class TestAbsDistanceGate(unittest.TestCase):
 class TestCapBumpsApril26(unittest.TestCase):
     """Cap evolution: $1/$4 (live launch) → $3/$30 (2026-04-26 AM) →
     $3/$60 (2026-04-27 AM, MIN_COST_USD pairing) →
-    $5/$60 (2026-04-27 PM, Chris asked for $1–$5 envelope)."""
+    $5/$60 (2026-04-27 PM, [$1, $5] envelope) →
+    $10/$60 (2026-04-27 evening, post-V2-port wins evidence)."""
 
-    def test_max_bet_is_5(self):
-        self.assertEqual(pb.MAX_BET_USD, 5.00)
+    def test_max_bet_is_10(self):
+        self.assertEqual(pb.MAX_BET_USD, 10.00)
 
     def test_daily_cap_is_60(self):
         """Bumped from $30 → $60 on 2026-04-27 to absorb the ~2× capital
