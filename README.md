@@ -89,7 +89,9 @@ All in `paper_min_bot.py`:
 | `DAILY_EXPOSURE_CAP_USD` | `$60.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27, paired with MIN_COST_USD floor) |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
-| `MAX_EDGE` | `0.40` | Skip edges > 40% (V1 trust-zone — model error) |
+| `MAX_EDGE` | `0.42` | Skip edges > 42% (V1 trust-zone — model error). Bumped 0.40 → 0.42 (2026-04-27 evening) as a cautious half-step toward V2's NWS-PRIMARY-era 0.45. |
+| **PRICE_ZONE** | `yes_bid 30-40c` | **BUY_NO only** (V2 port). Skip when market YES bid ∈ [30c, 40c] — market is uncertain (NO costs 60-70c) and our model with high BUY_NO confidence usually disagrees with the market for the wrong reasons. V2 backtest: 50% WR / −$99 / n=50. Bypassed by `_obs_confirmed_alive`. |
+| **H_2.0** | `disagreement 2°F` | **BUY_NO d-1+ only** (V2-inspired). Skip when pairwise forecast disagreement (NBP/HRRR/NBM max diff) > 2°F on day-1+ markets where we have no obs to break ties. Tighter than `MAX_DISAGREEMENT_F=5.0`. Bypassed by `_obs_confirmed_alive`. |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain |
 | **Directional consistency** | `mp 0.40 / 0.60` | BUY_NO requires `mp ≤ 0.40`; BUY_YES requires `mp ≥ 0.60`. Don't bet against your own model. Tightened 2026-04-27 from 0.50 → 0.40/0.60 to drop coin-flip-zone entries (CHI-T41 mp=34% and NYC-T44 mp=42% were both BUY_YES losers admitted at the old 0.50 threshold). The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. |
 | `MIN_ABS_DISTANCE_F` | `0.5°F` | **BUY_NO only** — skip when `\|mu − bracket_mid\| < 0.5°F` (mu inside or near bracket center). 1.0 → 1.5 (2026-04-27 AM) → reverted to 0.5 (2026-04-27 PM) after Kalshi-truth audit on n=15: at 1.5°F we'd have blocked 9/9 winners with dist 0.5–1.5°F (BUY_NO with mu *at the bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu inside) is still caught at 0.5°F. BUY_YES intentionally not gated. |

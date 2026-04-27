@@ -111,8 +111,11 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters
 MIN_EDGE = 0.20                     # min edge to take a trade
-MAX_EDGE = 0.40                     # mirror V1 trust zone: edges above this almost always come
-                                    # from model error (forecast vs market disagree wildly)
+MAX_EDGE = 0.42                     # 0.40 → 0.42 (2026-04-27 evening, cautious half-step toward
+                                    # V2's 0.45 retune). Edges above this almost always come from
+                                    # model error (forecast vs market disagree wildly). V2 raised
+                                    # to 0.45 post-NWS-PRIMARY but min_bot lacks the per-min
+                                    # validation data to commit to the full bump.
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
@@ -200,6 +203,23 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 # ─── Hard stop on existing positions (V2 port, mid-cycle exit) ────────────
 HARD_STOP_BRACKET_LOSS_PCT = 0.80   # exit if MTM loss ≥ 80% on B-brackets
 HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery payoff)
+
+# ─── PRICE_ZONE block (V2 port, BUY_NO only) ─────────────────────────────
+# Skip BUY_NO when yes_bid ∈ [30c, 40c] — market thinks YES has 30–40% prob
+# (NO costs 60–70c, market is uncertain). V2 backtest: 50% WR / −$99 across
+# 50 trades. The market's uncertainty is a heuristic — when it doesn't lean
+# strongly either way and our model says NO with high confidence, the model
+# is usually wrong. Bypassed when _obs_confirmed_alive.
+PRICE_ZONE_LO_C = 30                # yes_bid ≥ this (cents)
+PRICE_ZONE_HI_C = 40                # yes_bid ≤ this (cents)
+
+# ─── H_2.0 disagreement skip (V2-inspired, d-1+ BUY_NO only) ─────────────
+# V2's H_2.0 skips d-1 BUY_NO when NWS-HRRR diverge >2°F. min_bot has no NWS
+# integration; we use the existing `disagreement` field (max pairwise diff
+# among NBP/HRRR/NBM) as a proxy. Tighter than MAX_DISAGREEMENT_F=5.0 and
+# scoped to d-1+ where forecast uncertainty is the only error signal (d-0
+# has running_min). Bypassed when _obs_confirmed_alive.
+H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
@@ -2130,6 +2150,27 @@ def execute_opportunity(opp: dict) -> bool:
         if msg_block:
             log(f"  skip {ticker}: {msg_block}")
             return False
+        # PRICE_ZONE block (V2 port, BUY_NO only). Market YES bid ∈ [30, 40]c
+        # signals "no strong directional consensus". When our model says NO
+        # with confidence in this market-uncertainty zone, the model is
+        # usually the side that's wrong (V2 backtest 50% WR / −$99 / n=50).
+        if action == "BUY_NO":
+            yb = opp.get("yes_bid")
+            if yb is not None and PRICE_ZONE_LO_C <= int(yb) <= PRICE_ZONE_HI_C:
+                log(f"  skip {ticker}: PRICE_ZONE — yes_bid {int(yb)}c in "
+                    f"[{PRICE_ZONE_LO_C}, {PRICE_ZONE_HI_C}] (market uncertain)")
+                return False
+        # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
+        # have no obs to break ties between forecasts; pairwise disagreement
+        # > 2°F = forecast uncertainty too high for this BUY_NO. Tighter than
+        # MAX_DISAGREEMENT_F=5.0; only fires on day-1+ where there's no rm
+        # safety net.
+        if action == "BUY_NO" and not opp.get("is_today", False):
+            disag = float(opp.get("disagreement", 0.0))
+            if disag > H_2_0_DISAGREE_F:
+                log(f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
+                    f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
+                return False
         disagreement = float(opp.get("disagreement", 0.0))
         if disagreement > MAX_DISAGREEMENT_F:
             log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
