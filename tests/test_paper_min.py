@@ -514,44 +514,110 @@ class TestKalshiReconcile(unittest.TestCase):
         pb.kalshi_get = self._orig_get
         pb._save_positions = self._orig_save
 
-    def test_recovers_ghost_position(self):
-        # Kalshi shows 1 NO position on a ticker bot doesn't track
-        pb.kalshi_get = lambda path, params=None: {
-            "market_positions": [{
-                "ticker": "KXLOWTNYC-26APR25-T48",
-                "position_fp": -3.0,
-                "market_exposure_dollars": 0.21,
-                "last_updated_ts": "2026-04-25T05:00:00Z",
-            }]
-        }
+    def _mock_kalshi(self, positions, market_metadata=None):
+        """Build a kalshi_get mock that returns positions on /portfolio/positions
+        and market_metadata on /markets/{ticker}. Test fixtures for the T-tail
+        reconcile fix call /markets/{ticker} after parsing the ticker."""
+        market_metadata = market_metadata or {}
+        def fake_get(path, params=None):
+            if path == "/trade-api/v2/portfolio/positions":
+                return {"market_positions": positions}
+            if path.startswith("/trade-api/v2/markets/"):
+                tk = path.split("/")[-1]
+                return {"market": market_metadata.get(tk, {})}
+            return {}
+        return fake_get
+
+    def test_recovers_ghost_b_bracket_position(self):
+        """B-bracket position: parse_market_bracket sets floor/cap directly,
+        no market-metadata fetch needed."""
+        pb.kalshi_get = self._mock_kalshi([{
+            "ticker": "KXLOWTNYC-26APR25-B45.5",
+            "position_fp": -3.0,
+            "market_exposure_dollars": 0.21,
+            "last_updated_ts": "2026-04-25T05:00:00Z",
+        }])
         added = pb._reconcile_kalshi_positions()
         self.assertEqual(added, 1)
-        self.assertIn("KXLOWTNYC-26APR25-T48", pb._open_positions)
-        rec = pb._open_positions["KXLOWTNYC-26APR25-T48"]
+        self.assertIn("KXLOWTNYC-26APR25-B45.5", pb._open_positions)
+        rec = pb._open_positions["KXLOWTNYC-26APR25-B45.5"]
         self.assertEqual(rec["action"], "BUY_NO")
         self.assertEqual(rec["count"], 3)
+        self.assertEqual(rec["floor"], 45.0)
+        self.assertEqual(rec["cap"], 46.0)
         self.assertEqual(rec["station"], "KNYC")
         self.assertEqual(rec["date_str"], "2026-04-25")
         self.assertTrue(rec["_recovered_from_kalshi"])
 
+    def test_recovers_t_high_with_subtitle_resolution(self):
+        """T-high tail (e.g. T48 = '49° or above'): parse_market_bracket alone
+        leaves floor=cap=None — that produces inverted won-flag at settlement
+        (in_bracket defaults True). Audit 2026-04-27 caught CHI-T48 BUY_YES
+        recording +$8.28 phantom win when truth was -$0.78 loss. Fix: fetch
+        market metadata, parse 'X° or above' → floor=X-0.5."""
+        pb.kalshi_get = self._mock_kalshi(
+            [{"ticker": "KXLOWTCHI-26APR25-T48", "position_fp": 9.0,
+              "market_exposure_dollars": 0.72}],
+            {"KXLOWTCHI-26APR25-T48": {"yes_sub_title": "49° or above"}}
+        )
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 1)
+        rec = pb._open_positions["KXLOWTCHI-26APR25-T48"]
+        self.assertEqual(rec["action"], "BUY_YES")
+        self.assertEqual(rec["floor"], 48.5)
+        self.assertIsNone(rec["cap"])
+
+    def test_recovers_t_low_with_subtitle_resolution(self):
+        """T-low tail (e.g. T47 = '46° or below'): parse 'X° or below' → cap=X+0.5."""
+        pb.kalshi_get = self._mock_kalshi(
+            [{"ticker": "KXLOWTLAX-26APR27-T47", "position_fp": -2.0,
+              "market_exposure_dollars": 0.40}],
+            {"KXLOWTLAX-26APR27-T47": {"yes_sub_title": "46° or below"}}
+        )
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 1)
+        rec = pb._open_positions["KXLOWTLAX-26APR27-T47"]
+        self.assertEqual(rec["action"], "BUY_NO")
+        self.assertIsNone(rec["floor"])
+        self.assertEqual(rec["cap"], 46.5)
+
+    def test_t_tail_skipped_when_metadata_fetch_fails(self):
+        """If yes_sub_title fetch fails or returns empty, the position must
+        NOT be added with floor=cap=None — that would re-introduce the
+        inversion bug. Skip and log a warning."""
+        pb.kalshi_get = self._mock_kalshi(
+            [{"ticker": "KXLOWTCHI-26APR25-T48", "position_fp": 9.0,
+              "market_exposure_dollars": 0.72}],
+            {"KXLOWTCHI-26APR25-T48": {}}  # empty metadata, no subtitle
+        )
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 0)
+        self.assertNotIn("KXLOWTCHI-26APR25-T48", pb._open_positions)
+
+    def test_t_tail_skipped_on_unparseable_subtitle(self):
+        """Subtitle present but doesn't match 'X° or above/below' → skip."""
+        pb.kalshi_get = self._mock_kalshi(
+            [{"ticker": "KXLOWTCHI-26APR25-T48", "position_fp": 9.0,
+              "market_exposure_dollars": 0.72}],
+            {"KXLOWTCHI-26APR25-T48": {"yes_sub_title": "garbled"}}
+        )
+        added = pb._reconcile_kalshi_positions()
+        self.assertEqual(added, 0)
+
     def test_skips_already_tracked(self):
-        pb._open_positions["KXLOWTNYC-26APR25-T48"] = {"market_ticker": "KXLOWTNYC-26APR25-T48"}
-        pb.kalshi_get = lambda path, params=None: {
-            "market_positions": [{
-                "ticker": "KXLOWTNYC-26APR25-T48",
-                "position_fp": -3.0, "market_exposure_dollars": 0.21,
-            }]
-        }
+        pb._open_positions["KXLOWTNYC-26APR25-B45.5"] = {"market_ticker": "KXLOWTNYC-26APR25-B45.5"}
+        pb.kalshi_get = self._mock_kalshi([{
+            "ticker": "KXLOWTNYC-26APR25-B45.5",
+            "position_fp": -3.0, "market_exposure_dollars": 0.21,
+        }])
         added = pb._reconcile_kalshi_positions()
         self.assertEqual(added, 0)
 
     def test_skips_zero_positions(self):
-        pb.kalshi_get = lambda path, params=None: {
-            "market_positions": [{
-                "ticker": "KXLOWTNYC-26APR25-T48",
-                "position_fp": 0.0, "market_exposure_dollars": 0.0,
-            }]
-        }
+        pb.kalshi_get = self._mock_kalshi([{
+            "ticker": "KXLOWTNYC-26APR25-B45.5",
+            "position_fp": 0.0, "market_exposure_dollars": 0.0,
+        }])
         added = pb._reconcile_kalshi_positions()
         self.assertEqual(added, 0)
 

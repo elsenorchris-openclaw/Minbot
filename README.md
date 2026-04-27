@@ -151,7 +151,13 @@ double-buys after a deploy or crash:
 1. `_load_positions()` — reads `positions.json` (TTL filter).
 2. `_reconcile_kalshi_positions()` — pulls `/portfolio/positions` and adds
    any KXLOWT* holding the bot doesn't track (the original "ghost
-   position" defense).
+   position" defense). For T-tail tickers (where `parse_market_bracket`
+   alone leaves `floor=cap=None`), additionally fetches `/markets/{ticker}`
+   and parses `yes_sub_title` ("X° or above" → T-high `floor=X-0.5`,
+   "X° or below" → T-low `cap=X+0.5`). Without this, recovered T-tails
+   default `in_bracket=True` at settlement and silently invert the `won`
+   flag — confirmed inversions on CHI-T48, SEA-T42, LV-T58, MIN-T45 in
+   the 2026-04-27 audit.
 3. `_reconcile_from_trades_log()` — reads today's `kind=entry` records
    from `trades.jsonl` and adds any whose ticker is missing from
    `_open_positions` *and* not already in `settlements.jsonl`. Closes

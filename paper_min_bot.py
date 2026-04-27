@@ -1573,6 +1573,33 @@ def _reconcile_kalshi_positions() -> int:
             br = parse_market_bracket(tk)
             floor = br.get("floor") if br else None
             cap = br.get("cap") if br else None
+            # T-tails leave floor=cap=None from parse_market_bracket alone — that
+            # function can't tell T-low from T-high without sibling B-brackets to
+            # compare against (resolve_tail_bracket needs the event). Fetch the
+            # market's yes_sub_title and parse the threshold directly.
+            # Why this matters: check_settlements defaults `in_bracket=True` when
+            # both bounds are None, so a recovered T-tail position would always
+            # report yes_wins=True regardless of CLI — silently inverting the
+            # `won` flag for BUY_YES (always "won") and BUY_NO (always "lost").
+            # Audit 2026-04-27 caught this on CHI-T48 BUY_YES (+$8.28 phantom),
+            # SEA-T42 BUY_YES (+$3.32 phantom), LV-T58 BUY_NO (-$0.80 phantom).
+            if br and br.get("kind") == "tail" and floor is None and cap is None:
+                try:
+                    md = kalshi_get(f"/trade-api/v2/markets/{tk}").get("market", {})
+                    sub = (md.get("yes_sub_title") or md.get("subtitle") or "").lower()
+                    sm = re.search(r"(\d+)\s*°?\s*or\s*(above|below)", sub)
+                    if sm:
+                        x = int(sm.group(1))
+                        if sm.group(2) == "above":
+                            floor = float(x) - 0.5   # T-high: YES if cli ≥ X
+                        else:
+                            cap = float(x) + 0.5     # T-low:  YES if cli ≤ X
+                except Exception as e:
+                    log(f"  reconcile: tail bounds fetch failed for {tk}: {e}", "warn")
+                if floor is None and cap is None:
+                    log(f"  reconcile: SKIP {tk} — unresolved tail bounds "
+                        f"(adding without bounds would invert settlement)", "warn")
+                    continue
             _open_positions[tk] = {
                 "ts": p.get("last_updated_ts") or datetime.now(timezone.utc).isoformat(),
                 "kind": "entry",
