@@ -141,17 +141,63 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
                                     # 96% sub-$1 fills on 2026-04-25/26 (avg $0.45). Capped by
                                     # MAX_BET_USD downstream so the floor can't blow the ceiling.
 
-MIN_ABS_DISTANCE_F = 1.5            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
-                                    # Even when edge math passes, mu near bracket = coin-flip;
-                                    # small forecast error flips outcome. Ported from V2 max-bot
-                                    # at 1.0°F; tightened to 1.5°F on 2026-04-27 after PHIL-B44.5
-                                    # (abs_dist 0.1°F) and ATL-B61.5 (0.5°F) lost in clean-era data.
+MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
+                                    # 1.0 → 1.5 (2026-04-27 AM) → reverted to 0.5 (2026-04-27 PM)
+                                    # after Kalshi-truth audit on n=15: at 1.5°F we'd block 9
+                                    # winners with `dist 0.5–1.5°F` (PHX-B65.5, LAX-B56.5,
+                                    # SFO-B51.5, MIA-B69.5, CHI-B47.5 — all BUY_NO with mu *at the
+                                    # bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu *inside*
+                                    # bracket, the only real loser) is still caught at 0.5°F.
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 60.00      # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27,
                                     # paired with MIN_COST_USD floor — without the bump we'd hit
                                     # the cap in ~30 entries vs the recent 30–50/day rhythm)
+
+# ─── Kelly anchor (V2 port): bankroll, not MAX_BET_USD ──────────────────
+# Pre-fix: bet_usd = kelly * MAX_BET_USD (anchored to the cap, sized as if
+# bankroll = $5). Result: every trade hit the $1 floor, $5 cap unused.
+# Fix: bet_usd = kelly * bankroll, capped at MAX_BET_USD. With $21 bankroll,
+# 25% Kelly fraction, 25% edge, 50c price → bet_usd $2.62 vs old $0.625.
+BANKROLL_REFRESH_SEC = 60          # cache TTL — refresh ~once per scan
+
+# ─── _obs_confirmed_alive (V2 port: rm has decisively settled the bracket) ─
+# When running_min has unambiguously crossed into "our side is decided"
+# territory, bypass forecast-based gates and boost Kelly. Mirror of V2's
+# _obs_confirmed_dead for max-bot. Fires only on directionally-correct setups
+# (BUY_NO when rm went well below bracket; BUY_YES when rm hit YES territory
+# post-sunrise or with adequate buffer).
+OBS_ALIVE_BUFFER_F = 3.0            # rm must be this many °F outside bracket to fire
+OBS_ALIVE_MIN_EDGE = 0.05           # bypass-mode edge floor (vs MIN_EDGE for normal entries)
+SIGNAL_KELLY_MULT = 1.5             # Kelly boost when obs confirms (matches V2's recent retune)
+
+# ─── F2A asymmetry gate (V2 port, BUY_NO only) ────────────────────────────
+# Four sub-checks on BUY_NO entries. Bypassed when _obs_confirmed_alive.
+# V2 backtest: tightening these bands swung era P&L +$30 → +$74.
+F2A_PROB_LO = 0.05                  # mp < this is a price-asymmetry trap (97c contracts, low WR)
+F2A_PROB_HI = 0.30                  # mp ≥ this is calibration cliff (model says YES too likely)
+F2A_SIGMA_MIN = 1.5                 # sigma < this is over-confident model (tight-σ zones lost in V2)
+# F2A_DIST_MIN: V2 uses 0.5°F from NBM. NOT ported — min-bot audit (n=15) found
+# `mu at bracket edge` is the BUY_NO winner pattern (cli flips OUTSIDE the bracket
+# from there 60-100% of the time). MIN_ABS_DISTANCE_F (mu vs bracket MID, 0.5°F)
+# already catches the dangerous "mu near bracket center / strictly inside" cases.
+
+# ─── MSG multi-source consensus (V2 port, BUY_NO only) ────────────────────
+# Count how many of {NBP, HRRR, NBM} forecasts predict YES wins. Block if
+# consensus is too strong against us. Per-city tiers: WORST cities require
+# unanimity (no source predicting YES). Bypassed when _obs_confirmed_alive.
+MSG_MAX_CONSENSUS_DEFAULT = 2       # block if > this many sources predict YES
+MSG_MAX_CONSENSUS_WORST = 0         # WORST cities: any source predicting YES blocks
+MSG_WORST_CITIES = {                # cities with historical poor MIN calibration (mirror V2's WORST_7)
+    "KXLOWTNYC", "KXLOWTSEA", "KXLOWTPHIL",
+    "KXLOWTLV", "KXLOWTNOLA", "KXLOWTDEN",
+}
+MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES territory blocks
+
+# ─── Hard stop on existing positions (V2 port, mid-cycle exit) ────────────
+HARD_STOP_BRACKET_LOSS_PCT = 0.80   # exit if MTM loss ≥ 80% on B-brackets
+HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery payoff)
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
@@ -467,6 +513,36 @@ def place_kalshi_order(ticker: str, side: str, count: int,
         elif "insufficient_balance" in emsg or "insufficient balance" in emsg:
             _set_insufficient_balance_cooldown()
         log(f"  ORDER FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
+        return None
+
+
+def place_kalshi_sell_order(ticker: str, side: str, count: int,
+                             price_cents: int) -> Optional[str]:
+    """Place a limit SELL at price_cents. Used by hard-stop exits.
+    `side` is the side we currently HOLD (e.g. 'no' if we hold BUY_NO).
+    Returns order_id or None on failure."""
+    if _in_paused_cooldown(ticker):
+        return None
+    body = {
+        "ticker": ticker, "action": "sell", "side": side,
+        "type": "limit", "count": count,
+    }
+    if side == "yes":
+        body["yes_price"] = price_cents
+    else:
+        body["no_price"] = price_cents
+    try:
+        r = kalshi_post("/trade-api/v2/portfolio/orders", body)
+        order = r.get("order", {})
+        oid = order.get("order_id")
+        st = order.get("status", "?")
+        log(f"  ORDER sell {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
+        return oid
+    except Exception as e:
+        emsg = str(e).lower()
+        if "409" in str(e) or "trading is paused" in emsg or "trading_is_paused" in emsg:
+            _set_paused_cooldown(ticker)
+        log(f"  SELL FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
         return None
 
 
@@ -1259,6 +1335,159 @@ def _is_post_sunrise(tz_name: str) -> bool:
     return now_local.hour >= 8  # safe blanket: after 8 AM local, min is set
 
 
+# ─── Bankroll cache for Kelly anchor ──────────────────────────────────────
+_cached_bankroll: float = 0.0
+_bankroll_cache_ts: float = 0.0
+
+
+def _get_bankroll_cached() -> float:
+    """Return Kalshi bankroll, refreshed every BANKROLL_REFRESH_SEC. On fetch
+    failure, falls back to the cached value (or MAX_BET_USD on cold start —
+    preserves pre-fix sizing as a safety net)."""
+    global _cached_bankroll, _bankroll_cache_ts
+    now = time.time()
+    if now - _bankroll_cache_ts > BANKROLL_REFRESH_SEC:
+        b = get_kalshi_balance()
+        if b is not None:
+            _cached_bankroll = b
+            _bankroll_cache_ts = now
+    return _cached_bankroll if _cached_bankroll > 0 else MAX_BET_USD
+
+
+# ─── Obs-confirmed-alive helpers (V2 port) ────────────────────────────────
+def _check_obs_confirmed_alive(opp_or_pos: dict) -> bool:
+    """True if running_min has decisively settled the bracket in favor of our
+    action. Bypasses forecast-based entry gates and triggers SIGNAL_KELLY_MULT
+    boost when used at entry; suppresses hard-stop exit when used on an open
+    position. Mirror of V2's `_obs_confirmed_dead` for max-bot.
+
+    Decision rules per (action, bracket-shape):
+      BUY_NO + B-bracket: rm < floor − OBS_ALIVE_BUFFER_F
+        → low went well below bracket; daily low ≤ rm < floor → NO wins
+      BUY_NO + T-high (floor=X−0.5, YES if cli ≥ X): rm < floor − BUFFER
+        → low went well below threshold → NO wins
+      BUY_NO + T-low (cap=X+0.5, YES if cli ≤ X): defer (would need post-sunrise
+        confirmation that low won't drop further into YES territory)
+      BUY_YES + T-low (cap=X+0.5, YES if cli ≤ X): rm ≤ cap − 1.0
+        → low has hit YES territory with +1°F obs/CLI buffer → YES wins
+      BUY_YES + T-high (floor=X−0.5, YES if cli ≥ X): rm ≥ floor + 1.0 AND post-sunrise
+        → low has bottomed in YES territory → YES wins
+      BUY_YES + B-bracket: defer (would need post-sunrise + rm in bracket;
+        rare and complex; not a typical sweet-spot anyway)"""
+    rm = opp_or_pos.get("running_min")
+    if rm is None:
+        return False
+    floor = opp_or_pos.get("floor")
+    cap = opp_or_pos.get("cap")
+    action = opp_or_pos.get("action")
+    rm_f = float(rm)
+
+    if action == "BUY_NO":
+        # B-bracket: low went well below bracket
+        if floor is not None and cap is not None:
+            if rm_f < float(floor) - OBS_ALIVE_BUFFER_F:
+                return True
+        # T-high (single-bound floor): low went well below threshold
+        elif floor is not None and cap is None:
+            if rm_f < float(floor) - OBS_ALIVE_BUFFER_F:
+                return True
+        # T-low: deferred (needs post-sunrise)
+    elif action == "BUY_YES":
+        # T-low: low has confirmed dip into YES territory
+        if cap is not None and floor is None:
+            if rm_f <= float(cap) - 1.0:
+                return True
+        # T-high: low rose to YES territory AND post-sunrise so it won't drop
+        elif floor is not None and cap is None:
+            tz = opp_or_pos.get("tz", "America/New_York")
+            if rm_f >= float(floor) + 1.0 and _is_post_sunrise(tz):
+                return True
+        # B-bracket: deferred (complex; rare)
+    return False
+
+
+# ─── F2A asymmetry gate (V2 port, BUY_NO only) ────────────────────────────
+def _check_f2a_gate(opp: dict) -> Optional[str]:
+    """Returns a block-reason string if F2A blocks, None if it passes (or not
+    applicable). BUY_NO only. Bypassed by caller when _obs_confirmed_alive."""
+    if opp.get("action") != "BUY_NO":
+        return None
+    mp = float(opp.get("model_prob", 0.0))
+    sigma = float(opp.get("sigma", 0.0))
+    mu = opp.get("mu")
+    if mu is None:
+        return None
+    mu_f = float(mu)
+    floor = opp.get("floor")
+    cap = opp.get("cap")
+
+    if mp < F2A_PROB_LO:
+        return f"F2A: mp {mp:.0%} < {F2A_PROB_LO:.0%} (price-asymmetry trap)"
+    if mp >= F2A_PROB_HI:
+        return f"F2A: mp {mp:.0%} ≥ {F2A_PROB_HI:.0%} (model says YES too likely)"
+    if sigma < F2A_SIGMA_MIN:
+        return f"F2A: sigma {sigma:.1f}°F < {F2A_SIGMA_MIN:.1f}°F (over-confident model)"
+    # F2A distance check NOT applied — see constant comment.
+    _ = (mu_f, floor, cap)  # silence unused-vars
+    return None
+
+
+# ─── MSG multi-source consensus (V2 port, BUY_NO only) ────────────────────
+def _check_msg_gate(opp: dict) -> Optional[str]:
+    """Returns a block-reason string if MSG blocks, None otherwise.
+    Counts how many of {NBP, HRRR, NBM} forecasts predict YES (loss for us
+    on BUY_NO). Per-city tiers: WORST cities require unanimity; standard
+    cities allow up to MSG_MAX_CONSENSUS_DEFAULT sources to predict YES.
+    Outlier-margin sub-check: any source > MSG_MARGIN_F into YES territory
+    triggers a separate block. Bypassed by caller when _obs_confirmed_alive."""
+    if opp.get("action") != "BUY_NO":
+        return None
+    sources = []
+    for k in ("mu_nbp", "mu_hrrr", "mu_nbm_om"):
+        v = opp.get(k)
+        if v is not None:
+            sources.append(float(v))
+    if len(sources) < 2:
+        return None  # insufficient sources to evaluate consensus
+
+    floor = opp.get("floor")
+    cap = opp.get("cap")
+    series = opp.get("series", "")
+    max_consensus = MSG_MAX_CONSENSUS_WORST if series in MSG_WORST_CITIES else MSG_MAX_CONSENSUS_DEFAULT
+
+    yes_count = 0
+    yes_outlier_margin = 0.0
+    for s in sources:
+        in_yes = False
+        margin = 0.0
+        if floor is not None and cap is not None:
+            # B-bracket: YES region is [floor, cap]. Margin = how deep into bracket.
+            if float(floor) <= s <= float(cap):
+                in_yes = True
+                margin = max(s - float(floor), float(cap) - s)
+        elif floor is not None and cap is None:
+            # T-high: YES region is mu ≥ floor. Margin = depth above floor.
+            if s >= float(floor):
+                in_yes = True
+                margin = s - float(floor)
+        elif cap is not None and floor is None:
+            # T-low: YES region is mu ≤ cap. Margin = depth below cap.
+            if s <= float(cap):
+                in_yes = True
+                margin = float(cap) - s
+        if in_yes:
+            yes_count += 1
+            yes_outlier_margin = max(yes_outlier_margin, margin)
+
+    if yes_count > max_consensus:
+        return (f"MSG: {yes_count}/{len(sources)} sources predict YES "
+                f"(max {max_consensus} for {series})")
+    if yes_outlier_margin > MSG_MARGIN_F:
+        return (f"MSG: outlier {yes_outlier_margin:.1f}°F into YES "
+                f"(>{MSG_MARGIN_F:.1f}°F)")
+    return None
+
+
 def find_opportunities(markets: list[dict]) -> list[dict]:
     """For each market, compute model_prob, edge vs yes_ask, and return
     opportunities sorted by absolute edge."""
@@ -1761,8 +1990,6 @@ def execute_opportunity(opp: dict) -> bool:
     if opp.get("action") is None or opp.get("entry_price") is None:
         return False
     edge = float(opp["edge"])
-    if edge < MIN_EDGE:
-        return False
     ticker = opp["market_ticker"]
 
     # Per-ticker dedupe — never double up on the same market.
@@ -1770,75 +1997,92 @@ def execute_opportunity(opp: dict) -> bool:
         if ticker in _open_positions:
             return False
 
-    # Kelly sizing, then $1 cost floor (ceil), then MAX_BET_USD ceiling.
-    # Ordering matters: `int(bet_usd / price)` rounds DOWN, so the post-Kelly
-    # cost can land anywhere from `price` to MAX_BET_USD; without the ceil
-    # bump, edges with price < $1 produce sub-$1 fills (~96% of recent days).
+    # _obs_confirmed_alive: rm has decisively settled the bracket in our favor.
+    # When True, bypass forecast-based gates (directional, abs_dist, F2A, MSG,
+    # disagreement, mu-vs-rm, mp range) and lower the edge floor. Only the
+    # spread filter and budget gates still apply.
+    obs_alive = _check_obs_confirmed_alive(opp)
+    edge_floor = OBS_ALIVE_MIN_EDGE if obs_alive else MIN_EDGE
+    if edge < edge_floor:
+        return False
+
+    # Kelly sizing — anchor on bankroll (V2 fix; pre-fix anchored on MAX_BET_USD,
+    # under-sizing every trade by ~4× when bankroll > MAX_BET_USD). Kelly boost
+    # via SIGNAL_KELLY_MULT when obs_confirmed_alive (V2 _SIGNAL_KELLY_MULT port).
     price = float(opp["entry_price"])
     kelly = KELLY_FRACTION * edge / max(1 - price, 0.01)
-    bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * MAX_BET_USD))
+    if obs_alive:
+        kelly *= SIGNAL_KELLY_MULT
+    bankroll = _get_bankroll_cached()
+    bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * bankroll))
     count = max(1, int(bet_usd / price))
     count = max(count, math.ceil(MIN_COST_USD / price))
     count = min(count, max(1, int(MAX_BET_USD / price)))
     intended_cost = count * price
-
-    # Hard gates beyond MIN_EDGE — each one prevents a class of model error.
-    # Order: cheapest-to-evaluate first.
-    if edge > MAX_EDGE:
-        log(f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
-        return False
-    mp = float(opp.get("model_prob", 0.0))
-    if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-        log(f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
-        return False
-    # Directional consistency: never bet against our own model. The edge
-    # formula assumes a calibrated model, but our +1.24°F NBP-cool bias
-    # compounds when action and model direction disagree. First-day data
-    # 2026-04-26 (cascade-corrected): BUY_NO with mp ≥ 50% lost 5/5.
-    # Tightened 2026-04-27 from 0.50 → 0.40/0.60 to drop coin-flip-zone
-    # entries (CHI-T41 mp=34% BUY_YES, NYC-T44 mp=42% BUY_YES both lost).
     action = opp["action"]
-    if action == "BUY_NO" and mp > 0.40:
-        log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
-        return False
-    if action == "BUY_YES" and mp < 0.60:
-        log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
-        return False
-    # ABS DISTANCE GATE (BUY_NO only). When mu is close to the bracket
-    # midpoint, even a small forecast error flips the outcome — coin flip.
-    # Ported from V2 max-bot. BUY_YES is NOT gated: mu near bracket center
-    # is the BUY_YES sweet spot, not the danger zone.
-    if action == "BUY_NO":
-        fl = opp.get("floor"); cp = opp.get("cap")
-        if fl is not None and cp is not None:
-            bracket_mid = (float(fl) + float(cp)) / 2.0
-        elif fl is not None:
-            bracket_mid = float(fl)
-        elif cp is not None:
-            bracket_mid = float(cp)
-        else:
-            bracket_mid = None
-        if bracket_mid is not None:
-            mu_val = float(opp.get("mu", 0.0))
-            abs_dist = abs(mu_val - bracket_mid)
-            if abs_dist < MIN_ABS_DISTANCE_F:
-                log(f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
-                    f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F (min {MIN_ABS_DISTANCE_F:.1f}°F)")
-                return False
-    disagreement = float(opp.get("disagreement", 0.0))
-    if disagreement > MAX_DISAGREEMENT_F:
-        log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
-        return False
-    # Mu-vs-running_min sanity: pre-sunrise, if forecast μ disagrees with the
-    # observed lowest by >5°F, the forecast is plainly wrong — don't trade.
-    rm = opp.get("running_min")
-    if rm is not None and not opp.get("post_sunrise_lock"):
-        mu = float(opp.get("mu", 0.0))
-        if abs(mu - float(rm)) > MAX_MU_VS_RM_DIFF_F:
-            log(f"  skip {ticker}: μ={mu:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+    mp = float(opp.get("model_prob", 0.0))
+
+    if obs_alive:
+        log(f"  OBS_CONFIRMED_ALIVE {ticker}: bypassing forecast gates "
+            f"(rm={opp.get('running_min')}, action={action}); kelly×{SIGNAL_KELLY_MULT}")
+    else:
+        # Forecast-based gates — each prevents a class of model error.
+        # Order: cheapest-to-evaluate first.
+        if edge > MAX_EDGE:
+            log(f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
             return False
-    # Spread filter on the side we'd actually be buying.
-    side = "yes" if opp["action"] == "BUY_YES" else "no"
+        if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
+            log(f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+            return False
+        # Directional consistency: never bet against our own model.
+        if action == "BUY_NO" and mp > 0.40:
+            log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
+            return False
+        if action == "BUY_YES" and mp < 0.60:
+            log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
+            return False
+        # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
+        if action == "BUY_NO":
+            fl = opp.get("floor"); cp = opp.get("cap")
+            if fl is not None and cp is not None:
+                bracket_mid = (float(fl) + float(cp)) / 2.0
+            elif fl is not None:
+                bracket_mid = float(fl)
+            elif cp is not None:
+                bracket_mid = float(cp)
+            else:
+                bracket_mid = None
+            if bracket_mid is not None:
+                mu_val = float(opp.get("mu", 0.0))
+                abs_dist = abs(mu_val - bracket_mid)
+                if abs_dist < MIN_ABS_DISTANCE_F:
+                    log(f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
+                        f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F (min {MIN_ABS_DISTANCE_F:.1f}°F)")
+                    return False
+        # F2A asymmetry gate (V2 port, BUY_NO only).
+        f2a_block = _check_f2a_gate(opp)
+        if f2a_block:
+            log(f"  skip {ticker}: {f2a_block}")
+            return False
+        # MSG multi-source consensus gate (V2 port, BUY_NO only).
+        msg_block = _check_msg_gate(opp)
+        if msg_block:
+            log(f"  skip {ticker}: {msg_block}")
+            return False
+        disagreement = float(opp.get("disagreement", 0.0))
+        if disagreement > MAX_DISAGREEMENT_F:
+            log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
+            return False
+        # Mu-vs-running_min sanity: pre-sunrise, forecast μ vs observed lowest > 5°F = wrong.
+        rm = opp.get("running_min")
+        if rm is not None and not opp.get("post_sunrise_lock"):
+            mu_check = float(opp.get("mu", 0.0))
+            if abs(mu_check - float(rm)) > MAX_MU_VS_RM_DIFF_F:
+                log(f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+                return False
+    # Spread filter — always applies (even on obs_alive bypass; thin books are
+    # untradable regardless of obs confirmation).
+    side = "yes" if action == "BUY_YES" else "no"
     if side == "yes":
         ya = opp.get("yes_ask"); yb = opp.get("yes_bid")
         spread = (ya - yb) if (ya is not None and yb is not None) else 0
@@ -1895,6 +2139,182 @@ def execute_opportunity(opp: dict) -> bool:
         f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
     notify_discord_entry(record, opp)
     return True
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# MID-CYCLE EXIT (V2 PORT: HARD STOP + OBS-WINNER OVERRIDE)
+# ═══════════════════════════════════════════════════════════════════════
+
+def _check_position_obs_winning(pos: dict, rm: float) -> bool:
+    """True if the running_min observation already confirms our position is
+    winning. Used as override against hard-stop on confirmed winners
+    (mirror of V2's _obs_confirmed_winner). Decision rules: same as
+    `_check_obs_confirmed_alive` but with a smaller (1°F) buffer since
+    `pos` is an existing holding — we're not deciding whether to take a new
+    bet, we're deciding whether to sell what we hold."""
+    floor = pos.get("floor")
+    cap = pos.get("cap")
+    action = pos.get("action")
+    if action == "BUY_NO":
+        # B-bracket: rm well below bracket → NO wins
+        if floor is not None and cap is not None:
+            if rm < float(floor) - 1.0:
+                return True
+        # T-high (single-bound floor): rm below threshold → NO wins
+        elif floor is not None and cap is None:
+            if rm < float(floor) - 1.0:
+                return True
+        # T-low BUY_NO winner case requires post-sunrise; defer.
+    elif action == "BUY_YES":
+        # T-low: rm has dipped to YES threshold
+        if cap is not None and floor is None:
+            if rm <= float(cap) - 1.0:
+                return True
+        # T-high: rm above threshold AND post-sunrise (low won't drop further)
+        elif floor is not None and cap is None:
+            tz = pos.get("tz", "America/New_York")
+            if rm >= float(floor) + 1.0 and _is_post_sunrise(tz):
+                return True
+    return False
+
+
+def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
+                   reason: str) -> bool:
+    """Place a SELL order for an existing position at sell_price_c. Polls for
+    fill, records exit in trades.jsonl with kind='exit', marks position
+    settled in the dedupe map. Returns True iff we got any fill."""
+    count = int(pos.get("count", 0))
+    if count <= 0:
+        return False
+    if sell_price_c is None or sell_price_c <= 0:
+        return False
+    oid = place_kalshi_sell_order(ticker, sell_side, count, sell_price_c)
+    if not oid:
+        return False
+    status, filled = wait_for_fill(oid, count, ORDER_FILL_TIMEOUT_SEC)
+    if filled <= 0:
+        try:
+            kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
+        except Exception:
+            pass
+        log(f"  exit no-fill on {ticker} (status={status}); cancelled")
+        return False
+    if filled < count:
+        try:
+            kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
+        except Exception:
+            pass
+        log(f"  exit partial fill {filled}/{count} on {ticker}; cancelled remainder")
+    sell_revenue = filled * (sell_price_c / 100.0)
+    cost_basis = filled * float(pos.get("entry_price", 0))
+    pnl = sell_revenue - cost_basis
+    record = {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": "exit",
+        "market_ticker": ticker,
+        "action": pos.get("action"),
+        "exit_side": sell_side,
+        "exit_price": sell_price_c / 100.0,
+        "count": filled,
+        "entry_price": float(pos.get("entry_price", 0)),
+        "sell_revenue": sell_revenue,
+        "cost_basis": cost_basis,
+        "pnl": pnl,
+        "reason": reason,
+        "order_id": oid,
+        "station": pos.get("station"),
+        "date_str": pos.get("date_str"),
+        "label": pos.get("label"),
+    }
+    _append_jsonl(TRADES_FILE, record)
+    with _positions_lock:
+        existing = _open_positions.get(ticker)
+        if existing is not None:
+            existing.update({
+                "settled": True,
+                "exited_ts": record["ts"],
+                "exit_price": record["exit_price"],
+                "pnl": pnl,
+                "_exit_reason": reason,
+            })
+    _save_positions()
+    log(f"  EXIT FILLED {ticker} ({reason}): {filled}x @ {sell_price_c}c | "
+        f"pnl ${pnl:+.2f}")
+    discord_send(
+        f"🟡 **EXIT** `{ticker}` {pos.get('action')} {filled}x @ {sell_price_c}c "
+        f"({reason}) — P&L **${pnl:+.2f}**"
+    )
+    return True
+
+
+def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
+    """Mid-cycle exit check. For each open non-settled position, look up the
+    current bid in market_quotes (caller passes a {ticker: market_dict} index
+    from discover_markets). Triggers:
+
+      1. OBS_CONFIRMED_WINNER override → SKIP exit (hold guaranteed wins
+         even if MTM looks awful — V2 lesson: thin-book price noise faked
+         losses on confirmed winners).
+      2. HARD STOP: MTM loss ≥ HARD_STOP_BRACKET_LOSS_PCT (B-bracket) or
+         HARD_STOP_TAIL_LOSS_PCT (tail) → SELL at current bid.
+
+    Returns count of exits executed."""
+    n_exits = 0
+    with _positions_lock:
+        positions = dict(_open_positions)
+    for ticker, pos in positions.items():
+        if pos.get("settled"):
+            continue
+        mkt = market_quotes.get(ticker)
+        if mkt is None:
+            continue
+        action = pos.get("action")
+        entry_price = float(pos.get("entry_price", 0))
+        if entry_price <= 0:
+            continue
+        # Determine sell side and current bid.
+        if action == "BUY_YES":
+            sell_side = "yes"
+            current_bid_c = mkt.get("yes_bid")
+        elif action == "BUY_NO":
+            sell_side = "no"
+            current_bid_c = mkt.get("no_bid")
+        else:
+            continue
+        if current_bid_c is None or current_bid_c <= 0:
+            continue
+        current_price = current_bid_c / 100.0
+        loss_pct = (entry_price - current_price) / entry_price
+
+        # OBS_CONFIRMED_WINNER override — never sell a guaranteed winner.
+        rm = pos.get("running_min")
+        # If pos was reconciled from Kalshi without rm context, fetch current rm.
+        if rm is None:
+            station = pos.get("station")
+            date_str = pos.get("date_str")
+            if station and date_str:
+                rm = get_running_min(station, date_str)
+        if rm is not None:
+            try:
+                if _check_position_obs_winning(pos, float(rm)):
+                    if loss_pct > 0.30:  # only log when override matters
+                        log(f"  HOLD {ticker}: rm={rm} confirms winner; "
+                            f"ignoring MTM loss {loss_pct:.0%}")
+                    continue
+            except Exception:
+                pass
+
+        # Hard stop.
+        floor = pos.get("floor")
+        cap = pos.get("cap")
+        is_tail = (floor is None) != (cap is None)  # exactly one bound = tail
+        loss_threshold = HARD_STOP_TAIL_LOSS_PCT if is_tail else HARD_STOP_BRACKET_LOSS_PCT
+        if loss_pct >= loss_threshold:
+            log(f"  HARD_STOP trigger {ticker}: entry {entry_price:.2f} → "
+                f"mtm {current_price:.2f} (loss {loss_pct:.0%} ≥ {loss_threshold:.0%})")
+            if _execute_exit(ticker, pos, sell_side, int(current_bid_c), "hard_stop"):
+                n_exits += 1
+    return n_exits
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2051,12 +2471,23 @@ def scan_cycle() -> dict:
         log(f"  market discovery failed: {e}", "warn")
         return stats
     stats["markets"] = len(markets)
+    # Mid-cycle exit check on existing open positions (hard stop + obs-winner
+    # override). Runs BEFORE find_opportunities so freed-up budget can fund
+    # new entries the same cycle.
+    mkt_by_ticker = {m["market_ticker"]: m for m in markets if m.get("market_ticker")}
+    try:
+        stats["exited"] = check_open_positions_for_exit(mkt_by_ticker)
+    except Exception as e:
+        log(f"  exit check failed: {e}", "warn")
+        stats["exited"] = 0
     opps = find_opportunities(markets)
     stats["candidates"] = len(opps)
     for opp in opps:
         record_candidate(opp)
-    # Execute the takeable ones
-    taken = [o for o in opps if o.get("edge", 0) >= MIN_EDGE]
+    # Execute the takeable ones. Note: edge floor is dynamic (OBS_ALIVE_MIN_EDGE
+    # for obs-confirmed candidates, MIN_EDGE otherwise), so include any with
+    # edge ≥ OBS_ALIVE_MIN_EDGE; execute_opportunity itself decides.
+    taken = [o for o in opps if o.get("edge", 0) >= OBS_ALIVE_MIN_EDGE]
     stats["opps"] = sum(1 for o in opps if o.get("edge", 0) > 0)
     for opp in taken:
         ticker = opp["market_ticker"]
