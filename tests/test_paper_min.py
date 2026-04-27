@@ -1359,6 +1359,94 @@ class TestObsConfirmedAlive(unittest.TestCase):
         self.assertEqual(len(self._captured), 1, "obs_alive should lower edge floor to 0.05")
 
 
+class TestObsConfirmedLoser(unittest.TestCase):
+    """`_check_obs_confirmed_loser`: pre-empt entries where rm has already
+    moved against our action. Mirror of `_check_obs_confirmed_alive`. Fires
+    before forecast gates (only when alive is False — they're symmetric)."""
+
+    def test_buy_no_bbracket_loser_when_rm_in_bracket(self):
+        """B-bracket [44,45], rm=44.5 (currently in bracket → YES winning)."""
+        opp = {"action": "BUY_NO", "floor": 44.0, "cap": 45.0, "running_min": 44.5}
+        self.assertTrue(pb._check_obs_confirmed_loser(opp))
+
+    def test_buy_no_bbracket_not_loser_when_rm_outside(self):
+        opp_below = {"action": "BUY_NO", "floor": 44.0, "cap": 45.0, "running_min": 43.0}
+        opp_above = {"action": "BUY_NO", "floor": 44.0, "cap": 45.0, "running_min": 46.0}
+        self.assertFalse(pb._check_obs_confirmed_loser(opp_below))
+        self.assertFalse(pb._check_obs_confirmed_loser(opp_above))
+
+    def test_buy_no_thigh_loser_when_rm_above_floor(self):
+        """LAX-T54 reconstruction (cost $3.44 round-trip): floor=54.5, rm=57.2.
+        Bot bought BUY_NO based on HRRR mu=53.1; gate would have blocked it."""
+        opp = {"action": "BUY_NO", "floor": 54.5, "cap": None, "running_min": 57.2}
+        self.assertTrue(pb._check_obs_confirmed_loser(opp))
+
+    def test_buy_no_thigh_not_loser_when_rm_at_floor(self):
+        """rm exactly at floor (not strictly greater) — borderline OK."""
+        opp = {"action": "BUY_NO", "floor": 54.5, "cap": None, "running_min": 54.5}
+        self.assertFalse(pb._check_obs_confirmed_loser(opp))
+
+    def test_buy_no_tlow_loser_when_rm_at_or_below_cap(self):
+        """T-low cap=43.5 (YES if cli ≤ 43): rm=43 → loser; rm=44 → not."""
+        opp_loser = {"action": "BUY_NO", "floor": None, "cap": 43.5, "running_min": 43.0}
+        opp_safe = {"action": "BUY_NO", "floor": None, "cap": 43.5, "running_min": 44.0}
+        self.assertTrue(pb._check_obs_confirmed_loser(opp_loser))
+        self.assertFalse(pb._check_obs_confirmed_loser(opp_safe))
+
+    def test_buy_yes_bbracket_loser_when_rm_below_floor(self):
+        """B-bracket: rm went below floor; rm only goes down → YES (in bracket) lost."""
+        opp = {"action": "BUY_YES", "floor": 44.0, "cap": 45.0, "running_min": 43.0}
+        self.assertTrue(pb._check_obs_confirmed_loser(opp))
+
+    def test_buy_yes_thigh_loser_when_rm_below_floor(self):
+        """T-high (YES if cli ≥ X, floor=X-0.5): rm < floor → low went below
+        threshold, can't recover. YES lost."""
+        opp = {"action": "BUY_YES", "floor": 54.5, "cap": None, "running_min": 53.0}
+        self.assertTrue(pb._check_obs_confirmed_loser(opp))
+
+    def test_no_rm_returns_false(self):
+        """No obs evidence → not loser (default-allow)."""
+        self.assertFalse(pb._check_obs_confirmed_loser(
+            {"action": "BUY_NO", "floor": 44.0, "cap": 45.0, "running_min": None}))
+
+    def test_loser_blocks_entry_in_execute_opportunity(self):
+        """End-to-end: LAX-T54 reconstruction. rm=57.2 should block at the
+        OBS_CONFIRMED_LOSER gate before any forecast gate fires."""
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        pb._cached_bankroll = 25.0
+        pb._bankroll_cache_ts = 9999999999
+        captured: list[tuple] = []
+        orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (captured.append((a, kw)) or None)
+        try:
+            opp = {
+                "market_ticker": "KXLOWTLAX-26APR27-T54",
+                "event_ticker": "KXLOWTLAX-26APR27",
+                "action": "BUY_NO", "model_prob": 0.24, "edge": 0.20,
+                "entry_price": 0.56, "yes_bid": 42, "yes_ask": 44,
+                "no_bid": 54, "no_ask": 56,
+                "mu": 53.1, "sigma": 2.0, "mu_source": "hrrr",
+                "running_min": 57.2,  # rm WELL above floor 54.5 (T-high)
+                "post_sunrise_lock": False, "disagreement": 1.0,
+                "floor": 54.5, "cap": None,
+                "station": "KLAX", "date_str": "2026-04-27", "label": "LA",
+                "series": "KXLOWTLAX",
+            }
+            pb.execute_opportunity(opp)
+            self.assertEqual(captured, [],
+                             "OBS_CONFIRMED_LOSER should block — bot held at floor before "
+                             "forecast gates evaluate")
+        finally:
+            pb.place_kalshi_order = orig_place
+            pb._cached_bankroll = 0.0
+
+
 class TestF2AGate(unittest.TestCase):
     """F2A asymmetry gate (BUY_NO only). 4 sub-checks: prob_lo, prob_hi,
     sigma_min, dist_min. All return None on pass, str on block."""

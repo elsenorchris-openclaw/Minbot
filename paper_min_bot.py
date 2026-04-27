@@ -1406,6 +1406,58 @@ def _check_obs_confirmed_alive(opp_or_pos: dict) -> bool:
     return False
 
 
+# ─── _obs_confirmed_loser (mirror of _alive, pre-empt losing entries) ─────
+def _check_obs_confirmed_loser(opp_or_pos: dict) -> bool:
+    """True if running_min has already moved against our action — entering
+    this position would be buying a known loser. Mirror of
+    `_check_obs_confirmed_alive`. The hard-stop catches these post-entry,
+    but we'd rather not enter at all (LAX-T54 lost $3.44 in 18 min on
+    2026-04-27 12:44 entry — rm was already 57.2°F vs floor 54.5°F when bot
+    bought BUY_NO based on HRRR's stale mu=53.1°F forecast).
+
+    Decision rules per (action, bracket-shape):
+      BUY_NO + B-bracket: rm IN [floor, cap] → YES is currently winning
+      BUY_NO + T-high (floor=X−0.5, YES if cli ≥ X): rm > floor → low above
+        threshold; daily low ≤ rm but already in YES territory now
+      BUY_NO + T-low (cap=X+0.5, YES if cli ≤ X): rm ≤ cap−0.5 (i.e. cli ≤ X)
+        → low has hit YES threshold; rm only goes down → YES wins, NO loses
+      BUY_YES + B-bracket: rm < floor → low went below bracket; daily low
+        ≤ rm < floor → YES (low in bracket) lost
+      BUY_YES + T-high: rm < floor → low went below threshold; YES lost
+      BUY_YES + T-low: rm > cap AND post-sunrise → low never reached
+        threshold and won't drop further; YES (low ≤ X) lost"""
+    rm = opp_or_pos.get("running_min")
+    if rm is None:
+        return False
+    floor = opp_or_pos.get("floor")
+    cap = opp_or_pos.get("cap")
+    action = opp_or_pos.get("action")
+    rm_f = float(rm)
+
+    if action == "BUY_NO":
+        if floor is not None and cap is not None:
+            if float(floor) <= rm_f <= float(cap):
+                return True
+        elif floor is not None and cap is None:
+            if rm_f > float(floor):
+                return True
+        elif cap is not None and floor is None:
+            if rm_f <= float(cap) - 0.5:
+                return True
+    elif action == "BUY_YES":
+        if floor is not None and cap is not None:
+            if rm_f < float(floor):
+                return True
+        elif floor is not None and cap is None:
+            if rm_f < float(floor):
+                return True
+        elif cap is not None and floor is None:
+            tz = opp_or_pos.get("tz", "America/New_York")
+            if rm_f > float(cap) and _is_post_sunrise(tz):
+                return True
+    return False
+
+
 # ─── F2A asymmetry gate (V2 port, BUY_NO only) ────────────────────────────
 def _check_f2a_gate(opp: dict) -> Optional[str]:
     """Returns a block-reason string if F2A blocks, None if it passes (or not
@@ -2026,6 +2078,13 @@ def execute_opportunity(opp: dict) -> bool:
         log(f"  OBS_CONFIRMED_ALIVE {ticker}: bypassing forecast gates "
             f"(rm={opp.get('running_min')}, action={action}); kelly×{SIGNAL_KELLY_MULT}")
     else:
+        # Pre-empt entries where rm has already moved into losing territory.
+        # The hard-stop catches these post-entry, but the round-trip is costly
+        # (LAX-T54 round-trip 2026-04-27 lost $3.44 in 18 min).
+        if _check_obs_confirmed_loser(opp):
+            log(f"  skip {ticker}: OBS_CONFIRMED_LOSER — rm={opp.get('running_min')} "
+                f"already in YES territory (floor={opp.get('floor')}, cap={opp.get('cap')})")
+            return False
         # Forecast-based gates — each prevents a class of model error.
         # Order: cheapest-to-evaluate first.
         if edge > MAX_EDGE:
