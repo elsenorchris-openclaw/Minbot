@@ -261,7 +261,7 @@ class TestWalletConfig(unittest.TestCase):
     def test_live_config_caps_are_conservative(self):
         # Sanity: don't accidentally ship with $1000 caps.
         self.assertLessEqual(pb.MAX_BET_USD, 5.00)
-        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 50.00)
+        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 100.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
 
@@ -708,8 +708,9 @@ class TestDirectionalConsistency(unittest.TestCase):
     edge alone misleads when action and model direction disagree.
 
     First-day data 2026-04-26 (cascade-corrected n=21): BUY_NO entries
-    where mp ≥ 50% lost 5/5 (-$1.53). BUY_YES with mp ≤ 50% lost the
-    one trade in sample (CHI-T41).
+    where mp ≥ 50% lost 5/5 (-$1.53). BUY_YES with mp ≤ 50% lost CHI-T41
+    and NYC-T44 (mp 34% / 42%) — gate tightened 2026-04-27 from 0.50 →
+    0.40/0.60 to drop the coin-flip dead zone.
 
     Test pattern: stub `place_kalshi_order` to a sentinel that records
     when it was called. If the gate blocked, place_kalshi_order is never
@@ -756,40 +757,41 @@ class TestDirectionalConsistency(unittest.TestCase):
         return base
 
     def test_buy_no_with_high_mp_blocked(self):
-        """BUY_NO with mp ≥ 50% must be skipped — model says YES is more likely."""
+        """BUY_NO with mp > 40% must be skipped — model says YES is too likely."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.55))
         self.assertEqual(self._order_calls, [], "place_kalshi_order should not have been called")
 
     def test_buy_no_with_low_mp_allowed_through_gate(self):
-        """BUY_NO with mp < 50% (and mu far enough from bracket) reaches order placement."""
+        """BUY_NO with mp ≤ 40% (and mu far enough from bracket) reaches order placement."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.30))
         self.assertEqual(len(self._order_calls), 1, "place_kalshi_order should have been called once")
 
     def test_buy_yes_with_low_mp_blocked(self):
-        """BUY_YES with mp ≤ 50% must be skipped — model says NO is more likely."""
+        """BUY_YES with mp < 60% must be skipped — model says YES is not likely enough."""
         pb.execute_opportunity(self._opp("BUY_YES", 0.40))
         self.assertEqual(self._order_calls, [])
 
     def test_buy_yes_with_high_mp_allowed_through_gate(self):
-        """BUY_YES with mp > 50% reaches the order-placement step."""
+        """BUY_YES with mp ≥ 60% reaches the order-placement step."""
         pb.execute_opportunity(self._opp("BUY_YES", 0.70))
         self.assertEqual(len(self._order_calls), 1)
 
     def test_exact_50_blocks_both_actions(self):
-        """At mp=0.50 the model is indifferent — block both directions
-        rather than betting on a coin flip."""
+        """At mp=0.50 both directions remain blocked: BUY_NO requires mp ≤ 0.40,
+        BUY_YES requires mp ≥ 0.60. The dead zone 0.40–0.60 admits neither."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.50))
         pb.execute_opportunity(self._opp("BUY_YES", 0.50))
         self.assertEqual(self._order_calls, [])
 
 
 class TestAbsDistanceGate(unittest.TestCase):
-    """ABS DISTANCE GATE (BUY_NO only): skip when |mu − bracket_mid| < 1°F.
-    Ported from V2 max-bot. The directional consistency filter alone catches
-    the "model agrees with bracket" case; ABS DISTANCE catches "model is so
-    near the bracket boundary that small forecast error flips outcome" even
-    when model_prob looks low. PHIL-B44.5 lost on 2026-04-25 with mp=18%
-    but mu=44.6 right on bracket midpoint 44.5."""
+    """ABS DISTANCE GATE (BUY_NO only): skip when |mu − bracket_mid| < 1.5°F.
+    Ported from V2 max-bot at 1.0°F; tightened to 1.5°F on 2026-04-27.
+    The directional consistency filter alone catches the "model agrees with
+    bracket" case; ABS DISTANCE catches "model is so near the bracket boundary
+    that small forecast error flips outcome" even when model_prob looks low.
+    Losses driving the tighten: PHIL-B44.5 (mp=18%, abs_dist 0.1°F) and
+    ATL-B61.5 (mp=19%, abs_dist 0.5°F)."""
 
     def setUp(self):
         with pb._positions_lock:
@@ -829,8 +831,8 @@ class TestAbsDistanceGate(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_constant_is_one(self):
-        self.assertEqual(pb.MIN_ABS_DISTANCE_F, 1.0)
+    def test_constant_is_1_5(self):
+        self.assertEqual(pb.MIN_ABS_DISTANCE_F, 1.5)
 
     def test_buy_no_blocked_at_bracket_center(self):
         """PHIL-B44.5 reconstruction: mu exactly at bracket midpoint."""
@@ -842,9 +844,15 @@ class TestAbsDistanceGate(unittest.TestCase):
         pb.execute_opportunity(self._opp("BUY_NO", mu=44.6, floor=44.0, cap=45.0))
         self.assertEqual(self._order_calls, [])
 
-    def test_buy_no_passes_at_threshold(self):
-        """mu exactly 1.0°F from midpoint passes (strict less-than)."""
+    def test_buy_no_blocked_at_old_1_0_threshold(self):
+        """ATL-B61.5 reconstruction: 1.0°F from mid was admitted at the
+        old 1.0°F threshold and lost. Tightened gate must now block it."""
         pb.execute_opportunity(self._opp("BUY_NO", mu=43.5, floor=44.0, cap=45.0))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_passes_at_threshold(self):
+        """mu exactly 1.5°F from midpoint passes (strict less-than)."""
+        pb.execute_opportunity(self._opp("BUY_NO", mu=43.0, floor=44.0, cap=45.0))
         self.assertEqual(len(self._order_calls), 1)
 
     def test_buy_no_passes_well_above_threshold(self):
@@ -874,13 +882,192 @@ class TestAbsDistanceGate(unittest.TestCase):
 
 
 class TestCapBumpsApril26(unittest.TestCase):
-    """Cap bump from $1/$15 to $3/$30 on 2026-04-26."""
+    """Cap evolution: $1/$4 (live launch) → $3/$30 (2026-04-26) → $3/$60 (2026-04-27)."""
 
     def test_max_bet_is_3(self):
         self.assertEqual(pb.MAX_BET_USD, 3.00)
 
-    def test_daily_cap_is_30(self):
-        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 30.00)
+    def test_daily_cap_is_60(self):
+        """Bumped from $30 → $60 on 2026-04-27 to absorb the ~2× capital
+        deployment from the MIN_COST_USD floor without starving cycle 2 onward."""
+        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 60.00)
+
+    def test_min_cost_usd_is_1(self):
+        """$1 cost floor enforced via ceil(MIN_COST_USD / price) post-Kelly.
+        Before: 96% of recent fills under $1; after: every fill ≥ $1 (capped at $3)."""
+        self.assertEqual(pb.MIN_COST_USD, 1.00)
+
+
+class TestSizingMinCostFloor(unittest.TestCase):
+    """The $1 cost floor ensures every Kelly-sized entry deploys ≥ MIN_COST_USD,
+    regardless of how int(bet_usd / price) rounded down. The cap at MAX_BET_USD
+    keeps the floor from blowing the ceiling on cheap contracts."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._captured: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        # Capture (ticker, side, count, price_cents) — that's the call signature.
+        pb.place_kalshi_order = lambda ticker, side, count, price_cents: (
+            self._captured.append((ticker, side, count, price_cents)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, action, price, edge=0.25, model_prob=None, mu=None,
+             floor=44.0, cap=45.0, **overrides):
+        if model_prob is None:
+            model_prob = 0.20 if action == "BUY_NO" else 0.70
+        if mu is None:
+            # 3°F from bracket mid keeps ABS DISTANCE GATE clear.
+            mid = (floor + cap) / 2.0 if (floor is not None and cap is not None) else (floor or cap)
+            mu = mid - 3.0 if action == "BUY_NO" else mid
+        # Build matching ask cents on the side we're buying.
+        ask_cents = int(round(price * 100))
+        base = {
+            "market_ticker": "KXLOWTNYC-26APR25-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR25",
+            "action": action,
+            "model_prob": model_prob,
+            "edge": edge,
+            "entry_price": price,
+            "yes_bid": ask_cents - 3 if action == "BUY_YES" else 65,
+            "yes_ask": ask_cents if action == "BUY_YES" else 70,
+            "no_bid": ask_cents - 3 if action == "BUY_NO" else 28,
+            "no_ask": ask_cents if action == "BUY_NO" else 32,
+            "mu": mu, "sigma": 2.5, "mu_source": "nws_primary",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": floor, "cap": cap,
+            "station": "KNYC", "date_str": "2026-04-25", "label": "New York",
+        }
+        base.update(overrides)
+        return base
+
+    def test_low_price_sized_to_at_least_one_dollar(self):
+        """price=5c, edge=20% → Kelly bet_usd ~ $0.19 floored to $0.50,
+        int(0.50/0.05)=10 → cost $0.50. Ceil(1/0.05)=20 bumps count to 20 → $1.00."""
+        pb.execute_opportunity(self._opp("BUY_NO", price=0.05, edge=0.25))
+        self.assertEqual(len(self._captured), 1)
+        _, _, count, price_cents = self._captured[0]
+        self.assertGreaterEqual(count * price_cents, 100,
+                                f"intended cost {count*price_cents}c < 100c")
+
+    def test_mid_price_sized_to_at_least_one_dollar(self):
+        """price=30c → ceil(1/0.30)=4 → 4×30c=$1.20 ≥ $1."""
+        pb.execute_opportunity(self._opp("BUY_NO", price=0.30, edge=0.25))
+        self.assertEqual(len(self._captured), 1)
+        _, _, count, price_cents = self._captured[0]
+        self.assertGreaterEqual(count * price_cents, 100)
+
+    def test_high_price_sized_to_at_least_one_dollar(self):
+        """price=70c → ceil(1/0.70)=2 → 2×70c=$1.40 ≥ $1 (and ≤ $3)."""
+        pb.execute_opportunity(self._opp("BUY_YES", price=0.70, edge=0.25, model_prob=0.85))
+        self.assertEqual(len(self._captured), 1)
+        _, _, count, price_cents = self._captured[0]
+        self.assertGreaterEqual(count * price_cents, 100)
+        self.assertLessEqual(count * price_cents, int(round(pb.MAX_BET_USD * 100)))
+
+    def test_floor_does_not_blow_max_bet_cap(self):
+        """price=10c, edge near MAX_EDGE → Kelly wants high count. Floor must
+        not push past MAX_BET_USD cap. ceil(1/0.10)=10 → $1.00. But Kelly with
+        edge=0.40 might want more; cap clamp keeps it at int(3/0.10)=30 → $3.00."""
+        pb.execute_opportunity(self._opp("BUY_NO", price=0.10, edge=0.40))
+        self.assertEqual(len(self._captured), 1)
+        _, _, count, price_cents = self._captured[0]
+        self.assertLessEqual(count * price_cents, int(round(pb.MAX_BET_USD * 100)),
+                             f"intended cost {count*price_cents}c > MAX_BET_USD")
+        self.assertGreaterEqual(count * price_cents, 100)
+
+    def test_count_is_always_at_least_one(self):
+        """Even when MIN_COST_USD/price < 1 (e.g. price=$2 hypothetical),
+        count must be at least 1 contract."""
+        # price > $1 hypothetical: ceil(1/0.95)=2, but MAX_BET cap of int(3/0.95)=3.
+        # We can't easily test price>$1 since Kalshi has no such contracts, but
+        # the math is: count >= 1 always.
+        pb.execute_opportunity(self._opp("BUY_YES", price=0.85, edge=0.25, model_prob=0.85))
+        self.assertEqual(len(self._captured), 1)
+        _, _, count, _ = self._captured[0]
+        self.assertGreaterEqual(count, 1)
+
+
+class TestDirectionalGateTightened(unittest.TestCase):
+    """Directional gate tightened from 0.50 → 0.40/0.60 on 2026-04-27.
+    BUY_NO requires mp ≤ 0.40; BUY_YES requires mp ≥ 0.60."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._order_calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._order_calls.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, action, model_prob, **overrides):
+        base = {
+            "market_ticker": "KXLOWTNYC-26APR25-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR25",
+            "action": action,
+            "model_prob": model_prob,
+            "edge": 0.25,
+            "entry_price": 0.30 if action == "BUY_NO" else 0.10,
+            "yes_bid": 65, "yes_ask": 70,
+            "no_bid": 28, "no_ask": 32,
+            "mu": 41.5 if action == "BUY_NO" else 45.5,
+            "sigma": 2.5, "mu_source": "nws_primary",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KNYC", "date_str": "2026-04-25", "label": "New York",
+        }
+        base.update(overrides)
+        return base
+
+    def test_buy_no_at_old_boundary_now_blocked(self):
+        """mp=0.45 was admitted by the old 0.50 gate; now blocked."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.45))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_just_above_new_threshold_blocked(self):
+        """mp=0.41 must block."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.41))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_at_new_threshold_passes(self):
+        """mp=0.40 is the threshold (strict greater-than blocks)."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.40))
+        self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_yes_at_old_boundary_now_blocked(self):
+        """CHI-T41 reconstruction: mp=0.34 BUY_YES lost. Now blocked."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.34))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_yes_just_below_new_threshold_blocked(self):
+        """mp=0.59 must block (NYC-T44 reconstruction at mp=0.42 also blocked)."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.59))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_yes_at_new_threshold_passes(self):
+        """mp=0.60 is the threshold (strict less-than blocks)."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.60))
+        self.assertEqual(len(self._order_calls), 1)
 
 
 class TestRecordCandidateKind(unittest.TestCase):

@@ -83,15 +83,16 @@ All in `paper_min_bot.py`:
 | Constant | Value | Why |
 |---|---|---|
 | `MAX_BET_USD` | `$3.00` | Kelly-sized but capped per entry (raised 2026-04-26 from $1) |
+| `MIN_COST_USD` | `$1.00` | Cost floor: `count = max(count, ceil(MIN_COST_USD/price))` after Kelly + MIN_BET_USD floor + int rounding. Without this, `int(bet_usd/price)` rounded `count` down such that 96% of fills landed under $1 (avg $0.45 on 2026-04-25/26). The cap clamp at MAX_BET_USD keeps the floor from blowing the ceiling on cheap contracts. Added 2026-04-27. |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
 | `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |
-| `DAILY_EXPOSURE_CAP_USD` | `$30.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) |
+| `DAILY_EXPOSURE_CAP_USD` | `$60.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27, paired with MIN_COST_USD floor) |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
 | `MAX_EDGE` | `0.40` | Skip edges > 40% (V1 trust-zone — model error) |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain |
-| **Directional consistency** | `mp 0.50` | BUY_NO requires `mp < 0.50`; BUY_YES requires `mp > 0.50`. Don't bet against your own model. The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. Added 2026-04-26 after first-day data showed 5/5 BUY_NO losers had `mp ≥ 50%`. |
-| `MIN_ABS_DISTANCE_F` | `1.0°F` | **BUY_NO only** — skip when `\|mu − bracket_mid\| < 1°F`. Even with edge math passing, mu near bracket = coin-flip; small forecast error flips outcome. Bracket mid is `(floor+cap)/2` for B-range, single edge for tail brackets. Ported from V2 max-bot 2026-04-26 (V2: +$206 net on 480 trades). BUY_YES intentionally not gated — mu near bracket center is the BUY_YES sweet spot. |
+| **Directional consistency** | `mp 0.40 / 0.60` | BUY_NO requires `mp ≤ 0.40`; BUY_YES requires `mp ≥ 0.60`. Don't bet against your own model. Tightened 2026-04-27 from 0.50 → 0.40/0.60 to drop coin-flip-zone entries (CHI-T41 mp=34% and NYC-T44 mp=42% were both BUY_YES losers admitted at the old 0.50 threshold). The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. |
+| `MIN_ABS_DISTANCE_F` | `1.5°F` | **BUY_NO only** — skip when `\|mu − bracket_mid\| < 1.5°F`. Bracket mid is `(floor+cap)/2` for B-range, single edge for tail brackets. Ported from V2 max-bot at 1.0°F; tightened to 1.5°F on 2026-04-27 after PHIL-B44.5 (mp=18%, abs_dist 0.1°F) and ATL-B61.5 (mp=19%, abs_dist 0.5°F) lost in clean-era data. BUY_YES intentionally not gated — mu near bracket center is the BUY_YES sweet spot. |
 | `MAX_DISAGREEMENT_F` | `5.0°F` | Skip if HRRR vs NBP / NBP vs NBM diverge > this |
 | `MAX_SPREAD_CENTS` | `10c` | Skip if ask − bid > 10c on buying side |
 | `MAX_MU_VS_RM_DIFF_F` | `5.0°F` | Pre-sunrise: forecast μ vs observed rm sanity gate |

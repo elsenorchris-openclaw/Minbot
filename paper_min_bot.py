@@ -134,15 +134,22 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
 MAX_BET_USD = 3.00                  # $3 cap per entry (raised 2026-04-26 from $1)
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
+MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bumps `count` so
+                                    # every fill deploys ≥ $1. Prior int-rounded Kelly produced
+                                    # 96% sub-$1 fills on 2026-04-25/26 (avg $0.45). Capped by
+                                    # MAX_BET_USD downstream so the floor can't blow the ceiling.
 
-MIN_ABS_DISTANCE_F = 1.0            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
+MIN_ABS_DISTANCE_F = 1.5            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
                                     # Even when edge math passes, mu near bracket = coin-flip;
                                     # small forecast error flips outcome. Ported from V2 max-bot
-                                    # 2026-04-26 (V2: +$206 net on 480 trades).
+                                    # at 1.0°F; tightened to 1.5°F on 2026-04-27 after PHIL-B44.5
+                                    # (abs_dist 0.1°F) and ATL-B61.5 (0.5°F) lost in clean-era data.
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
-DAILY_EXPOSURE_CAP_USD = 30.00      # day scope (UTC midnight); $4 → $15 → $30 (2026-04-26)
+DAILY_EXPOSURE_CAP_USD = 60.00      # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27,
+                                    # paired with MIN_COST_USD floor — without the bump we'd hit
+                                    # the cap in ~30 entries vs the recent 30–50/day rhythm)
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 
@@ -1734,11 +1741,16 @@ def execute_opportunity(opp: dict) -> bool:
         if ticker in _open_positions:
             return False
 
-    # Kelly sizing with MAX_BET_USD cap
+    # Kelly sizing, then $1 cost floor (ceil), then MAX_BET_USD ceiling.
+    # Ordering matters: `int(bet_usd / price)` rounds DOWN, so the post-Kelly
+    # cost can land anywhere from `price` to MAX_BET_USD; without the ceil
+    # bump, edges with price < $1 produce sub-$1 fills (~96% of recent days).
     price = float(opp["entry_price"])
     kelly = KELLY_FRACTION * edge / max(1 - price, 0.01)
     bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * MAX_BET_USD))
     count = max(1, int(bet_usd / price))
+    count = max(count, math.ceil(MIN_COST_USD / price))
+    count = min(count, max(1, int(MAX_BET_USD / price)))
     intended_cost = count * price
 
     # Hard gates beyond MIN_EDGE — each one prevents a class of model error.
@@ -1754,12 +1766,14 @@ def execute_opportunity(opp: dict) -> bool:
     # formula assumes a calibrated model, but our +1.24°F NBP-cool bias
     # compounds when action and model direction disagree. First-day data
     # 2026-04-26 (cascade-corrected): BUY_NO with mp ≥ 50% lost 5/5.
+    # Tightened 2026-04-27 from 0.50 → 0.40/0.60 to drop coin-flip-zone
+    # entries (CHI-T41 mp=34% BUY_YES, NYC-T44 mp=42% BUY_YES both lost).
     action = opp["action"]
-    if action == "BUY_NO" and mp >= 0.50:
-        log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} ≥ 50% (action vs model disagree)")
+    if action == "BUY_NO" and mp > 0.40:
+        log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
         return False
-    if action == "BUY_YES" and mp <= 0.50:
-        log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} ≤ 50% (action vs model disagree)")
+    if action == "BUY_YES" and mp < 0.60:
+        log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
         return False
     # ABS DISTANCE GATE (BUY_NO only). When mu is close to the bracket
     # midpoint, even a small forecast error flips the outcome — coin flip.
