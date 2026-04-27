@@ -948,10 +948,12 @@ class TestAbsDistanceGate(unittest.TestCase):
 
 
 class TestCapBumpsApril26(unittest.TestCase):
-    """Cap evolution: $1/$4 (live launch) → $3/$30 (2026-04-26) → $3/$60 (2026-04-27)."""
+    """Cap evolution: $1/$4 (live launch) → $3/$30 (2026-04-26 AM) →
+    $3/$60 (2026-04-27 AM, MIN_COST_USD pairing) →
+    $5/$60 (2026-04-27 PM, Chris asked for $1–$5 envelope)."""
 
-    def test_max_bet_is_3(self):
-        self.assertEqual(pb.MAX_BET_USD, 3.00)
+    def test_max_bet_is_5(self):
+        self.assertEqual(pb.MAX_BET_USD, 5.00)
 
     def test_daily_cap_is_60(self):
         """Bumped from $30 → $60 on 2026-04-27 to absorb the ~2× capital
@@ -960,8 +962,13 @@ class TestCapBumpsApril26(unittest.TestCase):
 
     def test_min_cost_usd_is_1(self):
         """$1 cost floor enforced via ceil(MIN_COST_USD / price) post-Kelly.
-        Before: 96% of recent fills under $1; after: every fill ≥ $1 (capped at $3)."""
+        Every fill ≥ $1 (capped at MAX_BET_USD=$5)."""
         self.assertEqual(pb.MIN_COST_USD, 1.00)
+
+    def test_min_under_max_envelope(self):
+        """Chris's spec 2026-04-27: every position ∈ [$1, $5]. Floor must be
+        ≤ ceiling, otherwise sizing logic gets clamped weirdly."""
+        self.assertLess(pb.MIN_COST_USD, pb.MAX_BET_USD)
 
 
 class TestSizingMinCostFloor(unittest.TestCase):
