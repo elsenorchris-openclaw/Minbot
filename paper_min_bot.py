@@ -278,6 +278,33 @@ def log(msg: str, level: str = "info") -> None:
             pass
 
 
+# Skip-log debouncing. The skip path inside execute_opportunity logs a line
+# every time a gate fires; the same (ticker, gate, values) typically repeats
+# every cycle until the ticker settles or quotes change. Pre-fix the log
+# was 83% repeated skip lines (82k of 99k lines/24h, top offender 2108 firings
+# of OBS_CONFIRMED_LOSER on one ticker). Cap at one log per (ticker, msg) until
+# the message changes, with a re-log every 30 min so dashboards / log-tail
+# eyeballing still see "still blocked."
+_skip_log_state: dict[str, tuple[str, float]] = {}
+_skip_log_lock = threading.Lock()
+SKIP_LOG_RELOG_SEC = 1800.0
+
+
+def _log_skip(ticker: str, msg: str) -> None:
+    """log(msg) but suppress repeats for the same (ticker, msg) within
+    SKIP_LOG_RELOG_SEC. msg should be the full pre-formatted skip line
+    (e.g. `"  skip KXLOWTNYC-26APR28-B45.5: edge 25% > MAX_EDGE 42%"`).
+    Different formatted values (e.g. edge 25% → 26%) count as different
+    msgs and re-log normally."""
+    now = time.time()
+    with _skip_log_lock:
+        prev = _skip_log_state.get(ticker)
+        if prev is not None and prev[0] == msg and (now - prev[1]) < SKIP_LOG_RELOG_SEC:
+            return
+        _skip_log_state[ticker] = (msg, now)
+    log(msg)
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     tmp = Path(str(path) + ".tmp")
     with open(tmp, "w") as f:
@@ -2109,23 +2136,24 @@ def execute_opportunity(opp: dict) -> bool:
         # The hard-stop catches these post-entry, but the round-trip is costly
         # (LAX-T54 round-trip 2026-04-27 lost $3.44 in 18 min).
         if _check_obs_confirmed_loser(opp):
-            log(f"  skip {ticker}: OBS_CONFIRMED_LOSER — rm={opp.get('running_min')} "
+            _log_skip(ticker,
+                f"  skip {ticker}: OBS_CONFIRMED_LOSER — rm={opp.get('running_min')} "
                 f"already in YES territory (floor={opp.get('floor')}, cap={opp.get('cap')})")
             return False
         # Forecast-based gates — each prevents a class of model error.
         # Order: cheapest-to-evaluate first.
         if edge > MAX_EDGE:
-            log(f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
+            _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
             return False
         if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-            log(f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+            _log_skip(ticker, f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
             return False
         # Directional consistency: never bet against our own model.
         if action == "BUY_NO" and mp > 0.40:
-            log(f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
+            _log_skip(ticker, f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
             return False
         if action == "BUY_YES" and mp < 0.60:
-            log(f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
+            _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
             return False
         # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
         if action == "BUY_NO":
@@ -2142,18 +2170,19 @@ def execute_opportunity(opp: dict) -> bool:
                 mu_val = float(opp.get("mu", 0.0))
                 abs_dist = abs(mu_val - bracket_mid)
                 if abs_dist < MIN_ABS_DISTANCE_F:
-                    log(f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
+                    _log_skip(ticker,
+                        f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
                         f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F (min {MIN_ABS_DISTANCE_F:.1f}°F)")
                     return False
         # F2A asymmetry gate (V2 port, BUY_NO only).
         f2a_block = _check_f2a_gate(opp)
         if f2a_block:
-            log(f"  skip {ticker}: {f2a_block}")
+            _log_skip(ticker, f"  skip {ticker}: {f2a_block}")
             return False
         # MSG multi-source consensus gate (V2 port, BUY_NO only).
         msg_block = _check_msg_gate(opp)
         if msg_block:
-            log(f"  skip {ticker}: {msg_block}")
+            _log_skip(ticker, f"  skip {ticker}: {msg_block}")
             return False
         # PRICE_ZONE block (V2 port, BUY_NO only). Market YES bid ∈ [30, 40]c
         # signals "no strong directional consensus". When our model says NO
@@ -2162,7 +2191,8 @@ def execute_opportunity(opp: dict) -> bool:
         if action == "BUY_NO":
             yb = opp.get("yes_bid")
             if yb is not None and PRICE_ZONE_LO_C <= int(yb) <= PRICE_ZONE_HI_C:
-                log(f"  skip {ticker}: PRICE_ZONE — yes_bid {int(yb)}c in "
+                _log_skip(ticker,
+                    f"  skip {ticker}: PRICE_ZONE — yes_bid {int(yb)}c in "
                     f"[{PRICE_ZONE_LO_C}, {PRICE_ZONE_HI_C}] (market uncertain)")
                 return False
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
@@ -2173,19 +2203,20 @@ def execute_opportunity(opp: dict) -> bool:
         if action == "BUY_NO" and not opp.get("is_today", False):
             disag = float(opp.get("disagreement", 0.0))
             if disag > H_2_0_DISAGREE_F:
-                log(f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
+                _log_skip(ticker,
+                    f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
                     f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
                 return False
         disagreement = float(opp.get("disagreement", 0.0))
         if disagreement > MAX_DISAGREEMENT_F:
-            log(f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
+            _log_skip(ticker, f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
             return False
         # Mu-vs-running_min sanity: pre-sunrise, forecast μ vs observed lowest > 5°F = wrong.
         rm = opp.get("running_min")
         if rm is not None and not opp.get("post_sunrise_lock"):
             mu_check = float(opp.get("mu", 0.0))
             if abs(mu_check - float(rm)) > MAX_MU_VS_RM_DIFF_F:
-                log(f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+                _log_skip(ticker, f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
                 return False
     # Spread filter — always applies (even on obs_alive bypass; thin books are
     # untradable regardless of obs confirmation).
@@ -2197,12 +2228,12 @@ def execute_opportunity(opp: dict) -> bool:
         na = opp.get("no_ask"); nb = opp.get("no_bid")
         spread = (na - nb) if (na is not None and nb is not None) else 0
     if spread > MAX_SPREAD_CENTS:
-        log(f"  skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS}c")
+        _log_skip(ticker, f"  skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS}c")
         return False
     # Per-cycle / daily / per-event budget.
     ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""))
     if not ok:
-        log(f"  skip {ticker}: {reason}")
+        _log_skip(ticker, f"  skip {ticker}: {reason}")
         return False
     price_cents = int(round(price * 100))
     order_id = place_kalshi_order(ticker, side, count, price_cents)
@@ -2429,12 +2460,106 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
 # SETTLEMENT
 # ═══════════════════════════════════════════════════════════════════════
 
+# Kalshi settlement fallback cache (5-min TTL). Populated lazily when we
+# detect a stale open position with no obs-pipeline CLI. Closes the gap when
+# obs-pipeline misses a CLI bulletin (8 stuck positions detected 2026-04-28
+# audit: KBOS/KDFW Apr 27, plus 6 older — Kalshi had settled them all).
+_kalshi_settlements_cache: dict[str, dict] = {}
+_kalshi_settlements_cache_ts: float = 0.0
+KALSHI_SETTLEMENTS_TTL_SEC = 300
+
+
+def _refresh_kalshi_settlements_cache(force: bool = False) -> None:
+    """Pull the most recent KXLOWT settlements from Kalshi and cache by ticker.
+    5-min TTL, refreshed only when called by `check_settlements` for a stale
+    position. Pulls the most-recent page (limit=200) — sufficient for any
+    position the bot might still be holding given POSITION_TTL_DAYS=3."""
+    global _kalshi_settlements_cache, _kalshi_settlements_cache_ts
+    if not force and (time.time() - _kalshi_settlements_cache_ts) < KALSHI_SETTLEMENTS_TTL_SEC:
+        return
+    try:
+        r = kalshi_get("/trade-api/v2/portfolio/settlements", {"limit": 200})
+        new_cache: dict[str, dict] = {}
+        for s in (r.get("settlements") or []):
+            tk = s.get("ticker")
+            if tk and tk.startswith("KXLOWT"):
+                new_cache[tk] = s
+        _kalshi_settlements_cache = new_cache
+        _kalshi_settlements_cache_ts = time.time()
+        log(f"  Kalshi settlements cache refreshed: {len(new_cache)} entries")
+    except Exception as e:
+        log(f"  Kalshi settlements cache refresh failed: {e}", "warn")
+
+
+def _settle_from_kalshi(pos: dict) -> Optional[dict]:
+    """Build a settlement record from a Kalshi `/portfolio/settlements` entry
+    when obs-pipeline's CLI is missing. Returns the settlement dict or None
+    if Kalshi hasn't settled either.
+
+    `cli_low` is None on these records (we don't have the CLI value); a
+    `source: kalshi` field marks them so calibration analysis can filter."""
+    ticker = pos.get("market_ticker")
+    if not ticker:
+        return None
+    ks = _kalshi_settlements_cache.get(ticker)
+    if not ks:
+        return None
+    market_result = ks.get("market_result")
+    if market_result not in ("yes", "no"):
+        return None
+    yes_wins = (market_result == "yes")
+    action = pos.get("action")
+    our_win = (yes_wins if action == "BUY_YES" else (not yes_wins))
+    count = int(pos.get("count", 0))
+    price = float(pos.get("entry_price", 0.0))
+    cost = count * price
+    revenue = count * 1.0 if our_win else 0.0
+    pnl = revenue - cost
+    return {
+        "ts": datetime.now(timezone.utc).isoformat(),
+        "kind": "settlement",
+        "market_ticker": ticker, "action": action,
+        "entry_price": price, "count": count, "cost": cost,
+        "cli_low": None, "floor": pos.get("floor"), "cap": pos.get("cap"),
+        "in_bracket": yes_wins, "won": our_win,
+        "revenue": revenue, "pnl": pnl,
+        "model_prob": pos.get("model_prob"),
+        "mu": pos.get("mu"), "sigma": pos.get("sigma"),
+        "mu_source": pos.get("mu_source"),
+        "running_min_at_entry": pos.get("running_min"),
+        "station": pos.get("station"), "date_str": pos.get("date_str"),
+        "label": pos.get("label"),
+        "source": "kalshi",
+        "kalshi_settled_time": ks.get("settled_time"),
+    }
+
+
 def check_settlements() -> int:
     """Walk open positions; for each, check if the settlement CLI low has
-    been published. If so, compute P&L and archive."""
+    been published. If so, compute P&L and archive.
+
+    Two settlement paths:
+      1. obs-pipeline CLI (preferred): `get_cli_low` returns the integer low
+         from `cli_reports`. Bracket math computes in_bracket / won.
+      2. Kalshi fallback: when obs-pipeline never ingested the CLI for this
+         (station, climate-day) AND date_str < today, ask Kalshi if the market
+         already settled (their `market_result` is authoritative regardless of
+         our obs-pipeline coverage). Recovers stuck positions caused by gaps
+         in NWS bulletin ingestion."""
     settled = 0
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    have_stale_unsettled = False
     with _positions_lock:
         positions = dict(_open_positions)
+    for ticker, pos in positions.items():
+        if pos.get("settled"):
+            continue
+        ds = pos.get("date_str") or ""
+        if ds and ds < today:
+            have_stale_unsettled = True
+            break
+    if have_stale_unsettled:
+        _refresh_kalshi_settlements_cache()
     for ticker, pos in positions.items():
         # Skip positions already marked settled. dedupe-survives-settle (commit
         # bca506e) keeps them in _open_positions for re-entry blocking; without
@@ -2447,39 +2572,55 @@ def check_settlements() -> int:
         if not station or not date_str:
             continue
         cli_low = get_cli_low(station, date_str)
+        kalshi_settlement: Optional[dict] = None
         if cli_low is None:
-            continue  # settlement not yet available
-        # Determine outcome
-        floor = pos.get("floor")
-        cap = pos.get("cap")
-        in_bracket = True
-        if floor is not None and cli_low < floor:
-            in_bracket = False
-        if cap is not None and cli_low > cap:
-            in_bracket = False
-        action = pos.get("action")
-        yes_wins = in_bracket
-        our_win = (yes_wins if action == "BUY_YES" else (not yes_wins))
-        count = int(pos.get("count", 0))
-        price = float(pos.get("entry_price", 0.0))
-        cost = count * price
-        revenue = count * 1.0 if our_win else 0.0
-        pnl = revenue - cost
-        settlement = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "kind": "settlement",
-            "market_ticker": ticker, "action": action,
-            "entry_price": price, "count": count, "cost": cost,
-            "cli_low": cli_low, "floor": floor, "cap": cap,
-            "in_bracket": in_bracket, "won": our_win,
-            "revenue": revenue, "pnl": pnl,
-            "model_prob": pos.get("model_prob"),
-            "mu": pos.get("mu"), "sigma": pos.get("sigma"),
-            "mu_source": pos.get("mu_source"),
-            "running_min_at_entry": pos.get("running_min"),
-            "station": station, "date_str": date_str,
-            "label": pos.get("label"),
-        }
+            # Fallback: ask Kalshi if it already settled this market
+            # (obs-pipeline missed the CLI bulletin). Only fires when the
+            # climate day is past — fresh markets still wait for CLI.
+            if date_str < today:
+                kalshi_settlement = _settle_from_kalshi(pos)
+            if kalshi_settlement is None:
+                continue  # settlement not yet available from either source
+        if kalshi_settlement is not None:
+            settlement = kalshi_settlement
+            in_bracket = settlement["in_bracket"]
+            our_win = settlement["won"]
+            pnl = settlement["pnl"]
+            log_cli = "kalshi"
+        else:
+            # Determine outcome from CLI low
+            floor = pos.get("floor")
+            cap = pos.get("cap")
+            in_bracket = True
+            if floor is not None and cli_low < floor:
+                in_bracket = False
+            if cap is not None and cli_low > cap:
+                in_bracket = False
+            action = pos.get("action")
+            yes_wins = in_bracket
+            our_win = (yes_wins if action == "BUY_YES" else (not yes_wins))
+            count = int(pos.get("count", 0))
+            price = float(pos.get("entry_price", 0.0))
+            cost = count * price
+            revenue = count * 1.0 if our_win else 0.0
+            pnl = revenue - cost
+            settlement = {
+                "ts": datetime.now(timezone.utc).isoformat(),
+                "kind": "settlement",
+                "market_ticker": ticker, "action": action,
+                "entry_price": price, "count": count, "cost": cost,
+                "cli_low": cli_low, "floor": floor, "cap": cap,
+                "in_bracket": in_bracket, "won": our_win,
+                "revenue": revenue, "pnl": pnl,
+                "model_prob": pos.get("model_prob"),
+                "mu": pos.get("mu"), "sigma": pos.get("sigma"),
+                "mu_source": pos.get("mu_source"),
+                "running_min_at_entry": pos.get("running_min"),
+                "station": station, "date_str": date_str,
+                "label": pos.get("label"),
+                "source": "obs_pipeline",
+            }
+            log_cli = f"{cli_low}°F"
         _append_jsonl(SETTLEMENTS_FILE, settlement)
         # Don't pop — keep the record in _open_positions tagged as settled so
         # the per-ticker dedupe (in scan_cycle and execute_opportunity) still
@@ -2493,15 +2634,17 @@ def check_settlements() -> int:
                 existing.update({
                     "settled": True,
                     "settled_ts": settlement["ts"],
-                    "cli_low": cli_low,
+                    "cli_low": settlement.get("cli_low"),
                     "in_bracket": in_bracket,
                     "won": our_win,
                     "pnl": pnl,
                 })
         settled += 1
-        log(f"  SETTLED {ticker} | action={action} CLI_low={cli_low}°F "
+        log(f"  SETTLED {ticker} | action={pos.get('action')} CLI_low={log_cli} "
             f"in={in_bracket} won={our_win} pnl=${pnl:+.2f}")
-        notify_discord_settlement(ticker, action, cli_low, in_bracket, our_win, pnl)
+        notify_discord_settlement(ticker, pos.get("action"),
+                                  settlement.get("cli_low") or 0,
+                                  in_bracket, our_win, pnl)
     if settled:
         _save_positions()
     return settled

@@ -24,7 +24,17 @@ Conservative caps: $1 per entry, 3 entries per cycle, $4 daily exposure,
   +1°F is the ASOS-vs-CLI buffer; CLI rounds to integer and our 5-min obs
   may be 0.5°F off). Post-sunrise, sigma collapses to 1.0°F residual noise.
 - **Settlement**: reads CLI daily low from obs-pipeline's `cli_reports.low_f`
-  field (same source V1/V2 use for CLI high).
+  field (same source V1/V2 use for CLI high). **Kalshi fallback** when
+  obs-pipeline missed a CLI bulletin: if `get_cli_low` returns None for a
+  position whose `date_str < today`, query `/portfolio/settlements` and use
+  Kalshi's `market_result` to settle locally. Recovers stuck positions caused
+  by NWS bulletin ingestion gaps (settlement record gets `source: "kalshi"`
+  and `cli_low: null` so calibration analysis can filter).
+- **Logging**: skip-log lines for the same `(market_ticker, msg)` pair are
+  debounced — first occurrence logs, repeats are suppressed for 30 min, then
+  re-logged once for visibility. Pre-fix the log was 83% repeated skip lines
+  (top offender: 2108 firings of one ticker in 24h). Real events
+  (`ENTRY`/`EXIT`/`SETTLED`/`OBS_CONFIRMED_ALIVE`) always log.
 
 ## Data flow
 

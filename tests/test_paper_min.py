@@ -1916,5 +1916,248 @@ class TestQuickWinGates(unittest.TestCase):
         self.assertEqual(len(self._captured), 1, "obs_alive should bypass forecast gates")
 
 
+class TestSkipLogDebounce(unittest.TestCase):
+    """`_log_skip` suppresses repeated (ticker, msg) pairs within
+    SKIP_LOG_RELOG_SEC. Pre-fix the log was 83% repeated skip lines (82k of
+    99k lines/24h, top offender 2108 firings of one ticker)."""
+
+    def setUp(self):
+        with pb._skip_log_lock:
+            pb._skip_log_state.clear()
+        self._lines: list[str] = []
+        self._orig_log = pb.log
+        pb.log = lambda msg, level="info": self._lines.append(msg)
+
+    def tearDown(self):
+        pb.log = self._orig_log
+        with pb._skip_log_lock:
+            pb._skip_log_state.clear()
+
+    def test_first_call_logs(self):
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        self.assertEqual(len(self._lines), 1)
+
+    def test_repeat_suppressed(self):
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        self.assertEqual(len(self._lines), 1, "exact repeats should not re-log")
+
+    def test_changed_msg_relogs(self):
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 26%")
+        self.assertEqual(len(self._lines), 2, "different msg → re-log")
+
+    def test_different_ticker_logs_independently(self):
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        pb._log_skip("KXLOWTBOS-26APR28-T40", "  skip foo: edge 25%")
+        self.assertEqual(len(self._lines), 2, "per-ticker dedup, not per-msg")
+
+    def test_relog_after_ttl_window(self):
+        """After SKIP_LOG_RELOG_SEC the same message re-logs (visibility check)."""
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        # Manually age the entry past the window
+        with pb._skip_log_lock:
+            ent = pb._skip_log_state["KXLOWTNYC-26APR28-B45.5"]
+            pb._skip_log_state["KXLOWTNYC-26APR28-B45.5"] = (
+                ent[0], ent[1] - pb.SKIP_LOG_RELOG_SEC - 1.0
+            )
+        pb._log_skip("KXLOWTNYC-26APR28-B45.5", "  skip foo: edge 25%")
+        self.assertEqual(len(self._lines), 2, "should re-log after RELOG_SEC")
+
+    def test_execute_opportunity_skip_uses_debouncer(self):
+        """End-to-end: 3 successive cycles of same opp should log skip once."""
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        pb._cached_bankroll = 25.0
+        pb._bankroll_cache_ts = 9999999999
+        opp = {
+            "market_ticker": "KXLOWTNYC-26APR28-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR28",
+            "action": "BUY_NO", "model_prob": 0.50, "edge": 0.50,  # > MAX_EDGE
+            "entry_price": 0.50, "yes_bid": 47, "yes_ask": 50,
+            "no_bid": 48, "no_ask": 50, "mu": 50.0, "sigma": 2.5,
+            "mu_source": "nbp", "running_min": None,
+            "post_sunrise_lock": False, "disagreement": 1.0,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KNYC", "date_str": "2026-04-28", "label": "NYC",
+            "series": "KXLOWTNYC",
+        }
+        for _ in range(5):
+            pb.execute_opportunity(opp)
+        skip_lines = [l for l in self._lines if "skip " in l and "MAX_EDGE" in l]
+        self.assertEqual(len(skip_lines), 1,
+                         f"5 cycles same skip → exactly 1 log line; got {len(skip_lines)}: {skip_lines}")
+
+
+class TestKalshiSettlementFallback(unittest.TestCase):
+    """`check_settlements` falls back to Kalshi `/portfolio/settlements` when
+    obs-pipeline missed the CLI bulletin (8 stuck positions detected
+    2026-04-28). Closes the gap permanently — Kalshi's `market_result` is
+    authoritative regardless of our obs coverage."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        # Wipe + reset Kalshi cache
+        pb._kalshi_settlements_cache.clear()
+        pb._kalshi_settlements_cache_ts = 0.0
+        # Patch I/O
+        self._orig_get_cli = pb.get_cli_low
+        self._orig_kalshi_get = pb.kalshi_get
+        self._orig_append = pb._append_jsonl
+        self._orig_save = pb._save_positions
+        self._orig_send = pb.notify_discord_settlement
+        self._orig_log = pb.log
+        self._appended: list[dict] = []
+        self._kalshi_calls: list[tuple] = []
+        pb._append_jsonl = lambda path, rec: self._appended.append(rec)
+        pb._save_positions = lambda: None
+        pb.notify_discord_settlement = lambda *a, **kw: None
+        pb.log = lambda msg, level="info": None
+
+    def tearDown(self):
+        pb.get_cli_low = self._orig_get_cli
+        pb.kalshi_get = self._orig_kalshi_get
+        pb._append_jsonl = self._orig_append
+        pb._save_positions = self._orig_save
+        pb.notify_discord_settlement = self._orig_send
+        pb.log = self._orig_log
+        pb._kalshi_settlements_cache.clear()
+        pb._kalshi_settlements_cache_ts = 0.0
+
+    def _patch_kalshi(self, settlements_payload):
+        def fake(path, params=None):
+            self._kalshi_calls.append((path, params))
+            if "settlements" in path:
+                return {"settlements": settlements_payload}
+            return {}
+        pb.kalshi_get = fake
+
+    def _yesterday(self):
+        from datetime import datetime, timezone, timedelta
+        return (datetime.now(timezone.utc) - timedelta(days=1)).strftime("%Y-%m-%d")
+
+    def test_kalshi_fallback_settles_buy_yes_winner(self):
+        """Stale BUY_YES position with no CLI; Kalshi result=yes → won + revenue."""
+        pb.get_cli_low = lambda st, ds: None
+        self._patch_kalshi([{
+            "ticker": "KXLOWTBOS-26APR27-T40",
+            "market_result": "yes", "revenue": 100,
+            "settled_time": "2026-04-28T11:33:58Z",
+        }])
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTBOS-26APR27-T40", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.50, "count": 1, "cost": 0.50,
+               "station": "KBOS", "date_str": ds, "label": "Boston",
+               "floor": 40.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 1)
+        self.assertEqual(len(self._appended), 1)
+        s = self._appended[0]
+        self.assertEqual(s["source"], "kalshi")
+        self.assertIsNone(s["cli_low"])
+        self.assertTrue(s["won"])
+        self.assertAlmostEqual(s["pnl"], 0.50)
+
+    def test_kalshi_fallback_settles_buy_no_loser(self):
+        """BUY_NO position; Kalshi result=yes → BUY_NO loses → pnl=-cost."""
+        pb.get_cli_low = lambda st, ds: None
+        self._patch_kalshi([{
+            "ticker": "KXLOWTHOU-26APR25-B73.5",
+            "market_result": "yes", "revenue": 0,
+            "settled_time": "2026-04-26T11:33:59Z",
+        }])
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTHOU-26APR25-B73.5", "kind": "entry",
+               "action": "BUY_NO", "entry_price": 0.22, "count": 2, "cost": 0.44,
+               "station": "KHOU", "date_str": ds, "label": "Houston",
+               "floor": 73.0, "cap": 74.0}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 1)
+        s = self._appended[0]
+        self.assertFalse(s["won"])
+        self.assertAlmostEqual(s["pnl"], -0.44)
+
+    def test_no_fallback_for_fresh_position(self):
+        """Position whose date_str is today — no fallback even if CLI missing
+        (we expect to wait for normal settlement path)."""
+        pb.get_cli_low = lambda st, ds: None
+        self._patch_kalshi([{"ticker": "KXLOWTBOS-26APR28-T40", "market_result": "yes", "revenue": 100}])
+        from datetime import datetime, timezone
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        pos = {"market_ticker": "KXLOWTBOS-26APR28-T40", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.50, "count": 1,
+               "station": "KBOS", "date_str": today, "label": "Boston",
+               "floor": 40.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 0, "should NOT fallback for today's positions")
+        self.assertEqual(len(self._appended), 0)
+
+    def test_no_fallback_when_kalshi_doesnt_have_it(self):
+        """Stale position; Kalshi cache empty for the ticker → still skip
+        (don't conjure a settlement that doesn't exist)."""
+        pb.get_cli_low = lambda st, ds: None
+        self._patch_kalshi([])  # empty
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTBOS-26APR27-T40", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.50, "count": 1,
+               "station": "KBOS", "date_str": ds, "label": "Boston",
+               "floor": 40.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 0)
+
+    def test_obs_pipeline_cli_takes_precedence(self):
+        """If obs-pipeline has the CLI we use it (even if Kalshi also has
+        a settlement). source field is `obs_pipeline`, not `kalshi`."""
+        pb.get_cli_low = lambda st, ds: 42  # CLI present
+        self._patch_kalshi([{"ticker": "KXLOWTBOS-26APR27-T40", "market_result": "yes", "revenue": 100}])
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTBOS-26APR27-T40", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.50, "count": 1,
+               "station": "KBOS", "date_str": ds, "label": "Boston",
+               "floor": 40.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 1)
+        s = self._appended[0]
+        self.assertEqual(s["source"], "obs_pipeline")
+        self.assertEqual(s["cli_low"], 42)
+        # CLI=42, floor=40.5 → cli >= floor → in_bracket=True → BUY_YES wins
+        self.assertTrue(s["won"])
+
+    def test_kalshi_cache_not_refetched_within_ttl(self):
+        """Cache TTL is 5min; a second check_settlements call within that
+        window should not re-call Kalshi."""
+        pb.get_cli_low = lambda st, ds: None
+        self._patch_kalshi([{"ticker": "X", "market_result": "yes", "revenue": 100}])
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTBOS-26APR27-T40", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.50, "count": 1,
+               "station": "KBOS", "date_str": ds, "label": "Boston",
+               "floor": 40.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        pb.check_settlements()
+        n_calls_1 = len(self._kalshi_calls)
+        pb.check_settlements()
+        n_calls_2 = len(self._kalshi_calls)
+        self.assertEqual(n_calls_1, n_calls_2, "should not re-fetch within TTL")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
