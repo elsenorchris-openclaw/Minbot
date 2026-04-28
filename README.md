@@ -92,11 +92,11 @@ All in `paper_min_bot.py`:
 
 | Constant | Value | Why |
 |---|---|---|
-| `MAX_BET_USD` | `$15.00` | Kelly-sized but capped per entry. $1 (live launch) → $3 (2026-04-26) → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15 (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner validated upsizing on confirmed-edge setups). $79 bankroll supports ~5 concurrent $15 bets within per-event correlation envelope. |
+| `MAX_BET_USD` | `$20.00` | Kelly-sized but capped per entry. $1 (live launch) → $3 (2026-04-26) → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15 (2026-04-28) → $20 (2026-04-28 night, paired with $200 bankroll add to ~$279). $20 stays below full Kelly intent (~$35 on $279 @ 25%/25%/50c) so individual position risk is bounded while the bot proves at scale. |
 | `MIN_COST_USD` | `$1.00` | Cost floor: `count = max(count, ceil(MIN_COST_USD/price))` after Kelly + MIN_BET_USD floor + int rounding. Without this, `int(bet_usd/price)` rounded `count` down such that 96% of fills landed under $1 (avg $0.45 on 2026-04-25/26). The cap clamp at MAX_BET_USD keeps the floor from blowing the ceiling on cheap contracts. Added 2026-04-27. |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
 | `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |
-| `DAILY_EXPOSURE_CAP_USD` | `$60.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27, paired with MIN_COST_USD floor) |
+| `DAILY_EXPOSURE_CAP_USD` | `$120.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27) → $120 (2026-04-28 night, alongside $200 bankroll add). 43% of $279 bankroll — caps daily drawdown below half the bankroll if the model has a bad day. |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
 | `MAX_EDGE` | `0.42` | Skip edges > 42% (V1 trust-zone — model error). Bumped 0.40 → 0.42 (2026-04-27 evening) as a cautious half-step toward V2's NWS-PRIMARY-era 0.45. |

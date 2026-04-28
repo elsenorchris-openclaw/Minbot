@@ -259,9 +259,10 @@ class TestWalletConfig(unittest.TestCase):
         self.assertEqual(pb.WALLET, "v1")
 
     def test_live_config_caps_are_conservative(self):
-        # Sanity: don't accidentally ship with $1000 caps.
-        self.assertLessEqual(pb.MAX_BET_USD, 25.00)
-        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 100.00)
+        # Sanity: don't accidentally ship with $1000 caps. Bumped 2026-04-28
+        # night to $20 / $120 alongside bankroll growth to ~$279.
+        self.assertLessEqual(pb.MAX_BET_USD, 30.00)
+        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 150.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
 
@@ -967,15 +968,17 @@ class TestCapBumpsApril26(unittest.TestCase):
     $3/$60 (2026-04-27 AM, MIN_COST_USD pairing) →
     $5/$60 (2026-04-27 PM, [$1, $5] envelope) →
     $10/$60 (2026-04-27 evening, post-V2-port wins) →
-    $15/$60 (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner)."""
+    $15/$60 (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner) →
+    $20/$120 (2026-04-28 night, paired with $200 bankroll add)."""
 
-    def test_max_bet_is_15(self):
-        self.assertEqual(pb.MAX_BET_USD, 15.00)
+    def test_max_bet_is_20(self):
+        self.assertEqual(pb.MAX_BET_USD, 20.00)
 
-    def test_daily_cap_is_60(self):
-        """Bumped from $30 → $60 on 2026-04-27 to absorb the ~2× capital
-        deployment from the MIN_COST_USD floor without starving cycle 2 onward."""
-        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 60.00)
+    def test_daily_cap_is_120(self):
+        """Bumped from $60 → $120 on 2026-04-28 night alongside bankroll
+        growth to ~$279. 43% of bankroll — absorbs Kelly intent at scale
+        without exposing more than half the bankroll on a bad day."""
+        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 120.00)
 
     def test_min_cost_usd_is_1(self):
         """$1 cost floor enforced via ceil(MIN_COST_USD / price) post-Kelly.

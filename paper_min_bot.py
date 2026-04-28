@@ -134,11 +134,13 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 15.00                 # $15 cap per entry. $1 (live launch) → $3 (2026-04-26)
+MAX_BET_USD = 20.00                 # $20 cap per entry. $1 (live launch) → $3 (2026-04-26)
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
                                     # (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner
-                                    # validated upsizing on confirmed-edge setups). $79 bankroll
-                                    # supports ~5 concurrent $15 bets within correlation envelope.
+                                    # validated upsizing) → $20 (2026-04-28 night, paired with
+                                    # bankroll add to ~$279). Kelly @ 25% on 25% edge × 50c price
+                                    # wants ~$35/bet; $20 cap is intentionally below that to keep
+                                    # individual position risk bounded while bot proves at scale.
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bumps `count` so
@@ -156,9 +158,10 @@ MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: skip if |mu − bracket_mid| 
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
-DAILY_EXPOSURE_CAP_USD = 60.00      # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27,
-                                    # paired with MIN_COST_USD floor — without the bump we'd hit
-                                    # the cap in ~30 entries vs the recent 30–50/day rhythm)
+DAILY_EXPOSURE_CAP_USD = 120.00     # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
+                                    # → $120 (2026-04-28 night, paired with $200 bankroll add to
+                                    # ~$279). 43% of bankroll — caps daily drawdown at less than
+                                    # half the bankroll if the model has a bad day.
 
 # ─── Kelly anchor (V2 port): bankroll, not MAX_BET_USD ──────────────────
 # Pre-fix: bet_usd = kelly * MAX_BET_USD (anchored to the cap, sized as if
