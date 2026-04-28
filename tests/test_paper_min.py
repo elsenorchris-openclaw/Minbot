@@ -1319,6 +1319,23 @@ class TestObsConfirmedAlive(unittest.TestCase):
         opp = {"action": "BUY_YES", "floor": None, "cap": 43.5, "running_min": 43.0}
         self.assertFalse(pb._check_obs_confirmed_alive(opp))
 
+    def test_buy_yes_thigh_never_alive_min_temp(self):
+        """T-high (floor=56.5, cap=None): rm=60.08 above floor+1.0 even
+        post-sunrise should NOT confirm alive on a min-temp market.
+        rm is monotonically decreasing — evening cooling can drop temp below
+        the threshold before LST midnight. Reconstructs the KOKC-26APR28-T56
+        phantom (rm=60.08 at 16:04Z bypassed all gates; NBP next-day forecast
+        45°F)."""
+        opp = {"action": "BUY_YES", "floor": 56.5, "cap": None,
+               "running_min": 60.08, "tz": "America/Chicago"}
+        self.assertFalse(pb._check_obs_confirmed_alive(opp))
+
+    def test_buy_yes_thigh_never_alive_even_far_above(self):
+        """T-high with rm 10°F above floor and post-sunrise: still no bypass."""
+        opp = {"action": "BUY_YES", "floor": 50.0, "cap": None,
+               "running_min": 60.0, "tz": "America/New_York"}
+        self.assertFalse(pb._check_obs_confirmed_alive(opp))
+
     def test_no_rm_returns_false(self):
         """No rm → no obs evidence → not alive."""
         opp = {"action": "BUY_NO", "floor": 44.0, "cap": 45.0, "running_min": None}
@@ -1359,6 +1376,29 @@ class TestObsConfirmedAlive(unittest.TestCase):
         }
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1, "obs_alive should lower edge floor to 0.05")
+
+    def test_okc_t56_replay_blocked_post_fix(self):
+        """KOKC-26APR28-T56 reconstruction: rm=60.08, floor=56.5, BUY_YES,
+        edge=12.4% (below MIN_EDGE=20%). Pre-fix: obs_alive bypassed gates and
+        Kelly-boosted to 23×$0.16. Post-fix: T-high BUY_YES never triggers
+        obs_alive on min markets → edge_floor stays at MIN_EDGE → blocked."""
+        opp = {
+            "market_ticker": "KXLOWTOKC-26APR28-T56",
+            "event_ticker": "KXLOWTOKC-26APR28",
+            "action": "BUY_YES", "model_prob": 0.284, "edge": 0.124,
+            "entry_price": 0.16, "yes_bid": 14, "yes_ask": 16,
+            "no_bid": 84, "no_ask": 86, "mu": 54.9, "sigma": 3.0,
+            "mu_source": "hrrr", "running_min": 60.08,
+            "post_sunrise_lock": False, "disagreement": 2.0,
+            "floor": 56.5, "cap": None,
+            "station": "KOKC", "date_str": "2026-04-28", "label": "Oklahoma City",
+            "series": "KXLOWTOKC", "tz": "America/Chicago",
+            "is_today": True,
+        }
+        pb.execute_opportunity(opp)
+        self.assertEqual(self._captured, [],
+                         "post-fix: T-high BUY_YES below MIN_EDGE should be "
+                         "blocked (no obs_alive bypass on min-temp T-high)")
 
 
 class TestObsConfirmedLoser(unittest.TestCase):
@@ -1677,6 +1717,39 @@ class TestPositionExitLogic(unittest.TestCase):
                                           "yes_bid": 99, "no_bid": 1}}
         n = pb.check_open_positions_for_exit(markets)
         self.assertEqual(n, 0, "obs winner should override hard stop")
+
+    def test_buy_yes_thigh_no_winner_override_min_temp(self):
+        """T-high BUY_YES with rm above floor: hold-side override REMOVED
+        2026-04-28. rm is monotonically decreasing on min markets — current
+        rm above floor doesn't survive overnight cooling. Hard stop should
+        run normally instead of holding."""
+        pos = self._make_pos("KXLOWTOKC-26APR28-T56", "BUY_YES", 0.50, 5,
+                             floor=56.5, cap=None,
+                             running_min=60.08,
+                             tz="America/Chicago")
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        # MTM loss 80% on a tail (>70% threshold for tails)
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 10, "no_bid": 90}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 1,
+                         "T-high BUY_YES post-fix should NOT get the hold-side "
+                         "override; hard_stop should fire on tail-loss ≥ 70%")
+
+    def test_buy_yes_tlow_winner_override_still_works(self):
+        """Regression: T-low BUY_YES winner case still overrides hard-stop.
+        rm monotonically decreases — once below cap, position is locked."""
+        pos = self._make_pos("KXLOWTBOS-26APR28-T40", "BUY_YES", 0.50, 5,
+                             floor=None, cap=39.5,
+                             running_min=38.0,  # ≤ cap − 1 → confirmed YES winner
+                             tz="America/New_York")
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 5, "no_bid": 95}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 0, "T-low BUY_YES winner override unchanged by fix")
 
     def test_settled_positions_skipped(self):
         """settled=True positions are not re-evaluated."""

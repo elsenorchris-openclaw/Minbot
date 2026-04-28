@@ -1392,8 +1392,15 @@ def _check_obs_confirmed_alive(opp_or_pos: dict) -> bool:
         confirmation that low won't drop further into YES territory)
       BUY_YES + T-low (cap=X+0.5, YES if cli ≤ X): rm ≤ cap − 1.0
         → low has hit YES territory with +1°F obs/CLI buffer → YES wins
-      BUY_YES + T-high (floor=X−0.5, YES if cli ≥ X): rm ≥ floor + 1.0 AND post-sunrise
-        → low has bottomed in YES territory → YES wins
+        (rm is monotonically decreasing → once below threshold, stays there)
+      BUY_YES + T-high: NOT bypassed. Removed 2026-04-28 after KOKC-26APR28-T56
+        phantom: rm=60.08 at 16:04Z bypassed all gates, NBP next-day forecast
+        45°F (21°F cold-front cooling forecast before climate-day end). Unlike
+        max-bot's analog, the daily MIN can drop AGAIN later in the climate
+        day (evening radiative cooling, late cold-front passage); post-sunrise
+        does not lock the low. By the time rm IS final (post-LST-midnight)
+        the OBS WINNER LOCK has already pulled the market — no legitimate
+        bypass window for min-temp T-high BUY_YES.
       BUY_YES + B-bracket: defer (would need post-sunrise + rm in bracket;
         rare and complex; not a typical sweet-spot anyway)"""
     rm = opp_or_pos.get("running_min")
@@ -1415,15 +1422,13 @@ def _check_obs_confirmed_alive(opp_or_pos: dict) -> bool:
                 return True
         # T-low: deferred (needs post-sunrise)
     elif action == "BUY_YES":
-        # T-low: low has confirmed dip into YES territory
+        # T-low: rm is monotonically decreasing — once it dips into YES
+        # territory it cannot recover. Safe to bypass.
         if cap is not None and floor is None:
             if rm_f <= float(cap) - 1.0:
                 return True
-        # T-high: low rose to YES territory AND post-sunrise so it won't drop
-        elif floor is not None and cap is None:
-            tz = opp_or_pos.get("tz", "America/New_York")
-            if rm_f >= float(floor) + 1.0 and _is_post_sunrise(tz):
-                return True
+        # T-high: NO BYPASS for min-temp markets — rm can still drop later in
+        # the climate day. See docstring above.
         # B-bracket: deferred (complex; rare)
     return False
 
@@ -2268,15 +2273,16 @@ def _check_position_obs_winning(pos: dict, rm: float) -> bool:
                 return True
         # T-low BUY_NO winner case requires post-sunrise; defer.
     elif action == "BUY_YES":
-        # T-low: rm has dipped to YES threshold
+        # T-low: rm is monotonically decreasing — once it dips below cap it
+        # cannot recover; YES is locked.
         if cap is not None and floor is None:
             if rm <= float(cap) - 1.0:
                 return True
-        # T-high: rm above threshold AND post-sunrise (low won't drop further)
-        elif floor is not None and cap is None:
-            tz = pos.get("tz", "America/New_York")
-            if rm >= float(floor) + 1.0 and _is_post_sunrise(tz):
-                return True
+        # T-high: NO override — symmetric with `_check_obs_confirmed_alive`.
+        # Removed 2026-04-28: rm above floor right now does not survive
+        # overnight cooling within the same climate day. Without the override
+        # the hard-stop will run normally; that's the conservative choice for
+        # a position whose underlying low is not yet locked.
     return False
 
 
