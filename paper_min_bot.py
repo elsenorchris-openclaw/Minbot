@@ -134,11 +134,11 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 10.00                 # $10 cap per entry. $1 (live launch) → $3 (2026-04-26)
-                                    # → $5 (2026-04-27 PM, [$1, $5] envelope) → $10 (2026-04-27
-                                    # evening, after 3-of-3 winning settlements demonstrated the
-                                    # post-V2-port edge — $59 bankroll supports ~6 concurrent $10
-                                    # bets without per-event correlation breaching).
+MAX_BET_USD = 15.00                 # $15 cap per entry. $1 (live launch) → $3 (2026-04-26)
+                                    # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
+                                    # (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner
+                                    # validated upsizing on confirmed-edge setups). $79 bankroll
+                                    # supports ~5 concurrent $15 bets within correlation envelope.
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bumps `count` so
