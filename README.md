@@ -5,9 +5,9 @@ cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
 **Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
 `KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
-Current caps (2026-04-29, after the $200 bankroll add brought balance to
-~$279): **$20 per entry, 3 entries per cycle, daily exposure unlimited
-(bankroll itself is the binding constraint), 20% min edge.** Bumped
+Current caps (2026-04-29 evening): **$30 per entry, 3 entries per cycle,
+daily exposure unlimited (bankroll itself is the binding constraint), 20%
+min edge.** Bumped
 iteratively from launch's `$1 / 3 / $4 / 20%` as the bot's track record
 built. Full evolution in the constants table below.
 
@@ -108,7 +108,7 @@ All in `paper_min_bot.py`:
 
 | Constant | Value | Why |
 |---|---|---|
-| `MAX_BET_USD` | `$20.00` | Kelly-sized but capped per entry. $1 (live launch) → $3 (2026-04-26) → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15 (2026-04-28) → $20 (2026-04-28 night, paired with $200 bankroll add to ~$279). $20 stays below full Kelly intent (~$35 on $279 @ 25%/25%/50c) so individual position risk is bounded while the bot proves at scale. |
+| `MAX_BET_USD` | `$30.00` | Kelly-sized but capped per entry. $1 (live launch) → $3 (2026-04-26) → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15 (2026-04-28) → $20 (2026-04-28 night, paired with $200 bankroll add to ~$279) → **$30 (2026-04-29 evening, per Chris)**. Kelly @ 25% on 25% edge × 50c price wants ~$35/bet on $279 bankroll; $30 cap finally lets full Kelly run on the highest-conviction trades. Per-position blast radius still bounded (~10% of bankroll). |
 | `MIN_COST_USD` | `$1.00` | Cost floor: `count = max(count, ceil(MIN_COST_USD/price))` after Kelly + MIN_BET_USD floor + int rounding. Without this, `int(bet_usd/price)` rounded `count` down such that 96% of fills landed under $1 (avg $0.45 on 2026-04-25/26). The cap clamp at MAX_BET_USD keeps the floor from blowing the ceiling on cheap contracts. Added 2026-04-27. |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
 | `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |

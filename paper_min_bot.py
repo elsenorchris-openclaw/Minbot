@@ -140,13 +140,14 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 20.00                 # $20 cap per entry. $1 (live launch) → $3 (2026-04-26)
+MAX_BET_USD = 30.00                 # $30 cap per entry. $1 (live launch) → $3 (2026-04-26)
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
-                                    # (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner
-                                    # validated upsizing) → $20 (2026-04-28 night, paired with
-                                    # bankroll add to ~$279). Kelly @ 25% on 25% edge × 50c price
-                                    # wants ~$35/bet; $20 cap is intentionally below that to keep
-                                    # individual position risk bounded while bot proves at scale.
+                                    # (2026-04-28) → $20 (2026-04-28 night, paired with bankroll
+                                    # add to ~$279) → $30 (2026-04-29 evening, per Chris). Kelly
+                                    # @ 25% on 25% edge × 50c price wants ~$35/bet on $279
+                                    # bankroll; $30 cap finally lets full Kelly run on the
+                                    # highest-conviction trades while still bounding per-position
+                                    # blast radius.
 KELLY_FRACTION = 0.25
 MIN_BET_USD = 0.50
 MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bumps `count` so

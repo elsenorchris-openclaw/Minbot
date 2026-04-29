@@ -261,7 +261,7 @@ class TestWalletConfig(unittest.TestCase):
     def test_live_config_caps_sanity(self):
         # Per-bet cap stays bounded. Daily cap removed 2026-04-29 evening
         # (sentinel ≥ $1000) — bankroll itself is the binding constraint.
-        self.assertLessEqual(pb.MAX_BET_USD, 30.00)
+        self.assertLessEqual(pb.MAX_BET_USD, 50.00)
         self.assertGreaterEqual(pb.DAILY_EXPOSURE_CAP_USD, 1000.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
@@ -971,8 +971,11 @@ class TestCapBumpsApril26(unittest.TestCase):
     $15/$60 (2026-04-28, after SATX-T75 +$9.10 Kelly-sized winner) →
     $20/$120 (2026-04-28 night, paired with $200 bankroll add)."""
 
-    def test_max_bet_is_20(self):
-        self.assertEqual(pb.MAX_BET_USD, 20.00)
+    def test_max_bet_is_30(self):
+        """Bumped $20 → $30 on 2026-04-29 evening per Chris. Lets Kelly run
+        full size on highest-conviction trades (~$35 ideal at $279 bankroll,
+        25% Kelly, 25% edge, 50c price)."""
+        self.assertEqual(pb.MAX_BET_USD, 30.00)
 
     def test_daily_cap_unlimited(self):
         """Daily cap removed 2026-04-29 evening per Chris. Sentinel value
