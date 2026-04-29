@@ -259,23 +259,80 @@ existing max-tracking:
 V2 is unaffected — still reads `max_f_nws`/`max_f_local` from `/snapshot`,
 ignoring the new min fields.
 
-## Not yet implemented (backlog)
+## Backlog
 
-- **Bracket-math integer-rounding correction (Phase 0a)**: V2's `CDF(cap+0.5)
-  − CDF(floor−0.5)` formula. Min-bot currently uses raw `[floor, cap]`
-  endpoints, under-stating B-bracket probability. Mathematically correct fix
-  but ripples into every gate's mp threshold (calibrated against the buggy
-  formula). Defer until paired with a gate re-calibration backtest.
-- **Per-station σ multiplier expansion**: data exists for OKC (NBP bias
-  −3.5°F like KLAX), DC, DEN, NYC. Only KLAX deployed so far (n=12). Add
-  others as their n grows past the playbook's n≥20 bar.
+### Hold pending validation (post-2026-04-29 deploys)
+
+These are decisions or watch-items that need fresh data from today's deploys
+to settle. Re-run `tools/gate_audit.py` and `tools/source_audit.py` after
+the Apr 28 + Apr 29 climate days settle (≈ 48-72h from 2026-04-29 06:00Z),
+then revisit each.
+
+- **Validate LAX BUY_NO T-high block** (commit `d39f23b`). Was deployed at
+  n=3 wr=0% — below the n≥20 playbook bar but justified by the
+  CLI-median + bias mechanism. After 48-72h, count `LAX_NO_THIGH` firings
+  in `blocked_by`. If the gate is firing and the candidates it blocks would
+  have been losers (resolve via `tools/gate_audit.py --gate LAX_NO_THIGH`),
+  keep. If it's blocking winners, revert.
+- **Validate CHI + OKC HRRR-primary on d-1+** (commit `b751940`). CHI
+  deployed at n=18 (under n≥20 bar) on a 5× MAE gap; OKC at n=24. Re-run
+  `tools/source_audit.py --series KXLOWTCHI` and `--series KXLOWTOKC` once
+  fresh d-1+ candidates have settled. If MAE gap holds, consider
+  expanding to NYC (HRRR 2.63°F vs NBP 3.33°F, n=18) and PHIL (HRRR 1.30°F
+  vs NBP 5.00°F, n=6 currently — wait for n≥20).
+- **Validate PRICE_ZONE removal** (commit `9dff496`). Removed at n=2 wr=0%.
+  Watch for new entries with `yes_bid ∈ [30, 40]c` BUY_NO and check their
+  outcomes. If the removal continues to recover winners, the call was right.
+  If new BUY_NO at 65-67¢ in this band start losing, the V2 finding may
+  apply on min after all.
+- **MAX_DISAGREEMENT BUY_YES gate**: 1/1 historical winner blocked
+  (KATL-T60 BUY_YES, +$0.63/c). Sample tiny but pattern is interesting —
+  the gate fires on BUY_NO d-1+ via H_2.0 already; for BUY_YES it's only
+  the broader 5°F MAX_DISAGREEMENT. Could be worth a `_nbp_consistent_with_recent_cli`-
+  style bypass for BUY_YES specifically. Wait for n≥3 more BUY_YES
+  candidates blocked by MAX_DISAGREEMENT before deciding.
+- **F2A BUY_NO blocked-winner watch**: 1/1 historical winner
+  (KMIN-26APR27-B46.5, +$0.33/c). Tiny sample. F2A is a V2 port; behavior
+  on min-temp B-brackets may differ. Watch the count of F2A blocks via
+  `tools/gate_audit.py --gate F2A`.
+- **LAX threshold T-high BUY_YES audit**: bot has a real weakness at LAX
+  53/54/55 boundary cluster — at-threshold trades with σ=1.4 produce
+  overconfident BUY_YES that loses on rounding (LAX-T53 currently losing,
+  LAX-T54 toss-up). The σ×1.5 mult deployed today partially addresses this,
+  but a tighter rule (e.g., block BUY_YES T-high at LAX when |μ − floor|
+  < σ × some factor) may be needed. Audit after ≥5 more LAX BUY_YES
+  T-high settles.
+- **Bracket-math integer-rounding correction (Phase 0a)**: V2's
+  `CDF(cap+0.5) − CDF(floor−0.5)` formula. Min-bot currently uses raw
+  `[floor, cap]` endpoints, under-stating B-bracket probability.
+  Mathematically correct fix but ripples into every gate's mp threshold
+  (which were calibrated against the buggy formula). Defer until paired
+  with a re-calibration backtest of all the mp-threshold gates.
+
+### Not yet implemented (features)
+
+- **Per-station σ multiplier expansion**: source-MAE data hints at
+  candidates beyond KLAX (OKC has same −3.5°F NBP cool-bias pattern; DC,
+  DEN, NYC each have distinct +2 to +3°F warm bias). Each only has n=12-24
+  trades right now. Defer per-city σ-mults until the playbook's n≥20 +
+  consistent bias signal is established.
 - **NWS gridpoint forecast integration**: V2's primary source. Researched
-  2026-04-29; held due to source-MAE backtest showing blending hurts on
-  min markets (NBP+HRRR mean MAE 2.18°F worse than NBP alone 2.11°F).
-  Worth revisiting only if a single-source NWS test (vs the current NBP /
-  HRRR per-city split) shows a clean MAE win at the worst-MAE stations
-  (LAX, MIN, DEN, PHIL).
-- HRRR overnight nowcast blending (HRRR 0-18h min trajectory)
-- `seed_running_min_from_observations()` wired into obs-pipeline startup
-- client_order_id-based idempotency on retry
-- Web dashboard (calibration curve, P&L by city, rolling Brier score)
+  2026-04-29; held because the source-MAE backtest showed blending hurts
+  on min markets (NBP+HRRR mean MAE 2.18°F vs NBP alone 2.11°F; triple-mean
+  2.41°F). Worth revisiting only if a single-source NWS test (NWS alone vs
+  the current NBP / HRRR per-city split) shows a clean MAE win at the
+  worst-MAE stations (LAX, MIN, DEN, PHIL).
+- **HRRR overnight nowcast blending** (HRRR 0-18h min trajectory). Could
+  pull HRRR's hourly forecast and find the min over the next 18h instead
+  of just the daily-min field. Useful for d-0 evening entries when the
+  morning pre-dawn low hasn't happened yet.
+- **`seed_running_min_from_observations()`** wired into obs-pipeline
+  startup. Currently rm only accumulates from new obs after bot restart;
+  if it crashes mid-climate-day we lose the day's running min until the
+  next obs comes in.
+- **client_order_id-based idempotency on retry**. Lower priority — Kalshi's
+  `order_id` already provides this; but client_order_id would let the bot
+  recover from a half-acknowledged POST without a duplicate fill.
+- **Web dashboard** (calibration curve, P&L by city, rolling Brier score).
+  V2 has one at `~/.openclaw/workspace-main/sniper-us-poll/weather_dashboard.py`;
+  porting the pattern to min would help with at-a-glance monitoring.
