@@ -90,6 +90,9 @@ CITIES: dict[str, dict[str, Any]] = {
     "KXLOWTSFO":  {"station": "KSFO", "lat": 37.6196, "lon": -122.3656,"tz": "America/Los_Angeles", "label": "San Francisco"},
 }
 
+# Station → IANA tz lookup (used by _cli_is_final to compute climate-day end).
+_STATION_TZ: dict[str, str] = {info["station"]: info["tz"] for info in CITIES.values()}
+
 # NBM Probabilistic product station IDs (same as v1/v2 use for max).
 # These are the 3-letter NBP identifiers; mapping from series ticker.
 # Source: NBM bulletin headers (NBPCWL, NBPWD, etc.)
@@ -767,6 +770,50 @@ def get_cli_low(station: str, climate_date: str) -> Optional[int]:
     except sqlite3.Error as e:
         log(f"  cli_low read error: {e}", "warn")
         return None
+
+
+# Buffer (hours) after climate-day end before we trust an obs-pipeline CLI as
+# final. NWS issues a "morning-after" CLI ~07:00 LST that summarizes the full
+# midnight-to-midnight climate day; intermediate (noon, 4 PM, 5 PM, 10 PM)
+# reports cover the day SO FAR and can be wildly off for min-temp markets when
+# late-evening cooling drives a new daily min. 6 h covers the ~7 AM LST window.
+CLI_FINAL_BUFFER_H = 6
+
+
+def _cli_is_final(station: str, climate_date: str, tz_str: Optional[str]) -> bool:
+    """Return True only if the latest CLI for (station, climate_date) was issued
+    AFTER climate_date_end_LST + CLI_FINAL_BUFFER_H. That guarantees the report
+    is the morning-after summary, not a partial intra-day reading.
+
+    Why (2026-04-29 phantom-settlement bug):
+      Bot fired SETTLED WIN +$5.22 on KXLOWTSATX-26APR29-T73 from a 4 PM CDT
+      partial CLI showing low=77 ("VALID AS OF 0400 PM LOCAL TIME"). The
+      climate day ran until midnight CDT; market priced 89% NO; final CLI
+      issued the next morning will reflect overnight cooling. Trusting partials
+      caused the phantom WIN.
+    """
+    if not tz_str:
+        return False
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT issued_time FROM cli_reports WHERE station=? AND climate_date=? "
+            "AND low_f IS NOT NULL ORDER BY issued_time DESC LIMIT 1",
+            (station, climate_date),
+        ).fetchone()
+        conn.close()
+        if not row:
+            return False
+        issued_epoch = int(row[0])
+        tz = ZoneInfo(tz_str)
+        # climate_date end = next-day 00:00 LST
+        cd = datetime.strptime(climate_date, "%Y-%m-%d").replace(tzinfo=tz)
+        cd_end_utc = (cd + timedelta(days=1)).astimezone(timezone.utc)
+        threshold_epoch = int(cd_end_utc.timestamp()) + CLI_FINAL_BUFFER_H * 3600
+        return issued_epoch >= threshold_epoch
+    except (sqlite3.Error, ValueError, KeyError) as e:
+        log(f"  _cli_is_final read error: {e}", "warn")
+        return False
 
 
 # ─── Recent-CLI history (used by MAX_EDGE NBP-consistency bypass) ─────────
@@ -2889,11 +2936,22 @@ def check_settlements() -> int:
         if not station or not date_str:
             continue
         cli_low = get_cli_low(station, date_str)
+        # 2026-04-29 phantom-settlement fix: only treat the CLI as final when
+        # issued AFTER climate_date_end_LST + CLI_FINAL_BUFFER_H. Otherwise it's
+        # a partial intra-day reading (4 PM "VALID AS OF 0400 PM LOCAL TIME")
+        # and the climate-day low can still drop overnight before midnight.
+        # Falls through to the Kalshi /portfolio/settlements path which is
+        # authoritative once the market actually finalizes.
+        if cli_low is not None:
+            tz_str = _STATION_TZ.get(station)
+            if not _cli_is_final(station, date_str, tz_str):
+                cli_low = None
         kalshi_settlement: Optional[dict] = None
         if cli_low is None:
             # Fallback: ask Kalshi if it already settled this market
-            # (obs-pipeline missed the CLI bulletin). Only fires when the
-            # climate day is past — fresh markets still wait for CLI.
+            # (obs-pipeline missed the CLI bulletin OR the CLI we have is still
+            # partial). Only fires when the climate day is past — fresh markets
+            # still wait for the morning-after CLI.
             if date_str < today:
                 kalshi_settlement = _settle_from_kalshi(pos)
             if kalshi_settlement is None:

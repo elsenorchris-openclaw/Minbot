@@ -11,6 +11,7 @@ tested via live runs.
 """
 from __future__ import annotations
 
+import datetime as dt
 import json
 import os
 import sys
@@ -440,15 +441,19 @@ class TestSettleKeepsDedupe(unittest.TestCase):
             "running_min": 51.0, "label": "NYC",
         }
 
-        # Stub get_cli_low + dirs/files so check_settlements has somewhere to write
+        # Stub get_cli_low + _cli_is_final + files so check_settlements writes.
+        # _cli_is_final stub mimics a morning-after CLI publication.
         original_get_cli = pb.get_cli_low
+        original_is_final = pb._cli_is_final
         original_settlements_file = pb.SETTLEMENTS_FILE
         try:
             pb.get_cli_low = lambda station, date_str: 51 if (station, date_str) == ("KNYC", "2026-04-24") else None
+            pb._cli_is_final = lambda station, date_str, tz_str: True
             pb.SETTLEMENTS_FILE = Path(_TMPDIR) / "test_settlements.jsonl"
             n = pb.check_settlements()
         finally:
             pb.get_cli_low = original_get_cli
+            pb._cli_is_final = original_is_final
             pb.SETTLEMENTS_FILE = original_settlements_file
 
         self.assertEqual(n, 1)
@@ -2008,6 +2013,7 @@ class TestKalshiSettlementFallback(unittest.TestCase):
         pb._kalshi_settlements_cache_ts = 0.0
         # Patch I/O
         self._orig_get_cli = pb.get_cli_low
+        self._orig_is_final = pb._cli_is_final
         self._orig_kalshi_get = pb.kalshi_get
         self._orig_append = pb._append_jsonl
         self._orig_save = pb._save_positions
@@ -2019,9 +2025,14 @@ class TestKalshiSettlementFallback(unittest.TestCase):
         pb._save_positions = lambda: None
         pb.notify_discord_settlement = lambda *a, **kw: None
         pb.log = lambda msg, level="info": None
+        # Default: pretend any CLI we stub is final (morning-after publication).
+        # Individual tests can override this when they want to test the
+        # partial-CLI gating behavior.
+        pb._cli_is_final = lambda st, ds, tz: True
 
     def tearDown(self):
         pb.get_cli_low = self._orig_get_cli
+        pb._cli_is_final = self._orig_is_final
         pb.kalshi_get = self._orig_kalshi_get
         pb._append_jsonl = self._orig_append
         pb._save_positions = self._orig_save
@@ -2120,9 +2131,10 @@ class TestKalshiSettlementFallback(unittest.TestCase):
         self.assertEqual(n, 0)
 
     def test_obs_pipeline_cli_takes_precedence(self):
-        """If obs-pipeline has the CLI we use it (even if Kalshi also has
+        """If obs-pipeline has a FINAL CLI we use it (even if Kalshi also has
         a settlement). source field is `obs_pipeline`, not `kalshi`."""
         pb.get_cli_low = lambda st, ds: 42  # CLI present
+        pb._cli_is_final = lambda st, ds, tz: True  # morning-after CLI
         self._patch_kalshi([{"ticker": "KXLOWTBOS-26APR27-T40", "market_result": "yes", "revenue": 100}])
         ds = self._yesterday()
         pos = {"market_ticker": "KXLOWTBOS-26APR27-T40", "kind": "entry",
@@ -2138,6 +2150,27 @@ class TestKalshiSettlementFallback(unittest.TestCase):
         self.assertEqual(s["cli_low"], 42)
         # CLI=42, floor=40.5 → cli >= floor → in_bracket=True → BUY_YES wins
         self.assertTrue(s["won"])
+
+    def test_partial_cli_does_not_settle_falls_through_to_kalshi(self):
+        """2026-04-29 phantom-settle fix: partial CLI (pre-climate-day-end + 6h)
+        must NOT trigger obs_pipeline settlement. Bot should fall through to the
+        Kalshi /portfolio/settlements path. Without this fix the bot logged a
+        +$5.22 phantom WIN on KXLOWTSATX-26APR29-T73 from a 4 PM CDT partial
+        CLI showing low=77; market priced 89% NO."""
+        pb.get_cli_low = lambda st, ds: 77  # partial CLI present
+        pb._cli_is_final = lambda st, ds, tz: False  # but not yet final
+        # Kalshi has nothing → settlement not yet available
+        self._patch_kalshi([])
+        ds = self._yesterday()
+        pos = {"market_ticker": "KXLOWTSATX-26APR29-T73", "kind": "entry",
+               "action": "BUY_YES", "entry_price": 0.13, "count": 6,
+               "station": "KSAT", "date_str": ds, "label": "San Antonio",
+               "floor": 73.5, "cap": None}
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        n = pb.check_settlements()
+        self.assertEqual(n, 0, "partial CLI must NOT settle")
+        self.assertFalse(pos.get("settled"), "position must remain open")
 
     def test_kalshi_cache_not_refetched_within_ttl(self):
         """Cache TTL is 5min; a second check_settlements call within that
@@ -2608,6 +2641,82 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
                        "KXLOWTBOS", "KXLOWTAUS"):
             self.assertNotIn(series, pb.PER_SERIES_D1_PRIMARY,
                              f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
+
+
+class TestCliIsFinal(unittest.TestCase):
+    """2026-04-29 phantom-settlement fix: only treat CLI as final after
+    climate_date_end_LST + 6h. Prevents settling on intra-day partial CLI
+    reports (4 PM "VALID AS OF 0400 PM LOCAL TIME") that miss late-evening
+    cooling-driven new daily mins."""
+
+    def setUp(self):
+        # Build a fresh DB with cli_reports schema for this test
+        import tempfile, sqlite3
+        self._tmp = tempfile.NamedTemporaryFile(suffix=".sqlite", delete=False)
+        self._tmp.close()
+        self._db_path = self._tmp.name
+        conn = sqlite3.connect(self._db_path)
+        conn.execute("""
+            CREATE TABLE cli_reports (
+                station TEXT NOT NULL, climate_date TEXT NOT NULL,
+                high_f INTEGER NOT NULL, low_f INTEGER,
+                issued_time INTEGER NOT NULL, received_time INTEGER NOT NULL,
+                product_id TEXT, raw_text TEXT,
+                PRIMARY KEY (station, climate_date, issued_time)
+            )
+        """)
+        conn.commit(); conn.close()
+        self._orig_db = pb.OBS_DB_PATH
+        pb.OBS_DB_PATH = self._db_path
+
+    def tearDown(self):
+        import os
+        pb.OBS_DB_PATH = self._orig_db
+        os.unlink(self._db_path)
+
+    def _insert(self, station, climate_date, low_f, issued_time):
+        import sqlite3
+        conn = sqlite3.connect(self._db_path)
+        conn.execute(
+            "INSERT INTO cli_reports (station, climate_date, high_f, low_f, "
+            "issued_time, received_time, product_id) VALUES (?,?,?,?,?,?,?)",
+            (station, climate_date, 99, low_f, int(issued_time), int(issued_time),
+             f"test-{climate_date}-{int(issued_time)}"),
+        )
+        conn.commit(); conn.close()
+
+    def test_partial_4pm_cli_is_not_final(self):
+        # SATX 04-29: 4 PM CDT partial = 21:40 UTC.
+        # climate_date_end_LST = 2026-04-30 00:00 CDT = 2026-04-30 05:00 UTC
+        # threshold = 05:00 + 6h = 11:00 UTC 04-30
+        # 21:40 UTC 04-29 < 11:00 UTC 04-30 → NOT final
+        partial_4pm_utc = int(dt.datetime(2026,4,29,21,40, tzinfo=dt.timezone.utc).timestamp())
+        self._insert("KSAT", "2026-04-29", 77, partial_4pm_utc)
+        self.assertFalse(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
+
+    def test_morning_after_cli_is_final(self):
+        # SATX morning-after CLI: 07:00 UTC 04-30 (= 02:00 AM CDT)
+        # threshold = 11:00 UTC 04-30 — 07:00 still < 11:00, NOT final
+        # Use 12:00 UTC 04-30 (= 07:00 CDT) which IS past threshold
+        morning_after_utc = int(dt.datetime(2026,4,30,12,0, tzinfo=dt.timezone.utc).timestamp())
+        self._insert("KSAT", "2026-04-29", 65, morning_after_utc)
+        self.assertTrue(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
+
+    def test_no_cli_returns_not_final(self):
+        # No row inserted → _cli_is_final returns False
+        self.assertFalse(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
+
+    def test_no_tz_returns_not_final(self):
+        partial_utc = int(dt.datetime(2026,4,29,21,40, tzinfo=dt.timezone.utc).timestamp())
+        self._insert("KSAT", "2026-04-29", 77, partial_utc)
+        self.assertFalse(pb._cli_is_final("KSAT", "2026-04-29", None))
+
+    def test_station_tz_lookup_covers_all_cities(self):
+        # _STATION_TZ derived from CITIES — every station should be present.
+        for series, info in pb.CITIES.items():
+            self.assertIn(info["station"], pb._STATION_TZ,
+                          f"{info['station']} missing from _STATION_TZ")
+            self.assertEqual(pb._STATION_TZ[info["station"]], info["tz"])
 
 
 if __name__ == "__main__":

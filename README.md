@@ -39,12 +39,20 @@ built. Full evolution in the constants table below.
   day. Keep full σ all day; the running_min+1°F truncation is the safety
   net (low can only go down).
 - **Settlement**: reads CLI daily low from obs-pipeline's `cli_reports.low_f`
-  field (same source V1/V2 use for CLI high). **Kalshi fallback** when
-  obs-pipeline missed a CLI bulletin: if `get_cli_low` returns None for a
-  position whose `date_str < today`, query `/portfolio/settlements` and use
-  Kalshi's `market_result` to settle locally. Recovers stuck positions caused
-  by NWS bulletin ingestion gaps (settlement record gets `source: "kalshi"`
-  and `cli_low: null` so calibration analysis can filter).
+  field (same source V1/V2 use for CLI high). **`_cli_is_final` gate** — only
+  treat the most recent CLI as authoritative when its `issued_time` is at
+  least `CLI_FINAL_BUFFER_H = 6 h` past climate-day-end LST. Below that
+  threshold the CLI is treated as a partial intra-day reading (4 PM
+  "VALID AS OF 0400 PM LOCAL TIME") and we wait. Added 2026-04-29 after a
+  phantom-settle bug: bot logged `KXLOWTSATX-26APR29-T73 WIN +$5.22` from a
+  4 PM CDT partial CLI showing low=77; market priced 89% NO because evening
+  cooling drove the actual climate-day low into the 60s. **Kalshi fallback**
+  when obs-pipeline missed a CLI bulletin OR the CLI is still partial: if
+  `cli_low is None` (or gated to None) for a position whose `date_str <
+  today`, query `/portfolio/settlements` and use Kalshi's `market_result` to
+  settle locally. Recovers stuck positions caused by NWS bulletin ingestion
+  gaps (settlement record gets `source: "kalshi"` and `cli_low: null` so
+  calibration analysis can filter).
 - **Logging**: skip-log lines for the same `(market_ticker, msg)` pair are
   debounced — first occurrence logs, repeats are suppressed for 30 min, then
   re-logged once for visibility. Pre-fix the log was 83% repeated skip lines
