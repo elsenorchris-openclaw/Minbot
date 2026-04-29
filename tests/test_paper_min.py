@@ -2568,10 +2568,19 @@ class TestLaxFixes(unittest.TestCase):
                          "non-LAX BUY_NO T-high should still pass")
 
     def test_per_series_sigma_mult_constant(self):
-        """LAX has a 1.5× σ multiplier constant baked in."""
-        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTLAX"), 1.5)
-        # Other cities are unmodified
-        self.assertNotIn("KXLOWTSATX", pb.PER_SERIES_SIGMA_MULT)
+        """4 stations with HRRR MAE > 4°F per 2026-04-29 source_audit
+        (n=12-24 each) have σ multipliers calibrated to the empirical
+        MAE × √(π/2) gap."""
+        # LAX bumped 1.5 → 2.5 on 2026-04-29 evening (HRRR MAE 5.9°F)
+        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTLAX"), 2.5)
+        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTPHX"), 2.0)
+        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTDEN"), 1.5)
+        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTLV"),  1.5)
+        # Cities with narrower MAE are not in the dict (default 1.0×)
+        for series in ("KXLOWTSATX", "KXLOWTHOU", "KXLOWTAUS",
+                       "KXLOWTMIA", "KXLOWTCHI"):
+            self.assertNotIn(series, pb.PER_SERIES_SIGMA_MULT,
+                             f"{series} should not need σ-mult (HRRR/NBP MAE narrow)")
 
     def test_block_list_contains_klax(self):
         self.assertIn("KXLOWTLAX", pb.BUY_NO_T_HIGH_BLOCK_SERIES)

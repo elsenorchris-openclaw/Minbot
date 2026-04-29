@@ -162,12 +162,28 @@ MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: skip if |mu − bracket_mid| 
                                     # bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu *inside*
                                     # bracket, the only real loser) is still caught at 0.5°F.
 
-# ─── Per-station calibration tweaks (2026-04-29 LAX deep-dive) ────────────
-# σ multiplier applied to the bot's NBP-derived sigma in find_opportunities.
-# KLAX: NBP σ=1.0–1.5 was empirically too tight — actual |cli − μ| spread
-# 3-5°F over 14 days. Inflate so bot's confidence reflects the data.
+# ─── Per-station σ multiplier (2026-04-29) ────────────────────────────────
+# σ multiplier applied to the bot's pre-mult σ in find_opportunities.
+# Targets stations where the chosen μ source's empirical MAE (per
+# source_audit) is materially wider than the σ the bot has been using.
+# Multiplier ≈ (empirical σ) / (typical bot σ at that station).
+#   - empirical σ ≈ MAE × √(π/2) ≈ 1.25 × MAE (Gaussian)
+# Listed cities all have HRRR MAE > 4°F per source_audit n=336 audit:
+#   KLAX  HRRR 5.90°F (n=12)  → bot σ ~2.4 → 2.5× → ~6.0°F (still tight, but
+#                                              empirical 7.4°F so close)
+#   KPHX  HRRR 5.67°F (n=24)  → bot σ ~3.7 → 2.0× → ~7.4°F (matches empirical)
+#   KDEN  HRRR 4.47°F (n=18)  → bot σ ~3.0 → 1.5× → ~4.5°F (matches empirical)
+#   KLAS  HRRR 4.48°F (n=24)  → bot σ ~2.5 → 1.5× → ~3.8°F (slightly tight)
+# Multiplier applies to all μ sources at that station, but at PHX/LAS where
+# NBP's MAE is narrow (1.75°F), the inflated σ is conservatively wider on
+# those NBP entries — slightly under-confident but won't cause losses.
+# Borderline cities (ATL/NYC/DC/BOS, HRRR MAE 2.6-4.4°F) deferred until
+# the full empirical-σ-table backtest is built (see backlog).
 PER_SERIES_SIGMA_MULT: dict[str, float] = {
-    "KXLOWTLAX": 1.5,
+    "KXLOWTLAX": 2.5,  # was 1.5 (2026-04-29 evening); HRRR MAE 5.9°F
+    "KXLOWTPHX": 2.0,  # 2026-04-29 evening; HRRR MAE 5.67°F (n=24)
+    "KXLOWTDEN": 1.5,  # 2026-04-29 evening; HRRR MAE 4.47°F (n=18)
+    "KXLOWTLV":  1.5,  # 2026-04-29 evening; HRRR MAE 4.48°F (n=24)
 }
 # BUY_NO T-high block list. KLAX hit n=3 wr=0% on this pattern (2026-04-25
 # / 04-26 / 04-27 entries, all BUY_NO at thresholds 53–57 with NBP μ 53–56,
