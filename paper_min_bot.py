@@ -2143,6 +2143,107 @@ def _save_positions() -> None:
     _atomic_write_json(POSITIONS_FILE, snap)
 
 
+def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
+    """Replay all entry gates in `execute_opportunity` order against `opp` and
+    return `(blocked_by, reason)` for the FIRST gate that blocks. Returns
+    `(None, "obs_alive_bypass")` when `_obs_confirmed_alive` triggers and
+    bypasses forecast gates, or `(None, None)` when all gates pass and the
+    bot would enter (modulo per-ticker dedupe + budget caps which are stateful
+    and not modeled here).
+
+    Used by `record_candidate` to write a `blocked_by` field per candidate so
+    later analysis can answer "which gate is blocking winners?" — V2-style
+    shadow logging. Pure function: no side effects, no Kalshi calls."""
+    action = opp.get("action")
+    entry_price = opp.get("entry_price")
+    edge = float(opp.get("edge") or 0)
+    mp_v = opp.get("model_prob")
+
+    # No-action / no-edge candidates are not "blocked" — they're just below
+    # the bot's interest threshold (find_opportunities found no positive edge
+    # on either side). Tag separately so analysis can split them out.
+    if action is None or entry_price is None:
+        return ("NO_ACTION", "no positive edge on either side")
+    mp = float(mp_v or 0)
+
+    # Edge floor — depends on obs_alive bypass.
+    obs_alive = _check_obs_confirmed_alive(opp)
+    edge_floor = OBS_ALIVE_MIN_EDGE if obs_alive else MIN_EDGE
+    if edge < edge_floor:
+        return ("MIN_EDGE", f"{edge:.2%} < {edge_floor:.0%}")
+
+    # obs_alive bypasses everything else (matches execute_opportunity).
+    if obs_alive:
+        return (None, "obs_alive_bypass")
+
+    if _check_obs_confirmed_loser(opp):
+        return ("OBS_CONFIRMED_LOSER",
+                f"rm={opp.get('running_min')} in YES territory")
+    if edge > MAX_EDGE:
+        return ("MAX_EDGE", f"{edge:.2%} > {MAX_EDGE:.0%}")
+    if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
+        if not _nbp_consistent_with_recent_cli(opp):
+            return ("MP_RANGE",
+                    f"mp {mp:.0%} outside [{MIN_MODEL_PROB:.0%}, {MAX_MODEL_PROB:.0%}]")
+    if action == "BUY_NO" and mp > 0.40:
+        return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > 40%")
+    if action == "BUY_YES" and mp < 0.60:
+        return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < 60%")
+    if action == "BUY_NO":
+        fl = opp.get("floor"); cp = opp.get("cap")
+        if fl is not None and cp is not None:
+            bracket_mid = (float(fl) + float(cp)) / 2.0
+        elif fl is not None:
+            bracket_mid = float(fl)
+        elif cp is not None:
+            bracket_mid = float(cp)
+        else:
+            bracket_mid = None
+        if bracket_mid is not None:
+            mu_val = float(opp.get("mu", 0.0))
+            abs_dist = abs(mu_val - bracket_mid)
+            if abs_dist < MIN_ABS_DISTANCE_F:
+                return ("ABS_DIST",
+                        f"|μ-mid|={abs_dist:.1f}°F < {MIN_ABS_DISTANCE_F:.1f}°F")
+    f2a = _check_f2a_gate(opp)
+    if f2a:
+        return ("F2A", f2a)
+    msg_block = _check_msg_gate(opp)
+    if msg_block:
+        return ("MSG", msg_block)
+    if action == "BUY_NO":
+        yb = opp.get("yes_bid")
+        if yb is not None and PRICE_ZONE_LO_C <= int(yb) <= PRICE_ZONE_HI_C:
+            return ("PRICE_ZONE", f"yes_bid {int(yb)}c in [30, 40]")
+    if action == "BUY_NO" and not opp.get("is_today", False):
+        disag = float(opp.get("disagreement") or 0)
+        if disag > H_2_0_DISAGREE_F:
+            return ("H_2_0", f"disagreement {disag:.1f}°F > {H_2_0_DISAGREE_F}°F")
+    disag = float(opp.get("disagreement") or 0)
+    if disag > MAX_DISAGREEMENT_F:
+        return ("MAX_DISAGREEMENT", f"{disag:.1f}°F > {MAX_DISAGREEMENT_F}°F")
+    rm = opp.get("running_min")
+    if rm is not None and not opp.get("post_sunrise_lock"):
+        mu_check = float(opp.get("mu") or 0)
+        if abs(mu_check - float(rm)) > MAX_MU_VS_RM_DIFF_F:
+            return ("MU_VS_RM",
+                    f"|μ-rm|={abs(mu_check-float(rm)):.1f}°F > {MAX_MU_VS_RM_DIFF_F}°F")
+    side = "yes" if action == "BUY_YES" else "no"
+    if side == "yes":
+        ya, yb = opp.get("yes_ask"), opp.get("yes_bid")
+        spread = (ya - yb) if (ya is not None and yb is not None) else 0
+    else:
+        na, nb = opp.get("no_ask"), opp.get("no_bid")
+        spread = (na - nb) if (na is not None and nb is not None) else 0
+    if spread > MAX_SPREAD_CENTS:
+        return ("SPREAD", f"{spread}c > {MAX_SPREAD_CENTS}c")
+
+    # All gates pass. (Bot may still skip due to per-ticker dedupe in
+    # _open_positions or per-cycle/daily/event budget — those are stateful
+    # and not modeled here.)
+    return (None, None)
+
+
 def record_candidate(opp: dict) -> None:
     """Record a candidate opportunity for calibration analysis. Every
     generated opp goes here — not just taken ones — so we can back-test
@@ -2150,7 +2251,12 @@ def record_candidate(opp: dict) -> None:
 
     2026-04-25 fix: opp has its own `kind` field (bracket/tail_low/tail_high)
     which was silently overwriting our `kind: candidate` discriminator via
-    dict-spread. Rename to bracket_kind so the candidate/entry filter works."""
+    dict-spread. Rename to bracket_kind so the candidate/entry filter works.
+
+    2026-04-29: also writes `blocked_by` + `block_reason` fields via
+    `_evaluate_gates` so downstream analysis can identify which gate is
+    blocking winners (V2-style shadow logging). `blocked_by=None` means the
+    candidate would have been entered (subject to dedupe + budget caps)."""
     fields = ("event_ticker", "market_ticker", "station", "series", "date_str",
               "label", "floor", "cap",
               "yes_bid", "yes_ask", "no_bid", "no_ask",
@@ -2160,10 +2266,13 @@ def record_candidate(opp: dict) -> None:
               "post_sunrise_lock", "is_today", "model_prob",
               "yes_ask_frac", "no_ask_frac",
               "action", "edge", "entry_price")
+    blocked_by, block_reason = _evaluate_gates(opp)
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "candidate",
         "bracket_kind": opp.get("kind"),
+        "blocked_by": blocked_by,
+        "block_reason": block_reason,
         **{k: opp.get(k) for k in fields},
     }
     _append_jsonl(TRADES_FILE, record)

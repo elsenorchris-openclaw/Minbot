@@ -2316,5 +2316,186 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
                          "MAX_EDGE must block even when NBP consistent — backtest evidence")
 
 
+class TestEvaluateGates(unittest.TestCase):
+    """`_evaluate_gates(opp)` replays every entry gate and returns the first
+    blocker name. Used by `record_candidate` to write `blocked_by` per
+    candidate for V2-style shadow analysis."""
+
+    def setUp(self):
+        self._orig_recent = pb.get_recent_cli_range
+        pb.get_recent_cli_range = lambda *a, **kw: None  # default: no bypass
+
+    def tearDown(self):
+        pb.get_recent_cli_range = self._orig_recent
+
+    def _opp(self, **overrides):
+        # A clean BUY_NO B-bracket that passes everything.
+        base = {
+            "market_ticker": "KXLOWTBOS-26APR28-B45.5",
+            "event_ticker": "KXLOWTBOS-26APR28",
+            "action": "BUY_NO", "model_prob": 0.20, "edge": 0.30,
+            "entry_price": 0.50, "yes_bid": 18, "yes_ask": 22,
+            "no_bid": 48, "no_ask": 52, "mu": 41.0, "sigma": 2.5,
+            "mu_source": "nbp",
+            "mu_nbp": 41.0, "mu_hrrr": 41.0, "mu_nbm_om": 41.0,
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 0.5,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KBOS", "date_str": "2026-04-28",
+            "series": "KXLOWTBOS",
+        }
+        base.update(overrides)
+        return base
+
+    def test_clean_pass(self):
+        gate, _ = pb._evaluate_gates(self._opp())
+        self.assertIsNone(gate)
+
+    def test_no_action(self):
+        gate, _ = pb._evaluate_gates(self._opp(action=None, entry_price=None))
+        self.assertEqual(gate, "NO_ACTION")
+
+    def test_min_edge(self):
+        gate, _ = pb._evaluate_gates(self._opp(edge=0.10))
+        self.assertEqual(gate, "MIN_EDGE")
+
+    def test_max_edge(self):
+        gate, _ = pb._evaluate_gates(self._opp(edge=0.50))
+        self.assertEqual(gate, "MAX_EDGE")
+
+    def test_mp_range_low(self):
+        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.05))
+        self.assertEqual(gate, "MP_RANGE")
+
+    def test_mp_range_high(self):
+        # BUY_YES with mp=0.95
+        gate, _ = pb._evaluate_gates(self._opp(action="BUY_YES",
+                                               model_prob=0.95, edge=0.40,
+                                               entry_price=0.50, yes_ask=50))
+        self.assertEqual(gate, "MP_RANGE")
+
+    def test_mp_range_bypassed_when_consistent(self):
+        """mp out of range but NBP consistent → bypass mp gate, fall through."""
+        pb.get_recent_cli_range = lambda *a, **kw: (40.0, 42.0)
+        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.05))
+        # Falls through to next gate. With mp=0.05, BUY_NO directional check
+        # (mp > 0.40) doesn't fire. Should pass.
+        self.assertIsNone(gate)
+
+    def test_directional_buy_no(self):
+        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.45))
+        self.assertEqual(gate, "DIRECTIONAL_BUY_NO")
+
+    def test_directional_buy_yes(self):
+        gate, _ = pb._evaluate_gates(self._opp(action="BUY_YES",
+                                               model_prob=0.55, edge=0.30,
+                                               entry_price=0.25, yes_ask=25))
+        self.assertEqual(gate, "DIRECTIONAL_BUY_YES")
+
+    def test_abs_dist(self):
+        # BUY_NO with mu at bracket midpoint
+        gate, _ = pb._evaluate_gates(self._opp(mu=45.5, floor=45.0, cap=46.0))
+        self.assertEqual(gate, "ABS_DIST")
+
+    def test_f2a_low_mp(self):
+        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.03))
+        # mp=0.03 < MIN_MODEL_PROB=0.15, so MP_RANGE fires before F2A
+        self.assertEqual(gate, "MP_RANGE")
+
+    def test_msg_worst_city(self):
+        # NYC is in MSG_WORST_CITIES (max_consensus = 0). Use μ outside the
+        # bracket (so ABS_DIST doesn't fire first) but with one source's μ
+        # inside the bracket (triggering MSG).
+        opp = self._opp(market_ticker="KXLOWTNYC-26APR28-B45.5",
+                        series="KXLOWTNYC", station="KNYC",
+                        mu=42.0, mu_nbp=42.0, mu_hrrr=45.5, mu_nbm_om=42.0,
+                        floor=45.0, cap=46.0, model_prob=0.20)
+        # μ=42 → ABS_DIST passes. mp=0.20 → F2A passes (0.05 ≤ mp < 0.30,
+        # sigma=2.5 ≥ 1.5). mu_hrrr=45.5 in bracket → 1 source YES →
+        # exceeds WORST tier max=0 → MSG blocks.
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertEqual(gate, "MSG")
+
+    def test_h_2_0_d_minus_1_disagreement(self):
+        gate, _ = pb._evaluate_gates(self._opp(is_today=False, disagreement=2.5))
+        self.assertEqual(gate, "H_2_0")
+
+    def test_max_disagreement(self):
+        # is_today=True so H_2.0 doesn't fire; MAX_DISAGREEMENT 5°F threshold
+        gate, _ = pb._evaluate_gates(self._opp(is_today=True, disagreement=6.0))
+        self.assertEqual(gate, "MAX_DISAGREEMENT")
+
+    def test_mu_vs_rm(self):
+        gate, _ = pb._evaluate_gates(self._opp(mu=41.0, running_min=50.0))
+        self.assertEqual(gate, "MU_VS_RM")
+
+    def test_spread(self):
+        # 12c spread on no side > MAX_SPREAD_CENTS=10
+        gate, _ = pb._evaluate_gates(self._opp(no_bid=40, no_ask=52))
+        self.assertEqual(gate, "SPREAD")
+
+    def test_obs_alive_bypass(self):
+        # B-bracket [45, 46], rm=40 (< floor − 3) → obs_alive
+        gate, reason = pb._evaluate_gates(self._opp(running_min=40.0))
+        self.assertIsNone(gate)
+        self.assertEqual(reason, "obs_alive_bypass")
+
+    def test_obs_loser(self):
+        # B-bracket [45, 46], rm=45.5 (in bracket) → BUY_NO loser
+        gate, _ = pb._evaluate_gates(self._opp(running_min=45.5))
+        self.assertEqual(gate, "OBS_CONFIRMED_LOSER")
+
+
+class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
+    """`record_candidate` enriches every record with `blocked_by` so downstream
+    analysis can see which gate would have blocked or `null` for would-enter."""
+
+    def setUp(self):
+        self._captured: list[dict] = []
+        self._orig_append = pb._append_jsonl
+        pb._append_jsonl = lambda path, rec: self._captured.append(rec)
+        self._orig_recent = pb.get_recent_cli_range
+        pb.get_recent_cli_range = lambda *a, **kw: None
+
+    def tearDown(self):
+        pb._append_jsonl = self._orig_append
+        pb.get_recent_cli_range = self._orig_recent
+
+    def test_records_blocked_by(self):
+        opp = {
+            "market_ticker": "KXLOWTNYC-26APR28-B45.5", "kind": "bracket",
+            "action": "BUY_NO", "edge": 0.50, "model_prob": 0.20,
+            "entry_price": 0.50, "yes_bid": 48, "yes_ask": 50,
+            "no_bid": 48, "no_ask": 50, "mu": 41.0, "sigma": 2.5,
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 0.5,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KNYC", "date_str": "2026-04-28",
+            "series": "KXLOWTNYC",
+        }
+        pb.record_candidate(opp)
+        self.assertEqual(len(self._captured), 1)
+        r = self._captured[0]
+        self.assertEqual(r["blocked_by"], "MAX_EDGE")
+        self.assertIsNotNone(r.get("block_reason"))
+
+    def test_records_null_blocked_by_when_passing(self):
+        opp = {
+            "market_ticker": "KXLOWTNYC-26APR28-B45.5", "kind": "bracket",
+            "action": "BUY_NO", "edge": 0.30, "model_prob": 0.20,
+            "entry_price": 0.50, "yes_bid": 18, "yes_ask": 22,
+            "no_bid": 48, "no_ask": 52, "mu": 41.0, "sigma": 2.5,
+            "mu_nbp": 41.0, "mu_hrrr": 41.0, "mu_nbm_om": 41.0,
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 0.5,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KBOS", "date_str": "2026-04-28",
+            "series": "KXLOWTBOS",
+        }
+        pb.record_candidate(opp)
+        r = self._captured[0]
+        self.assertIsNone(r["blocked_by"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -140,7 +140,15 @@ Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
 ## Data dir
 
 `/home/ubuntu/paper_min_bot/data/`:
-- `trades.jsonl` — every candidate + entry (full context for calibration)
+- `trades.jsonl` — every candidate + entry (full context for calibration).
+  Candidate records carry `blocked_by` + `block_reason` (V2-style shadow
+  logging, added 2026-04-29) — `null` means the candidate would have been
+  entered, otherwise the gate name (`MIN_EDGE`, `MAX_EDGE`, `MP_RANGE`,
+  `DIRECTIONAL_BUY_NO`, `DIRECTIONAL_BUY_YES`, `ABS_DIST`, `F2A`, `MSG`,
+  `PRICE_ZONE`, `H_2_0`, `MAX_DISAGREEMENT`, `MU_VS_RM`, `SPREAD`,
+  `OBS_CONFIRMED_LOSER`, `NO_ACTION`). The shadow field is populated by
+  `_evaluate_gates(opp)` at candidate-record time so downstream analysis
+  can ask "which gate is blocking winners?" without re-deriving gate logic.
 - `positions.json` — currently open positions
 - `settlements.jsonl` — settled outcomes + P&L
 - `nbp_cache.json` — persisted NBP forecasts across restarts
