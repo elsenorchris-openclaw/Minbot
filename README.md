@@ -140,18 +140,40 @@ Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
 ## Data dir
 
 `/home/ubuntu/paper_min_bot/data/`:
-- `trades.jsonl` — every candidate + entry (full context for calibration).
-  Candidate records carry `blocked_by` + `block_reason` (V2-style shadow
-  logging, added 2026-04-29) — `null` means the candidate would have been
-  entered, otherwise the gate name (`MIN_EDGE`, `MAX_EDGE`, `MP_RANGE`,
-  `DIRECTIONAL_BUY_NO`, `DIRECTIONAL_BUY_YES`, `ABS_DIST`, `F2A`, `MSG`,
-  `H_2_0`, `MAX_DISAGREEMENT`, `MU_VS_RM`, `SPREAD`,
-  `OBS_CONFIRMED_LOSER`, `NO_ACTION`). The shadow field is populated by
-  `_evaluate_gates(opp)` at candidate-record time so downstream analysis
-  can ask "which gate is blocking winners?" without re-deriving gate logic.
+- `trades_YYYY-MM-DD.jsonl` — every candidate + entry + exit, **date-rotated
+  per UTC date** (added 2026-04-29 — V2 follows the same convention).
+  Candidate records carry `blocked_by` + `block_reason` shadow fields:
+  `null` means the candidate would have been entered, otherwise the gate
+  name (`MIN_EDGE`, `MAX_EDGE`, `MP_RANGE`, `DIRECTIONAL_BUY_NO`,
+  `DIRECTIONAL_BUY_YES`, `ABS_DIST`, `F2A`, `MSG`, `H_2_0`,
+  `MAX_DISAGREEMENT`, `MU_VS_RM`, `SPREAD`, `OBS_CONFIRMED_LOSER`,
+  `NO_ACTION`). Populated by `_evaluate_gates(opp)` at candidate-record
+  time. Old `trades.jsonl` is kept as the historical archive for
+  pre-rotation entries; runtime readers (`_compute_today_exposure`,
+  `_reconcile_from_trades_log`) check both files for today's entries.
 - `positions.json` — currently open positions
-- `settlements.jsonl` — settled outcomes + P&L
+- `settlements.jsonl` — settled outcomes + P&L (NOT date-rotated; small
+  enough to stay flat)
 - `nbp_cache.json` — persisted NBP forecasts across restarts
+
+## Tools
+
+`/home/ubuntu/paper_min_bot/tools/`:
+- `gate_audit.py` — back-test current gate stack against historical
+  candidates. Reads the `blocked_by` field directly when present, falls
+  back to recomputing via `paper_min_bot._evaluate_gates(opp)` for
+  pre-shadow-logging records. Resolves outcomes via local `settlements.jsonl`,
+  Kalshi `/portfolio/settlements`, and (with `--include-active`) Kalshi
+  `/markets/{ticker}` endpoint. Argparse: `--gate <NAME>`, `--action`,
+  `--days N`, `--include-active`, `--list-gates`.
+
+`/home/ubuntu/paper_min_bot/MIN_BOT_BACKTEST_PLAYBOOK.md` — read this
+**before proposing any filter / threshold change**. Codifies the 5-point
+validation bar (n ≥ 20, lift ≥ +$30, robust lift ≥ +$15 LOO-1,
+helps:hurts ≥ 4:2, articulable mechanism), audit workflow, and common
+mistakes. V2 has a sister playbook at `~/obs-pipeline-bot/BACKTEST_PLAYBOOK.md`
+with different thresholds (max-temp markets have different volume / variance
+characteristics).
 
 ## Running
 

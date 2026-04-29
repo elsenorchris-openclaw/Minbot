@@ -252,7 +252,9 @@ except OSError:
     pass
 
 POSITIONS_FILE = DATA_DIR / "positions.json"
-TRADES_FILE = DATA_DIR / "trades.jsonl"            # every candidate + decision
+# Legacy single-file path (writes pre-2026-04-29). Kept for historical reads
+# only — new writes route through `_trades_file_today()` which date-rotates.
+TRADES_FILE = DATA_DIR / "trades.jsonl"
 SETTLEMENTS_FILE = DATA_DIR / "settlements.jsonl"
 STATS_FILE = DATA_DIR / "stats.json"
 NBP_CACHE_FILE = DATA_DIR / "nbp_cache.json"
@@ -322,6 +324,17 @@ def _atomic_write_json(path: Path, data: Any) -> None:
     with open(tmp, "w") as f:
         json.dump(data, f, default=str)
     os.replace(tmp, path)
+
+
+# Date-rotated trades log. Writes go to `data/trades_YYYY-MM-DD.jsonl` per
+# UTC date (matches V2's `weather_candidates_YYYY-MM-DD.jsonl` convention).
+# Pre-rotation history lives in the legacy `trades.jsonl` file. Readers that
+# only care about today's entries (_compute_today_exposure,
+# _reconcile_from_trades_log) read today's file directly — fast even on a
+# 1GB+ historical archive — while the gate-audit / backtest tooling globs
+# every dated file plus the legacy file when it needs full history.
+def _trades_file_today() -> Path:
+    return DATA_DIR / f"trades_{datetime.now(timezone.utc).strftime('%Y-%m-%d')}.jsonl"
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1905,41 +1918,47 @@ def _set_insufficient_balance_cooldown() -> None:
 
 
 def _compute_today_exposure() -> float:
-    """Sum of cost field over all 'entry' records in TRADES_FILE whose UTC
-    date matches today. Survives bot restarts: the daily cap is enforced
-    against actual on-disk spend, not just in-process state. Without this,
-    every restart resets _today_exposure_usd to $0 and the bot can spend
-    the full DAILY_EXPOSURE_CAP_USD again."""
+    """Sum of cost field over all 'entry' records for today's UTC date.
+    Survives bot restarts: the daily cap is enforced against actual on-disk
+    spend, not just in-process state. Without this, every restart resets
+    _today_exposure_usd to $0 and the bot can spend the full
+    DAILY_EXPOSURE_CAP_USD again.
+
+    Reads today's date-rotated file (`trades_YYYY-MM-DD.jsonl`) plus the
+    legacy single-file `trades.jsonl` for backward-compat with entries
+    written before rotation was deployed."""
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     total = 0.0
-    if not TRADES_FILE.exists():
-        return total
-    try:
-        with open(TRADES_FILE) as f:
-            for line in f:
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                if rec.get("kind") != "entry":
-                    continue
-                if not rec.get("ts", "").startswith(today):
-                    continue
-                # Skip legacy PAPER-mode records (no real money). Live records
-                # written post-rename have no `mode` field; pre-rename live
-                # records have mode="LIVE".
-                if rec.get("mode") == "PAPER":
-                    continue
-                # 2026-04-25: only count entries on markets whose date_str is
-                # today UTC or later. Excludes the V2-wallet 04:09–04:26 cascade
-                # ($21 on Apr 24 markets) and any other prior-day backstop
-                # entries. Approximates wallet-scoping: V2 cascade hit Apr 24
-                # markets while V1's actual trades today are on Apr 25.
-                if rec.get("date_str", "") < today:
-                    continue
-                total += float(rec.get("cost", 0.0))
-    except Exception as e:
-        log(f"  today-exposure compute failed: {e}", "warn")
+    paths = [_trades_file_today(), TRADES_FILE]
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        rec = json.loads(line)
+                    except Exception:
+                        continue
+                    if rec.get("kind") != "entry":
+                        continue
+                    if not rec.get("ts", "").startswith(today):
+                        continue
+                    # Skip legacy PAPER-mode records (no real money). Live records
+                    # written post-rename have no `mode` field; pre-rename live
+                    # records have mode="LIVE".
+                    if rec.get("mode") == "PAPER":
+                        continue
+                    # 2026-04-25: only count entries on markets whose date_str is
+                    # today UTC or later. Excludes the V2-wallet 04:09–04:26 cascade
+                    # ($21 on Apr 24 markets) and any other prior-day backstop
+                    # entries. Approximates wallet-scoping: V2 cascade hit Apr 24
+                    # markets while V1's actual trades today are on Apr 25.
+                    if rec.get("date_str", "") < today:
+                        continue
+                    total += float(rec.get("cost", 0.0))
+        except Exception as e:
+            log(f"  today-exposure compute failed for {path}: {e}", "warn")
     return total
 
 
@@ -2049,16 +2068,21 @@ def _reconcile_from_trades_log() -> int:
     or rapid restart where positions.json was clobbered before Kalshi had
     propagated our recent fills.
 
-    Reads today's `kind=entry` records from TRADES_FILE and adds any whose
-    market_ticker is missing from `_open_positions` *and* not already in
-    SETTLEMENTS_FILE. Worst-case false-positive (manually-closed-then-not-
-    re-entered) is benign — it just blocks a redundant entry until next
-    cycle's reconcile catches up. The bug it prevents (CHI T48 double-entry
-    2026-04-25) is much worse: real money on correlated dupes.
+    Reads today's `kind=entry` records and adds any whose market_ticker is
+    missing from `_open_positions` *and* not already in SETTLEMENTS_FILE.
+    Worst-case false-positive (manually-closed-then-not-re-entered) is
+    benign — it just blocks a redundant entry until next cycle's reconcile
+    catches up. The bug it prevents (CHI T48 double-entry 2026-04-25) is
+    much worse: real money on correlated dupes.
+
+    Reads today's date-rotated file plus the legacy single-file trades.jsonl
+    (so a deploy-day restart picks up entries written before rotation took
+    over).
     """
-    if not TRADES_FILE.exists():
-        return 0
     today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    paths = [_trades_file_today(), TRADES_FILE]
+    if not any(p.exists() for p in paths):
+        return 0
 
     settled_tk: set[str] = set()
     if SETTLEMENTS_FILE.exists():
@@ -2076,27 +2100,30 @@ def _reconcile_from_trades_log() -> int:
             log(f"  trade-log reconcile: settlements read failed: {e}", "warn")
 
     entries: dict[str, dict] = {}
-    try:
-        with open(TRADES_FILE) as f:
-            for line in f:
-                try:
-                    t = json.loads(line)
-                except Exception:
-                    continue
-                if t.get("kind") != "entry":
-                    continue
-                if t.get("mode") == "PAPER":
-                    continue
-                ts = t.get("ts", "")
-                if not ts.startswith(today):
-                    continue
-                tk = t.get("market_ticker")
-                if not tk or tk in settled_tk:
-                    continue
-                entries[tk] = t
-    except Exception as e:
-        log(f"  trade-log reconcile read failed: {e}", "warn")
-        return 0
+    for path in paths:
+        if not path.exists():
+            continue
+        try:
+            with open(path) as f:
+                for line in f:
+                    try:
+                        t = json.loads(line)
+                    except Exception:
+                        continue
+                    if t.get("kind") != "entry":
+                        continue
+                    if t.get("mode") == "PAPER":
+                        continue
+                    ts = t.get("ts", "")
+                    if not ts.startswith(today):
+                        continue
+                    tk = t.get("market_ticker")
+                    if not tk or tk in settled_tk:
+                        continue
+                    entries[tk] = t
+        except Exception as e:
+            log(f"  trade-log reconcile read failed for {path}: {e}", "warn")
+            # Don't return — try the other path
 
     added = 0
     with _positions_lock:
@@ -2274,7 +2301,7 @@ def record_candidate(opp: dict) -> None:
         "block_reason": block_reason,
         **{k: opp.get(k) for k in fields},
     }
-    _append_jsonl(TRADES_FILE, record)
+    _append_jsonl(_trades_file_today(), record)
 
 
 def execute_opportunity(opp: dict) -> bool:
@@ -2458,7 +2485,7 @@ def execute_opportunity(opp: dict) -> bool:
         "floor": opp.get("floor"), "cap": opp.get("cap"),
         "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
     }
-    _append_jsonl(TRADES_FILE, record)
+    _append_jsonl(_trades_file_today(), record)
     with _positions_lock:
         _open_positions[ticker] = record
     _save_positions()
@@ -2556,7 +2583,7 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
         "date_str": pos.get("date_str"),
         "label": pos.get("label"),
     }
-    _append_jsonl(TRADES_FILE, record)
+    _append_jsonl(_trades_file_today(), record)
     with _positions_lock:
         existing = _open_positions.get(ticker)
         if existing is not None:
