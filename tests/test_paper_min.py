@@ -2476,5 +2476,106 @@ class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
         self.assertIsNone(r["blocked_by"])
 
 
+class TestLaxFixes(unittest.TestCase):
+    """LAX-specific fixes 2026-04-29:
+       1) BUY_NO T-high blocked on KLAX (n=3 wr=0% — NBP cool-bias structural)
+       2) σ × 1.5 inflation on KLAX (NBP σ too tight vs |cli-μ| empirical 3-5°F)"""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        pb._cached_bankroll = 25.0
+        pb._bankroll_cache_ts = 9999999999
+        with pb._skip_log_lock:
+            pb._skip_log_state.clear()
+        self._captured: list = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._captured.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+        pb._cached_bankroll = 0.0
+
+    def _lax_t_high_buy_no(self, **overrides):
+        """Reconstruct LAX-26APR27-T54 BUY_NO loser: μ=53.1 σ=2.0 (post σ-mult
+        applied here directly), entry 56c, edge 20%, mp 24%."""
+        base = {
+            "market_ticker": "KXLOWTLAX-26APR27-T54",
+            "event_ticker": "KXLOWTLAX-26APR27",
+            "action": "BUY_NO", "model_prob": 0.24, "edge": 0.20,
+            "entry_price": 0.56, "yes_bid": 42, "yes_ask": 44,
+            "no_bid": 54, "no_ask": 56, "mu": 53.1, "sigma": 2.0,
+            "mu_source": "nbp", "running_min": None,
+            "post_sunrise_lock": False, "disagreement": 1.0,
+            "floor": 54.5, "cap": None,
+            "station": "KLAX", "date_str": "2026-04-27", "label": "LA",
+            "series": "KXLOWTLAX", "is_today": False,
+        }
+        base.update(overrides)
+        return base
+
+    def test_lax_buy_no_thigh_blocked_in_evaluate_gates(self):
+        gate, reason = pb._evaluate_gates(self._lax_t_high_buy_no())
+        self.assertEqual(gate, "LAX_NO_THIGH")
+        self.assertIn("KXLOWTLAX", reason or "")
+
+    def test_lax_buy_no_thigh_blocked_in_execute(self):
+        pb.execute_opportunity(self._lax_t_high_buy_no())
+        self.assertEqual(self._captured, [],
+                         "LAX BUY_NO T-high must not place an order post-fix")
+
+    def test_lax_buy_no_b_bracket_still_passes(self):
+        """LAX BUY_NO B-bracket worked historically (n=5 wr=60%) — must stay
+        unblocked. Use μ outside bracket so ABS_DIST passes."""
+        opp = self._lax_t_high_buy_no(
+            floor=56.0, cap=57.0,         # B-bracket
+            mu=52.0, sigma=2.5,
+            entry_price=0.55, edge=0.30, model_prob=0.15,
+            yes_bid=14, yes_ask=18, no_bid=53, no_ask=55,
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1,
+                         "LAX BUY_NO B-bracket should still pass (working pattern)")
+
+    def test_lax_buy_yes_thigh_still_passes(self):
+        """LAX BUY_YES T-high is a different action; must not be caught by
+        the BUY_NO block."""
+        opp = self._lax_t_high_buy_no(
+            action="BUY_YES", model_prob=0.65, edge=0.25,
+            entry_price=0.40, yes_bid=38, yes_ask=42,
+            no_bid=58, no_ask=62, mu=55.0,
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1,
+                         "LAX BUY_YES T-high should pass (block is BUY_NO-only)")
+
+    def test_non_lax_buy_no_thigh_still_passes(self):
+        """The block is LAX-only; SATX BUY_NO T-high still allowed."""
+        opp = self._lax_t_high_buy_no(
+            market_ticker="KXLOWTSATX-26APR27-T74",
+            event_ticker="KXLOWTSATX-26APR27",
+            station="KSAT", series="KXLOWTSATX",
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1,
+                         "non-LAX BUY_NO T-high should still pass")
+
+    def test_per_series_sigma_mult_constant(self):
+        """LAX has a 1.5× σ multiplier constant baked in."""
+        self.assertEqual(pb.PER_SERIES_SIGMA_MULT.get("KXLOWTLAX"), 1.5)
+        # Other cities are unmodified
+        self.assertNotIn("KXLOWTSATX", pb.PER_SERIES_SIGMA_MULT)
+
+    def test_block_list_contains_klax(self):
+        self.assertIn("KXLOWTLAX", pb.BUY_NO_T_HIGH_BLOCK_SERIES)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

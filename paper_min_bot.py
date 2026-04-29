@@ -162,6 +162,21 @@ MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: skip if |mu − bracket_mid| 
                                     # bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu *inside*
                                     # bracket, the only real loser) is still caught at 0.5°F.
 
+# ─── Per-station calibration tweaks (2026-04-29 LAX deep-dive) ────────────
+# σ multiplier applied to the bot's NBP-derived sigma in find_opportunities.
+# KLAX: NBP σ=1.0–1.5 was empirically too tight — actual |cli − μ| spread
+# 3-5°F over 14 days. Inflate so bot's confidence reflects the data.
+PER_SERIES_SIGMA_MULT: dict[str, float] = {
+    "KXLOWTLAX": 1.5,
+}
+# BUY_NO T-high block list. KLAX hit n=3 wr=0% on this pattern (2026-04-25
+# / 04-26 / 04-27 entries, all BUY_NO at thresholds 53–57 with NBP μ 53–56,
+# all lost when actual cli came in 58–60). Mechanism: NBP runs 2.5–4°F cool
+# on KLAX in this regime, so betting "low won't reach X" is structurally
+# the wrong direction at any threshold inside KLAX's 54-60°F observed range.
+# B-bracket BUY_NO at LAX is unaffected (n=5 wr=60% there) — only T-high.
+BUY_NO_T_HIGH_BLOCK_SERIES: set[str] = {"KXLOWTLAX"}
+
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 120.00     # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
@@ -1754,6 +1769,11 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             # Linear inflation: 1x at 2°F disagreement, 1.5x at 5°F+
             inflation = min(1.5, 1.0 + (disagreement - 2.0) * 0.15)
             sigma = sigma * inflation
+        # Per-station σ inflation (2026-04-29). Counters NBP forecasts that
+        # are systematically too narrow at specific stations.
+        per_series_mult = PER_SERIES_SIGMA_MULT.get(m["series"], 1.0)
+        if per_series_mult != 1.0:
+            sigma = sigma * per_series_mult
         # Running min (only meaningful for today)
         rm = get_running_min(station, today_cd) if is_today else None
         # Post-sunrise lock
@@ -2219,6 +2239,13 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > 40%")
     if action == "BUY_YES" and mp < 0.60:
         return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < 60%")
+    # Per-station BUY_NO T-high block (2026-04-29 LAX audit, n=3 wr=0%,
+    # NBP cool-bias structural).
+    if (action == "BUY_NO"
+            and opp.get("series") in BUY_NO_T_HIGH_BLOCK_SERIES
+            and opp.get("floor") is not None and opp.get("cap") is None):
+        return ("LAX_NO_THIGH",
+                f"BUY_NO T-high blocked at {opp.get('series')} (NBP cool-bias)")
     if action == "BUY_NO":
         fl = opp.get("floor"); cp = opp.get("cap")
         if fl is not None and cp is not None:
@@ -2382,6 +2409,14 @@ def execute_opportunity(opp: dict) -> bool:
             return False
         if action == "BUY_YES" and mp < 0.60:
             _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
+            return False
+        # Per-station BUY_NO T-high block (2026-04-29 LAX audit).
+        if (action == "BUY_NO"
+                and opp.get("series") in BUY_NO_T_HIGH_BLOCK_SERIES
+                and opp.get("floor") is not None and opp.get("cap") is None):
+            _log_skip(ticker,
+                f"  skip {ticker}: LAX_NO_THIGH — BUY_NO T-high blocked at "
+                f"{opp.get('series')} (NBP cool-bias, n=3 wr=0%)")
             return False
         # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
         if action == "BUY_NO":
