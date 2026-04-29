@@ -111,11 +111,15 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters
 MIN_EDGE = 0.20                     # min edge to take a trade
-MAX_EDGE = 0.42                     # 0.40 → 0.42 (2026-04-27 evening, cautious half-step toward
-                                    # V2's 0.45 retune). Edges above this almost always come from
-                                    # model error (forecast vs market disagree wildly). V2 raised
-                                    # to 0.45 post-NWS-PRIMARY but min_bot lacks the per-min
-                                    # validation data to commit to the full bump.
+MAX_EDGE = 0.55                     # 0.40 → 0.42 (2026-04-27 evening) → 0.55 (2026-04-28 night,
+                                    # paired with NBP-vs-recent-CLI consistency bypass below).
+                                    # Beyond this, high apparent edge is treated as the *default*
+                                    # red flag — but `_nbp_consistent_with_recent_cli` opens a
+                                    # bypass when NBP μ is within ±2°F of the last-7d CLI range
+                                    # at the station, so legit cheap-tail wins (SATX-T73 / AUS-T71
+                                    # 2026-04-29 all priced 2-8c YES vs 80%+ recent-CLI win rate)
+                                    # don't get blocked. Outliers like the 2026-04-26 KMDW NBP=76
+                                    # vs CLI 44-51 case still hit the cap because consistency fails.
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
@@ -692,6 +696,75 @@ def get_cli_low(station: str, climate_date: str) -> Optional[int]:
     except sqlite3.Error as e:
         log(f"  cli_low read error: {e}", "warn")
         return None
+
+
+# ─── Recent-CLI history (used by MAX_EDGE NBP-consistency bypass) ─────────
+RECENT_CLI_DAYS = 7
+RECENT_CLI_MIN_SAMPLES = 3
+NBP_CONSISTENCY_BUFFER_F = 2.0
+
+
+def get_recent_cli_range(station: str, days: int = RECENT_CLI_DAYS,
+                          before_date: Optional[str] = None) -> Optional[tuple[float, float]]:
+    """Return (min_low, max_low) for the station's CLI lows over the last `days`
+    climate days, optionally only looking *before* `before_date` (for back-tests
+    or to avoid leaking the position's own settlement back into the consistency
+    window). Returns None if fewer than `RECENT_CLI_MIN_SAMPLES` distinct
+    climate days are available — conservative: when we lack data, MAX_EDGE
+    still bites."""
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        if before_date is not None:
+            rows = conn.execute(
+                "SELECT climate_date, low_f FROM cli_reports "
+                "WHERE station=? AND low_f IS NOT NULL AND climate_date < ? "
+                "ORDER BY climate_date DESC",
+                (station, before_date),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT climate_date, low_f FROM cli_reports "
+                "WHERE station=? AND low_f IS NOT NULL "
+                "ORDER BY climate_date DESC",
+                (station,),
+            ).fetchall()
+        conn.close()
+    except sqlite3.Error:
+        return None
+    seen: set = set()
+    lows: list[float] = []
+    for cd, low in rows:
+        if cd in seen:
+            continue
+        seen.add(cd)
+        lows.append(float(low))
+        if len(lows) >= days:
+            break
+    if len(lows) < RECENT_CLI_MIN_SAMPLES:
+        return None
+    return (min(lows), max(lows))
+
+
+def _nbp_consistent_with_recent_cli(opp: dict,
+                                     buffer_f: float = NBP_CONSISTENCY_BUFFER_F) -> bool:
+    """True if `opp.mu` lies within (recent_min − buffer, recent_max + buffer)
+    for the station's last-7d CLI lows. Used as a MAX_EDGE bypass: when the
+    forecast aligns with what's actually been happening at the station, an
+    extreme apparent edge is more likely a stale market-maker quote than a
+    model error.
+
+    Excludes the position's own climate_date from the lookback so back-test
+    scenarios don't leak. Returns False on insufficient history (< 3 days),
+    keeping MAX_EDGE active in that case."""
+    mu = opp.get("mu")
+    station = opp.get("station")
+    if mu is None or not station:
+        return False
+    rng = get_recent_cli_range(station, before_date=opp.get("date_str"))
+    if rng is None:
+        return False
+    cli_min, cli_max = rng
+    return (cli_min - buffer_f) <= float(mu) <= (cli_max + buffer_f)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -2145,12 +2218,25 @@ def execute_opportunity(opp: dict) -> bool:
             return False
         # Forecast-based gates — each prevents a class of model error.
         # Order: cheapest-to-evaluate first.
+        #
+        # NBP-vs-recent-CLI consistency bypass (2026-04-28 night) covers BOTH
+        # MAX_EDGE and the mp-range gate. Both gates protect against
+        # "model is too confident" failures; both are wrong when the forecast
+        # is supported by recent reality at the station. Cheap-tail wins like
+        # AUS-T71 (mp~95% / yes_ask 3¢ / 4-of-4 recent CLI ≥ 72°F) need both
+        # bypasses to actually clear; bypassing only one leaves the trade
+        # blocked by the other.
+        nbp_consistent = _nbp_consistent_with_recent_cli(opp)
         if edge > MAX_EDGE:
-            _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
-            return False
+            if not nbp_consistent:
+                _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
+                return False
+            # else: silently bypass; ENTRY log will show the high edge.
         if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-            _log_skip(ticker, f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
-            return False
+            if not nbp_consistent:
+                _log_skip(ticker, f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+                return False
+            # else: bypass — recent CLI supports the extreme prob.
         # Directional consistency: never bet against our own model.
         if action == "BUY_NO" and mp > 0.40:
             _log_skip(ticker, f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
