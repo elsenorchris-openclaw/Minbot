@@ -332,7 +332,7 @@ try:
 except OSError:
     # Non-VPS environments (tests, dev boxes) may not have /home/ubuntu.
     # Tests override DATA_DIR/LOG_DIR before calling anything that writes.
-    pass
+    pass  # noqa: defensive — startup mkdir on dev/test boxes (no /home/ubuntu)
 
 POSITIONS_FILE = DATA_DIR / "positions.json"
 # Legacy single-file path (writes pre-2026-04-29). Kept for historical reads
@@ -372,7 +372,7 @@ def log(msg: str, level: str = "info") -> None:
             with open(today_path, "a") as f:
                 f.write(line + "\n")
         except Exception:
-            pass
+            pass  # noqa: defensive — log file write fails are benign; stdout still has the line
 
 
 # Skip-log debouncing. The skip path inside execute_opportunity logs a line
@@ -467,13 +467,18 @@ def _discord_worker_loop() -> None:
                         discord_send._last_err = time.time()
                         print(f"[discord] send failed: {exc}", flush=True)
                     break
-        except Exception:
-            pass
+        except Exception as _outer_exc:
+            # Unexpected error in the worker outer loop. Don't recurse via
+            # discord_send (we ARE the worker); print to stdout, throttled
+            # via the same `_last_err` tag so a stuck worker doesn't spam.
+            if not hasattr(discord_send, "_last_err") or time.time() - discord_send._last_err > 300:
+                discord_send._last_err = time.time()
+                print(f"[discord] worker outer exception: {type(_outer_exc).__name__}: {_outer_exc}", flush=True)
         finally:
             try:
                 _discord_queue.task_done()
             except Exception:
-                pass
+                pass  # noqa: defensive — task_done() can raise ValueError if queue state is odd; we don't care here
 
 
 def discord_send(msg: str) -> None:
@@ -499,8 +504,12 @@ def _start_discord_worker() -> None:
         m = re.search(r"DISCORD_BOT_TOKEN=(\S+)", env_txt)
         if m:
             DISCORD_TOKEN = m.group(1)
-    except Exception:
-        pass
+    except Exception as _env_exc:
+        # noqa: should_log — env file missing/unreadable. The follow-up
+        # `if not DISCORD_TOKEN` log will fire too, but log the actual
+        # underlying error so missing-file vs permissions vs malformed
+        # are distinguishable in startup logs.
+        log(f"  Discord token load: env read failed: {type(_env_exc).__name__}: {_env_exc}", "warn")
     if not DISCORD_TOKEN:
         log("  Discord disabled — DISCORD_BOT_TOKEN missing from .env", "warn")
         return
@@ -715,7 +724,7 @@ def wait_for_fill(order_id: str, expected_count: int,
                 if f and f.get("total_count", 0) >= expected_count:
                     return ("filled", int(f["total_count"]))
             except Exception:
-                pass
+                pass  # noqa: defensive — WS fill-cache poll is best-effort; REST fallback is authoritative
         time.sleep(0.1)
     # REST fallback (authoritative)
     try:
@@ -1244,8 +1253,16 @@ def get_nbm_om_min(series: str, date_str: str) -> Optional[float]:
         entry = _nbm_om_cache.get(series, {}).get(date_str)
     if not entry:
         return None
-    if time.time() - entry.get("fetched", 0) > NBM_OM_TTL_SEC * 2:
-        return None  # stale
+    age_s = time.time() - entry.get("fetched", 0)
+    if age_s > NBM_OM_TTL_SEC * 2:
+        return None  # stale (blocked)
+    # 2026-04-29: stale-but-served Discord alert. NBM_OM TTL is 1h; the
+    # *2 fallback window means we silently serve up to 2h-old data when
+    # refresh fails. Alert per-series 30-min throttle so a degraded
+    # endpoint surfaces visibly without flooding Discord.
+    if age_s > NBM_OM_TTL_SEC:
+        _stale_cache_alert("NBM-OM", series, age_s, NBM_OM_TTL_SEC,
+                            NBM_OM_TTL_SEC * 2)
     return float(entry["min_f"])
 
 
@@ -1254,9 +1271,67 @@ def get_hrrr_min(series: str, date_str: str) -> Optional[float]:
         entry = _hrrr_cache.get(series, {}).get(date_str)
     if not entry:
         return None
-    if time.time() - entry.get("fetched", 0) > HRRR_TTL_SEC * 3:
+    age_s = time.time() - entry.get("fetched", 0)
+    if age_s > HRRR_TTL_SEC * 3:
         return None
+    # 2026-04-29: HRRR stale-but-served alert. TTL=10min; *3 fallback (30min)
+    # means up to 30min-old HRRR is served when refresh fails. Alert when
+    # we cross the standard TTL.
+    if age_s > HRRR_TTL_SEC:
+        _stale_cache_alert("HRRR", series, age_s, HRRR_TTL_SEC,
+                            HRRR_TTL_SEC * 3)
     return float(entry["min_f"])
+
+
+# ─── Stale-cache fallback alerting ────────────────────────────────────────
+# When a forecast cache TTL has expired but we're still inside the fallback
+# window (data is served, not blocked), fire a Discord alert so a degraded
+# upstream surfaces visibly. Per-(source, series) throttle: 30 min.
+# Pattern matches obs-pipeline iem_currents/nws_obs (commit 2227fd7).
+_stale_alert_last_ts: dict[str, float] = {}
+_STALE_ALERT_THROTTLE_SEC = 1800.0   # 30 min per source/series
+
+
+def _stale_cache_alert(source: str, series: str, age_s: float,
+                       ttl_s: float, fallback_max_s: float) -> None:
+    """Fire a rate-limited Discord alert when we serve stale-cache data."""
+    key = f"stale:{source}:{series}"
+    now = time.time()
+    last = _stale_alert_last_ts.get(key, 0.0)
+    if now - last < _STALE_ALERT_THROTTLE_SEC:
+        return
+    _stale_alert_last_ts[key] = now
+    age_min = age_s / 60.0
+    ttl_min = ttl_s / 60.0
+    fb_min = fallback_max_s / 60.0
+    msg = (
+        f":warning: **STALE CACHE FALLBACK** `{source}` "
+        f"`{series}` — age={age_min:.1f}m "
+        f"(TTL={ttl_min:.0f}m, fallback_max={fb_min:.0f}m). "
+        f"Serving stale data. Throttled 30m per series."
+    )
+    log(f"  [stale-cache] {source} {series} age={age_min:.1f}m (>{ttl_min:.0f}m TTL)", "warn")
+    discord_send(msg)
+
+
+def _nbp_staleness_alert(age_h: float) -> None:
+    """Fire a rate-limited Discord alert when NBP cache age forces sigma
+    inflation (age_h > 1.0). Single global key — NBP cache is one shared
+    cycle, not per-series."""
+    key = "stale:NBP:cache"
+    now = time.time()
+    last = _stale_alert_last_ts.get(key, 0.0)
+    if now - last < _STALE_ALERT_THROTTLE_SEC:
+        return
+    _stale_alert_last_ts[key] = now
+    msg = (
+        f":warning: **STALE CACHE FALLBACK** `NBP` — "
+        f"cache age={age_h:.1f}h "
+        f"(NBP cycle ~6h; sigma inflation active >1h, capped at 7h). "
+        f"Throttled 30m."
+    )
+    log(f"  [stale-cache] NBP cache age={age_h:.1f}h (>1h triggers σ inflation)", "warn")
+    discord_send(msg)
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -1436,7 +1511,7 @@ def _quote_cents(mkt: dict, dollars_field: str, cents_field: str) -> Optional[in
         try:
             return int(round(float(d) * 100))
         except (TypeError, ValueError):
-            pass
+            pass  # noqa: defensive — decimal field unparseable; fall through to cents_field
     c = mkt.get(cents_field)
     if c is not None:
         try:
@@ -1486,7 +1561,7 @@ def _overlay_ws_bbo(markets: list[dict]) -> int:
             s = kalshi_ws.get_stats()
             log(f"  WS BBO: {n} tickers overlaid (sub={s['subscribed']} cached={s['cached']} deltas={s['deltas']})")
         except Exception:
-            pass
+            pass  # noqa: defensive — WS stats poll is for log only; failure means we just skip the log line
     return n
 
 
@@ -1917,6 +1992,10 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
                 if age_h > 1.0:
                     stale_mult = min(1.30, 1.0 + 0.05 * (age_h - 1.0))
                     sigma = sigma * stale_mult
+                    # 2026-04-29: rate-limited Discord alert when NBP staleness
+                    # actually inflates sigma. Throttled 30m globally — NBP
+                    # cycles every 6h, so a single alert per cycle is enough.
+                    _nbp_staleness_alert(age_h)
         # Per-station σ inflation (2026-04-29). Counters NBP forecasts that
         # are systematically too narrow at specific stations.
         per_series_mult = PER_SERIES_SIGMA_MULT.get(m["series"], 1.0)
@@ -2644,15 +2723,19 @@ def execute_opportunity(opp: dict) -> bool:
     if filled <= 0:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
-        except Exception:
-            pass
+        except Exception as _cx:
+            # noqa: should_log — cancel is best-effort; Kalshi auto-GCs stale
+            # orders, but a persistent cancel-failure can leak ghost orders
+            # against bankroll headroom. Log so it's visible.
+            log(f"  cancel failed for {order_id} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  no fill on {ticker} (status={status}); cancelled")
         return False
     if filled < count:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
-        except Exception:
-            pass
+        except Exception as _cx:
+            # noqa: should_log — see above; partial-fill remainder cancel.
+            log(f"  cancel-remainder failed for {order_id} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  partial fill {filled}/{count} on {ticker}; cancelled remainder")
     actual_cost = filled * price
     _budget_record(actual_cost, opp.get("event_ticker", ""))
@@ -2735,15 +2818,18 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
     if filled <= 0:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
-        except Exception:
-            pass
+        except Exception as _cx:
+            # noqa: should_log — exit cancel is best-effort; logging the
+            # underlying failure makes ghost-order leaks investigable.
+            log(f"  exit cancel failed for {oid} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  exit no-fill on {ticker} (status={status}); cancelled")
         return False
     if filled < count:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
-        except Exception:
-            pass
+        except Exception as _cx:
+            # noqa: should_log — exit partial-fill remainder cancel.
+            log(f"  exit cancel-remainder failed for {oid} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  exit partial fill {filled}/{count} on {ticker}; cancelled remainder")
     sell_revenue = filled * (sell_price_c / 100.0)
     cost_basis = filled * float(pos.get("entry_price", 0))
@@ -2841,8 +2927,12 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                         log(f"  HOLD {ticker}: rm={rm} confirms winner; "
                             f"ignoring MTM loss {loss_pct:.0%}")
                     continue
-            except Exception:
-                pass
+            except Exception as _winx:
+                # noqa: should_log — obs-winning override raised; without
+                # logging, we'd silently drop into hard-stop logic and exit
+                # a position the obs may already have confirmed as winner.
+                log(f"  HOLD {ticker}: obs-winning check raised {type(_winx).__name__}: {_winx}; "
+                    f"falling through to MTM stop", "warn")
 
         # Hard stop.
         floor = pos.get("floor")
