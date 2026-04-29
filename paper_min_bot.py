@@ -177,6 +177,23 @@ PER_SERIES_SIGMA_MULT: dict[str, float] = {
 # B-bracket BUY_NO at LAX is unaffected (n=5 wr=60% there) — only T-high.
 BUY_NO_T_HIGH_BLOCK_SERIES: set[str] = {"KXLOWTLAX"}
 
+# Per-city d-1+ primary source override (2026-04-29 source-MAE audit).
+# Default is NBP for d-1+ markets. When a city is mapped to "hrrr" here,
+# HRRR's daily-min forecast is used as μ instead (with NBP σ if available).
+# Evidence: source_audit.py 2026-04-29 across n=336 settled candidates:
+#   CHI:  HRRR MAE 0.43°F vs NBP 2.33°F (5x better; n=18, mechanism: HRRR
+#         3km grid captures Chicago's lake-effect / urban-heat dynamics
+#         better than NBP's stat ensemble)
+#   OKC:  HRRR MAE 2.22°F vs NBP 3.50°F (1.6x better; n=24, NBP runs −3.5°F
+#         cool-biased on KOKC similar to LAX pattern)
+# Other 18 cities have NBP equal-or-better — keep them on NBP.
+# d-0 still uses HRRR universally (HRRR beats NBP overall on d-0 by 1.22°F
+# MAE) so this only affects d-1+ markets at these specific cities.
+PER_SERIES_D1_PRIMARY: dict[str, str] = {
+    "KXLOWTCHI": "hrrr",
+    "KXLOWTOKC": "hrrr",
+}
+
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 120.00     # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
@@ -1739,13 +1756,22 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         mu_source = ""
         # Priority:
         #   - day-0 (today): HRRR first (freshest nowcast for upcoming overnight).
-        #     But HRRR has no sigma, so pair it with NBP's sigma if we have it,
+        #     HRRR has no sigma, so pair it with NBP's sigma if we have it,
         #     otherwise use a conservative default.
-        #   - day-1+ (future): NBP first (has sigma), else NBM-OM.
+        #   - day-1+ (future): NBP by default. Per-city overrides via
+        #     PER_SERIES_D1_PRIMARY (CHI, OKC → HRRR — backed by source-MAE
+        #     audit 2026-04-29, see constant comment).
+        #   - else fall back to NBM-OM.
         if is_today and hrrr is not None:
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr"
+        elif (not is_today
+              and PER_SERIES_D1_PRIMARY.get(m["series"]) == "hrrr"
+              and hrrr is not None):
+            mu = hrrr
+            sigma = nbp["sigma"] if nbp else 2.5
+            mu_source = "hrrr_d1_override"
         elif nbp:
             mu = nbp["mu"]
             sigma = nbp["sigma"]
@@ -1775,7 +1801,10 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         # mu_source == "nbp" (i.e., d-1+ markets where we're using the cached
         # NBP forecast directly). d-0 typically uses HRRR (refreshed hourly)
         # so staleness isn't a concern there.
-        if mu_source == "nbp":
+        # σ from NBP is subject to staleness inflation regardless of whether
+        # μ came from NBP or HRRR (the d-1 hrrr override still uses NBP σ).
+        # Both source paths only fire on d-1+ markets.
+        if mu_source in ("nbp", "hrrr_d1_override"):
             with _nbp_cache_lock:
                 _ts = _nbp_cache_ts
             if _ts > 0:

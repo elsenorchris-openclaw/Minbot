@@ -2577,5 +2577,25 @@ class TestLaxFixes(unittest.TestCase):
         self.assertIn("KXLOWTLAX", pb.BUY_NO_T_HIGH_BLOCK_SERIES)
 
 
+class TestPerCityD1PrimarySource(unittest.TestCase):
+    """Per-city d-1+ primary source override (2026-04-29 source-MAE audit).
+    CHI uses HRRR instead of NBP on d-1+ (HRRR MAE 0.43°F vs NBP 2.33°F, n=18).
+    OKC uses HRRR instead of NBP on d-1+ (HRRR MAE 2.22°F vs NBP 3.50°F, n=24).
+    Other cities default to NBP."""
+
+    def test_chi_uses_hrrr_on_d_minus_1(self):
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTCHI"), "hrrr")
+
+    def test_okc_uses_hrrr_on_d_minus_1(self):
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTOKC"), "hrrr")
+
+    def test_other_cities_default_to_nbp(self):
+        # Most cities are NOT in the override dict — they fall through to NBP.
+        for series in ("KXLOWTNYC", "KXLOWTLAX", "KXLOWTSATX", "KXLOWTHOU",
+                       "KXLOWTBOS", "KXLOWTAUS"):
+            self.assertNotIn(series, pb.PER_SERIES_D1_PRIMARY,
+                             f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
