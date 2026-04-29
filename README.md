@@ -5,8 +5,10 @@ cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
 **Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
 `KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
-Conservative caps: $1 per entry, 3 entries per cycle, $4 daily exposure,
-20% min edge.
+Current caps (2026-04-29, after the $200 bankroll add brought balance to
+~$279): **$20 per entry, 3 entries per cycle, $120 daily exposure, 20% min
+edge.** Bumped iteratively from launch's `$1 / 3 / $4 / 20%` as the bot's
+track record built. Full evolution in the constants table below.
 
 > File / dir / service names still carry the `paper-min-bot` prefix from the
 > initial paper-trading scaffold. Keeping them avoids touching the systemd
@@ -18,11 +20,22 @@ Conservative caps: $1 per entry, 3 entries per cycle, $4 daily exposure,
   DB for real-time overnight-low tracking (added 2026-04-24 alongside existing
   `running_max`).
 - **Forecasts**: NBP (NBM Probabilistic text bulletins on AWS S3, `TNNMN`/`TNNSD`
-  for min-temp mu + sigma). Fallback to NBM via Open-Meteo daily
-  `temperature_2m_min`. HRRR via paid Open-Meteo on day-0.
+  for min-temp μ + σ) is the default mu source for d-1+. NBM via Open-Meteo
+  daily `temperature_2m_min` is the fallback. HRRR via paid Open-Meteo is
+  the d-0 primary source for all cities, AND the d-1+ primary for CHI / OKC
+  via `PER_SERIES_D1_PRIMARY` (source-MAE audit 2026-04-29: HRRR beat NBP
+  5× / 1.6× respectively at those stations).
 - **Model**: truncated Gaussian bounded above by `running_min + 1.0°F` (the
   +1°F is the ASOS-vs-CLI buffer; CLI rounds to integer and our 5-min obs
-  may be 0.5°F off). Post-sunrise, sigma collapses to 1.0°F residual noise.
+  may be 0.5°F off). σ inflation pipeline (in order, all multiplicative):
+  disagreement-based (1×→1.5× as NBP/HRRR/NBM diverge 2°F→5°F) → NBP
+  staleness (1×→1.30× as NBP cache ages 1h→7h, d-1+ only) → per-station
+  multiplier (`PER_SERIES_SIGMA_MULT`, currently KLAX=1.5).
+  *Post-sunrise σ collapse was DISABLED 2026-04-25*: the heuristic was too
+  tight — Apr 25 V1 positions had market prices nowhere near 99/1 at
+  mid-morning, proving the daily low can still drop later in the climate
+  day. Keep full σ all day; the running_min+1°F truncation is the safety
+  net (low can only go down).
 - **Settlement**: reads CLI daily low from obs-pipeline's `cli_reports.low_f`
   field (same source V1/V2 use for CLI high). **Kalshi fallback** when
   obs-pipeline missed a CLI bulletin: if `get_cli_low` returns None for a
@@ -82,7 +95,8 @@ placement still routes through REST. Disable with `USE_KALSHI_WS = False`.
 5. `wait_for_fill()` polls the `kalshi_ws` fill cache for up to 5 s, falls
    back to REST `/portfolio/orders/{id}` (authoritative).
 6. Partial / no-fill: cancel any resting remainder. Record actual `filled`
-   count to `data/trades.jsonl` and emit a Discord notification.
+   count to today's `data/trades_YYYY-MM-DD.jsonl` and emit a Discord
+   notification.
 7. `check_settlements()` walks open positions; on CLI publish, computes P&L
    and emits a Discord settlement notification.
 
@@ -217,9 +231,11 @@ double-buys after a deploy or crash:
    flag — confirmed inversions on CHI-T48, SEA-T42, LV-T58, MIN-T45 in
    the 2026-04-27 audit.
 3. `_reconcile_from_trades_log()` — reads today's `kind=entry` records
-   from `trades.jsonl` and adds any whose ticker is missing from
-   `_open_positions` *and* not already in `settlements.jsonl`. Closes
-   the Kalshi `/portfolio/positions` API-lag window. Without this,
+   from both today's `trades_YYYY-MM-DD.jsonl` and the legacy `trades.jsonl`
+   archive (date-rotation deployed 2026-04-29; legacy file holds
+   pre-rotation entries) and adds any whose ticker is missing from
+   `_open_positions` *and* not already in `settlements.jsonl`. Closes the
+   Kalshi `/portfolio/positions` API-lag window. Without this,
    KXLOWTCHI-26APR25-T48 was bought twice on 2026-04-25 (16 min apart,
    between back-to-back deploy restarts) because positions.json was
    clobbered AND Kalshi hadn't propagated the fill yet.
@@ -245,10 +261,21 @@ ignoring the new min fields.
 
 ## Not yet implemented (backlog)
 
+- **Bracket-math integer-rounding correction (Phase 0a)**: V2's `CDF(cap+0.5)
+  − CDF(floor−0.5)` formula. Min-bot currently uses raw `[floor, cap]`
+  endpoints, under-stating B-bracket probability. Mathematically correct fix
+  but ripples into every gate's mp threshold (calibrated against the buggy
+  formula). Defer until paired with a gate re-calibration backtest.
+- **Per-station σ multiplier expansion**: data exists for OKC (NBP bias
+  −3.5°F like KLAX), DC, DEN, NYC. Only KLAX deployed so far (n=12). Add
+  others as their n grows past the playbook's n≥20 bar.
+- **NWS gridpoint forecast integration**: V2's primary source. Researched
+  2026-04-29; held due to source-MAE backtest showing blending hurts on
+  min markets (NBP+HRRR mean MAE 2.18°F worse than NBP alone 2.11°F).
+  Worth revisiting only if a single-source NWS test (vs the current NBP /
+  HRRR per-city split) shows a clean MAE win at the worst-MAE stations
+  (LAX, MIN, DEN, PHIL).
 - HRRR overnight nowcast blending (HRRR 0-18h min trajectory)
-- NWS gridpoint minTemperature as tertiary mu source
 - `seed_running_min_from_observations()` wired into obs-pipeline startup
 - client_order_id-based idempotency on retry
-- Time-to-settlement-aware sigma collapse (smooth interpolation, not just
-  the binary `_is_post_sunrise` flip)
 - Web dashboard (calibration curve, P&L by city, rolling Brier score)
