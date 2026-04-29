@@ -1826,26 +1826,28 @@ class TestQuickWinGates(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_max_edge_is_0_55(self):
-        self.assertEqual(pb.MAX_EDGE, 0.55)
+    def test_max_edge_is_0_45(self):
+        self.assertEqual(pb.MAX_EDGE, 0.45)
 
-    def test_edge_above_max_edge_blocked_when_no_cli_history(self):
-        """Edge 0.60 > MAX_EDGE 0.55 → block (no CLI history → consistency bypass off)."""
-        # Patch get_recent_cli_range to None (no history) so bypass can't fire.
+    def test_edge_above_max_edge_blocked_unconditionally(self):
+        """Edge > MAX_EDGE blocks regardless of NBP-CLI consistency. Backtest
+        2026-04-29 showed 5/5 BUY_NO MAX_EDGE-bypass losses; bypass removed."""
+        # Even with NBP perfectly consistent, MAX_EDGE blocks.
         orig = pb.get_recent_cli_range
-        pb.get_recent_cli_range = lambda *a, **kw: None
+        pb.get_recent_cli_range = lambda *a, **kw: (40.0, 42.0)
         try:
-            pb.execute_opportunity(self._opp(edge=0.60, no_ask=10))
-            self.assertEqual(self._captured, [])
+            pb.execute_opportunity(self._opp(edge=0.50, no_ask=15))
+            self.assertEqual(self._captured, [],
+                "MAX_EDGE must block even when NBP is consistent — backtest evidence")
         finally:
             pb.get_recent_cli_range = orig
 
-    def test_edge_at_0_55_passes(self):
-        """Edge 0.55 = MAX_EDGE (strict greater-than blocks). Passes.
-        Engineered: BUY_NO with mp=0.20 (in [0.15, 0.40]) and no_ask=25c
-        → edge = (1-0.20) - 0.25 = 0.55 exactly."""
-        opp = self._opp(model_prob=0.20, no_ask=25, no_bid=23, entry_price=0.25,
-                        edge=0.55, yes_bid=73, yes_ask=75)
+    def test_edge_at_max_edge_passes(self):
+        """Edge = MAX_EDGE 0.45 (strict greater-than blocks). Passes.
+        BUY_NO with mp=0.20 (in [0.15, 0.40]) and no_ask=35c
+        → edge = (1-0.20) - 0.35 = 0.45 exactly."""
+        opp = self._opp(model_prob=0.20, no_ask=35, no_bid=33, entry_price=0.35,
+                        edge=0.45, yes_bid=63, yes_ask=65)
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1)
 
@@ -2214,9 +2216,12 @@ class TestNbpConsistencyBypass(unittest.TestCase):
         self.assertFalse(pb._nbp_consistent_with_recent_cli(opp))
 
 
-class TestMaxEdgeBypassEnd2End(unittest.TestCase):
-    """End-to-end: high-edge opp (>MAX_EDGE) gets through when NBP is
-    consistent with recent CLI; gets blocked when not."""
+class TestMpRangeBypassEnd2End(unittest.TestCase):
+    """End-to-end: extreme-mp opp (mp < MIN_MODEL_PROB or > MAX_MODEL_PROB)
+    bypasses the mp-range gate when NBP is consistent with recent CLI.
+    Backtest 2026-04-29: 3/3 such cases (BUY_NO with mp 3-11%, μ outside
+    bracket, NBP consistent) won. MAX_EDGE bypass was rolled back in same
+    deploy after 5/5 historical losses on the BUY_NO version of that path."""
 
     def setUp(self):
         with pb._positions_lock:
@@ -2242,77 +2247,73 @@ class TestMaxEdgeBypassEnd2End(unittest.TestCase):
         pb.get_recent_cli_range = self._orig_recent
         pb._cached_bankroll = 0.0
 
-    def _chi_t47_opp(self):
-        """Reconstructs KXLOWTCHI-26APR29-T47 (memory: yes_ask 5¢, NBP μ=49 σ=2,
-        recent KMDW CLI 44-67°F, edge 64%). T-high (cli ≥ 48 YES). mp 69% is
-        within [0.15, 0.85] and clears the BUY_YES≥60% directional gate, so
-        MAX_EDGE 0.55 is the only blocking gate — perfect target for the
-        consistency bypass."""
+    # MP-range bypass survives the 2026-04-29 rollback. Backtest of historical
+    # candidates: 3/3 cheap BUY_NO cases (edge < 0.42 AND mp < 0.15 AND μ
+    # clearly outside bracket AND NBP consistent) all won. The mp gate was
+    # blocking legit "very confident NO" trades.
+
+    def _atl_b59_opp(self):
+        """Reconstructs KXLOWTATL-26APR27-B59.5 backtest winner: BUY_NO,
+        edge=0.25, mp=0.08 (< MIN_MODEL_PROB=0.15), μ=62 with bracket [59,60]
+        (μ 2°F above bracket — clearly outside), KATL recent CLI [44, 66]."""
         return {
-            "market_ticker": "KXLOWTCHI-26APR29-T47",
-            "event_ticker": "KXLOWTCHI-26APR29",
-            "action": "BUY_YES", "model_prob": 0.69, "edge": 0.64,
-            "entry_price": 0.05, "yes_bid": 3, "yes_ask": 5,
-            "no_bid": 90, "no_ask": 95, "mu": 49.0, "sigma": 2.0,
+            "market_ticker": "KXLOWTATL-26APR27-B59.5",
+            "event_ticker": "KXLOWTATL-26APR27",
+            "action": "BUY_NO", "model_prob": 0.08, "edge": 0.25,
+            "entry_price": 0.67, "yes_bid": 7, "yes_ask": 11,
+            "no_bid": 65, "no_ask": 67, "mu": 62.0, "sigma": 4.5,
             "mu_source": "nbp", "running_min": None,
-            "post_sunrise_lock": False, "disagreement": 0.0,
-            "floor": 47.5, "cap": None,
-            "station": "KMDW", "date_str": "2026-04-29", "label": "Chicago",
-            "series": "KXLOWTCHI", "is_today": False,
+            "post_sunrise_lock": False, "disagreement": 0.5,
+            "floor": 59.0, "cap": 60.0,
+            "station": "KATL", "date_str": "2026-04-27", "label": "Atlanta",
+            "series": "KXLOWTATL", "is_today": False,
         }
 
-    def test_high_edge_passes_when_nbp_consistent(self):
-        """μ=49 with recent KMDW CLI [44, 51] → 49 within [42, 53] → bypass
-        MAX_EDGE → trade gets placed."""
-        pb.get_recent_cli_range = lambda station, **kw: (44.0, 51.0) if station == "KMDW" else None
-        pb.execute_opportunity(self._chi_t47_opp())
+    def test_low_mp_passes_when_nbp_consistent(self):
+        """mp=8% < MIN_MODEL_PROB=15% but μ=62 fits recent [44, 66] →
+        bypass mp-range → trade placed."""
+        pb.get_recent_cli_range = lambda station, **kw: (44.0, 66.0) if station == "KATL" else None
+        pb.execute_opportunity(self._atl_b59_opp())
         self.assertEqual(len(self._captured), 1,
-                         "high-edge BUY_YES with NBP-consistent forecast should pass")
+                         "cheap BUY_NO with NBP-consistent forecast should pass")
 
-    def test_high_edge_blocks_when_nbp_inconsistent(self):
-        """μ=49 with recent CLI [25, 30] → 49 > 30+2 → MAX_EDGE blocks."""
-        pb.get_recent_cli_range = lambda station, **kw: (25.0, 30.0) if station == "KMDW" else None
-        pb.execute_opportunity(self._chi_t47_opp())
+    def test_low_mp_blocks_when_nbp_inconsistent(self):
+        """μ=62 with recent CLI [40, 50] → 62 > 50+2 → mp gate blocks."""
+        pb.get_recent_cli_range = lambda station, **kw: (40.0, 50.0) if station == "KATL" else None
+        pb.execute_opportunity(self._atl_b59_opp())
         self.assertEqual(self._captured, [],
-                         "high-edge with NBP-inconsistent forecast should block")
+                         "low mp with NBP-inconsistent forecast should block")
 
-    def test_high_edge_blocks_when_no_history(self):
-        """No CLI history → conservative; MAX_EDGE still bites."""
+    def test_low_mp_blocks_when_no_history(self):
+        """No CLI history → conservative; mp gate still bites."""
         pb.get_recent_cli_range = lambda *a, **kw: None
-        pb.execute_opportunity(self._chi_t47_opp())
+        pb.execute_opportunity(self._atl_b59_opp())
         self.assertEqual(self._captured, [],
-                         "missing history should not bypass MAX_EDGE")
+                         "missing history should not bypass mp-range")
 
-    def _aus_t71_opp(self):
-        """KXLOWTAUS-26APR29-T71: NBP μ=77 σ=3, mp=95% (above MAX_MODEL_PROB),
-        edge=92% (above MAX_EDGE). Requires bypassing BOTH gates to enter."""
-        return {
-            "market_ticker": "KXLOWTAUS-26APR29-T71",
-            "event_ticker": "KXLOWTAUS-26APR29",
-            "action": "BUY_YES", "model_prob": 0.95, "edge": 0.92,
-            "entry_price": 0.03, "yes_bid": 2, "yes_ask": 3,
-            "no_bid": 95, "no_ask": 100, "mu": 77.0, "sigma": 3.0,
+    def test_high_edge_blocks_even_with_consistency(self):
+        """Backtest 2026-04-29: 5/5 BUY_NO MAX_EDGE-bypass cases lost. The
+        MAX_EDGE bypass was removed. Even with NBP perfectly consistent,
+        edge > 0.45 must still block."""
+        pb.get_recent_cli_range = lambda station, **kw: (60.0, 65.0)
+        # MIA-26APR25-B71.5 reconstruction: μ=70.5 in [70,74] (consistent),
+        # but edge 72% — must block.
+        opp = {
+            "market_ticker": "KXLOWTMIA-26APR25-B71.5",
+            "event_ticker": "KXLOWTMIA-26APR25",
+            "action": "BUY_NO", "model_prob": 0.20, "edge": 0.72,
+            "entry_price": 0.08, "yes_bid": 5, "yes_ask": 8,
+            "no_bid": 80, "no_ask": 92, "mu": 70.5, "sigma": 2.0,
             "mu_source": "nbp", "running_min": None,
-            "post_sunrise_lock": False, "disagreement": 0.0,
-            "floor": 71.5, "cap": None,
-            "station": "KAUS", "date_str": "2026-04-29", "label": "Austin",
-            "series": "KXLOWTAUS", "is_today": False,
+            "post_sunrise_lock": False, "disagreement": 0.5,
+            "floor": 71.0, "cap": 72.0,
+            "station": "KMIA", "date_str": "2026-04-25", "label": "Miami",
+            "series": "KXLOWTMIA", "is_today": False,
         }
-
-    def test_extreme_mp_passes_when_nbp_consistent(self):
-        """AUS-T71 reconstruction: mp=95% > MAX_MODEL_PROB=85% AND edge=92% >
-        MAX_EDGE=55%. Both bypassed by NBP consistency → trade placed."""
-        pb.get_recent_cli_range = lambda station, **kw: (72.0, 75.0) if station == "KAUS" else None
-        pb.execute_opportunity(self._aus_t71_opp())
-        self.assertEqual(len(self._captured), 1,
-                         "AUS-T71 should pass when NBP μ=77 is within recent [72, 75] ±2 buffer")
-
-    def test_extreme_mp_blocks_when_nbp_inconsistent(self):
-        """μ=77 with recent CLI [55, 60] → NOT consistent → mp gate blocks."""
-        pb.get_recent_cli_range = lambda station, **kw: (55.0, 60.0) if station == "KAUS" else None
-        pb.execute_opportunity(self._aus_t71_opp())
+        pb.get_recent_cli_range = lambda station, **kw: (70.0, 74.0) if station == "KMIA" else None
+        pb.execute_opportunity(opp)
         self.assertEqual(self._captured, [],
-                         "extreme mp with NBP-inconsistent forecast should block")
+                         "MAX_EDGE must block even when NBP consistent — backtest evidence")
 
 
 if __name__ == "__main__":

@@ -111,15 +111,17 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters
 MIN_EDGE = 0.20                     # min edge to take a trade
-MAX_EDGE = 0.55                     # 0.40 → 0.42 (2026-04-27 evening) → 0.55 (2026-04-28 night,
-                                    # paired with NBP-vs-recent-CLI consistency bypass below).
-                                    # Beyond this, high apparent edge is treated as the *default*
-                                    # red flag — but `_nbp_consistent_with_recent_cli` opens a
-                                    # bypass when NBP μ is within ±2°F of the last-7d CLI range
-                                    # at the station, so legit cheap-tail wins (SATX-T73 / AUS-T71
-                                    # 2026-04-29 all priced 2-8c YES vs 80%+ recent-CLI win rate)
-                                    # don't get blocked. Outliers like the 2026-04-26 KMDW NBP=76
-                                    # vs CLI 44-51 case still hit the cap because consistency fails.
+MAX_EDGE = 0.45                     # 0.40 → 0.42 (2026-04-27 evening) → 0.55 (2026-04-28 night,
+                                    # with NBP-CLI consistency bypass) → 0.45 (2026-04-29 early,
+                                    # bypass rolled back). Backtest of the 0.55+bypass policy on
+                                    # historical candidates: 8 bypass-passers, 5/5 of the BUY_NO
+                                    # MAX_EDGE-bypass cases lost (μ at-or-near bracket boundary —
+                                    # honest forecast still landing in the wrong bracket). 3/3 of
+                                    # the mp-range-only bypass cases (edge < 0.42 but mp outside
+                                    # [0.15, 0.85] with NBP consistent) won. Conclusion: high
+                                    # apparent edge IS a real model-error signal, even when NBP
+                                    # aligns with recent CLI. mp-range bypass kept; MAX_EDGE
+                                    # bypass removed; constant nudged to V2-validated 0.45.
 MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
@@ -748,10 +750,13 @@ def get_recent_cli_range(station: str, days: int = RECENT_CLI_DAYS,
 def _nbp_consistent_with_recent_cli(opp: dict,
                                      buffer_f: float = NBP_CONSISTENCY_BUFFER_F) -> bool:
     """True if `opp.mu` lies within (recent_min − buffer, recent_max + buffer)
-    for the station's last-7d CLI lows. Used as a MAX_EDGE bypass: when the
-    forecast aligns with what's actually been happening at the station, an
-    extreme apparent edge is more likely a stale market-maker quote than a
-    model error.
+    for the station's last-7d CLI lows. Used as an mp-range gate bypass: when
+    the forecast aligns with what's actually been happening at the station,
+    extreme model_prob values (e.g. mp < 0.15 on cheap BUY_NO bets where μ is
+    clearly outside the bracket) are trustworthy. Backtest 2026-04-29: 3/3
+    such cases won. (Originally also bypassed MAX_EDGE; that bypass was rolled
+    back after backtest showed 5/5 BUY_NO MAX_EDGE-bypass losses where μ was
+    at-or-near the bracket boundary.)
 
     Excludes the position's own climate_date from the lookback so back-test
     scenarios don't leak. Returns False on insufficient history (< 3 days),
@@ -2218,22 +2223,21 @@ def execute_opportunity(opp: dict) -> bool:
             return False
         # Forecast-based gates — each prevents a class of model error.
         # Order: cheapest-to-evaluate first.
-        #
-        # NBP-vs-recent-CLI consistency bypass (2026-04-28 night) covers BOTH
-        # MAX_EDGE and the mp-range gate. Both gates protect against
-        # "model is too confident" failures; both are wrong when the forecast
-        # is supported by recent reality at the station. Cheap-tail wins like
-        # AUS-T71 (mp~95% / yes_ask 3¢ / 4-of-4 recent CLI ≥ 72°F) need both
-        # bypasses to actually clear; bypassing only one leaves the trade
-        # blocked by the other.
-        nbp_consistent = _nbp_consistent_with_recent_cli(opp)
         if edge > MAX_EDGE:
-            if not nbp_consistent:
-                _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
-                return False
-            # else: silently bypass; ENTRY log will show the high edge.
+            # No NBP-CLI bypass here. Backtest 2026-04-29 on historical
+            # candidates: MAX_EDGE-bypass policy lost 5/5 BUY_NO cases
+            # (μ at-or-near bracket boundary — honest forecast still landing
+            # in the wrong bracket). High apparent edge IS a real model-error
+            # signal, even when NBP aligns with recent CLI.
+            _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
+            return False
         if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-            if not nbp_consistent:
+            # NBP-CLI consistency bypass kept HERE only. Backtest: 3/3 cheap
+            # BUY_NO cases (mp 3-11%, μ clearly outside bracket, NBP
+            # consistent) all won. The mp-range gate was blocking legit
+            # "very confident NO" trades where the bot's confidence was
+            # justified by recent CLI patterns.
+            if not _nbp_consistent_with_recent_cli(opp):
                 _log_skip(ticker, f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
                 return False
             # else: bypass — recent CLI supports the extreme prob.
