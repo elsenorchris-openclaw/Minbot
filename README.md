@@ -6,9 +6,10 @@ cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 **Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
 `KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
 Current caps (2026-04-29, after the $200 bankroll add brought balance to
-~$279): **$20 per entry, 3 entries per cycle, $120 daily exposure, 20% min
-edge.** Bumped iteratively from launch's `$1 / 3 / $4 / 20%` as the bot's
-track record built. Full evolution in the constants table below.
+~$279): **$20 per entry, 3 entries per cycle, daily exposure unlimited
+(bankroll itself is the binding constraint), 20% min edge.** Bumped
+iteratively from launch's `$1 / 3 / $4 / 20%` as the bot's track record
+built. Full evolution in the constants table below.
 
 > File / dir / service names still carry the `paper-min-bot` prefix from the
 > initial paper-trading scaffold. Keeping them avoids touching the systemd
@@ -111,7 +112,7 @@ All in `paper_min_bot.py`:
 | `MIN_COST_USD` | `$1.00` | Cost floor: `count = max(count, ceil(MIN_COST_USD/price))` after Kelly + MIN_BET_USD floor + int rounding. Without this, `int(bet_usd/price)` rounded `count` down such that 96% of fills landed under $1 (avg $0.45 on 2026-04-25/26). The cap clamp at MAX_BET_USD keeps the floor from blowing the ceiling on cheap contracts. Added 2026-04-27. |
 | `MAX_NEW_POSITIONS_PER_CYCLE` | `3` | First test cycle took 55 paper entries; cap stops runaway |
 | `MAX_OPEN_PER_EVENT` | `1` | Lifetime cap (counts open positions, not per-cycle). Once one bracket on an event is open, all other brackets on that event are blocked until it settles. CHI-26APR25 stacked 4 brackets across cycles 2026-04-25 under the prior per-cycle rule. |
-| `DAILY_EXPOSURE_CAP_USD` | `$120.00` | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27) → $120 (2026-04-28 night, alongside $200 bankroll add). 43% of $279 bankroll — caps daily drawdown below half the bankroll if the model has a bad day. |
+| `DAILY_EXPOSURE_CAP_USD` | `$10000.00` (sentinel) | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27) → $120 (2026-04-28 night) → **effectively unlimited (2026-04-29 evening, per Chris)**. With ~$279 bankroll, $20/bet, 3 entries/cycle, and `BANKROLL_FLOOR_USD=$5`, the bankroll itself is the binding constraint — the bot stops placing orders once balance drops below $5. The $10,000 sentinel is unreachable at current scale; revisit only if bankroll grows past $5k. |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
 | `MAX_EDGE` | `0.45` | Skip edges > 45%. Evolution: 0.40 → 0.42 (2026-04-27) → 0.55 with NBP-CLI bypass (2026-04-28 night) → **0.45 with bypass rolled back** (2026-04-29 early). Backtest on n=8 historical bypass-passers: 5/5 BUY_NO MAX_EDGE-bypass cases LOST (μ at-or-near bracket boundary — honest forecasts still landing in the wrong bracket). High apparent edge IS a real model-error signal even when NBP aligns with recent CLI. **No bypass.** |

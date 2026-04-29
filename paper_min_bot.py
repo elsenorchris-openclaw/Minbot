@@ -212,10 +212,14 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
-DAILY_EXPOSURE_CAP_USD = 120.00     # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
-                                    # → $120 (2026-04-28 night, paired with $200 bankroll add to
-                                    # ~$279). 43% of bankroll — caps daily drawdown at less than
-                                    # half the bankroll if the model has a bad day.
+DAILY_EXPOSURE_CAP_USD = 10000.00   # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
+                                    # → $120 (2026-04-28 night) → effectively unlimited (2026-04-29
+                                    # evening, per Chris). With ~$279 bankroll, MAX_BET_USD=$20,
+                                    # MAX_NEW_POSITIONS_PER_CYCLE=3, and BANKROLL_FLOOR_USD=$5, the
+                                    # bankroll itself becomes the binding constraint (bot refuses to
+                                    # place orders once balance < $5). The $10,000 value is a sentinel
+                                    # that will never be hit at current scale; if bankroll grows past
+                                    # $5k, revisit.
 
 # ─── Kelly anchor (V2 port): bankroll, not MAX_BET_USD ──────────────────
 # Pre-fix: bet_usd = kelly * MAX_BET_USD (anchored to the cap, sized as if

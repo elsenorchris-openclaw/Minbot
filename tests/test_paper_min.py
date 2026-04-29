@@ -258,11 +258,11 @@ class TestWalletConfig(unittest.TestCase):
     def test_wallet_default_is_v1(self):
         self.assertEqual(pb.WALLET, "v1")
 
-    def test_live_config_caps_are_conservative(self):
-        # Sanity: don't accidentally ship with $1000 caps. Bumped 2026-04-28
-        # night to $20 / $120 alongside bankroll growth to ~$279.
+    def test_live_config_caps_sanity(self):
+        # Per-bet cap stays bounded. Daily cap removed 2026-04-29 evening
+        # (sentinel ≥ $1000) — bankroll itself is the binding constraint.
         self.assertLessEqual(pb.MAX_BET_USD, 30.00)
-        self.assertLessEqual(pb.DAILY_EXPOSURE_CAP_USD, 150.00)
+        self.assertGreaterEqual(pb.DAILY_EXPOSURE_CAP_USD, 1000.00)
         self.assertLessEqual(pb.MAX_NEW_POSITIONS_PER_CYCLE, 5)
         self.assertGreaterEqual(pb.MIN_EDGE, 0.20)
 
@@ -974,11 +974,12 @@ class TestCapBumpsApril26(unittest.TestCase):
     def test_max_bet_is_20(self):
         self.assertEqual(pb.MAX_BET_USD, 20.00)
 
-    def test_daily_cap_is_120(self):
-        """Bumped from $60 → $120 on 2026-04-28 night alongside bankroll
-        growth to ~$279. 43% of bankroll — absorbs Kelly intent at scale
-        without exposing more than half the bankroll on a bad day."""
-        self.assertEqual(pb.DAILY_EXPOSURE_CAP_USD, 120.00)
+    def test_daily_cap_unlimited(self):
+        """Daily cap removed 2026-04-29 evening per Chris. Sentinel value
+        $10,000 — never reachable at current scale ($279 bankroll, $20/bet,
+        3 entries/cycle). Bankroll floor ($5) is the real stop. Revisit
+        only if bankroll grows past $5k."""
+        self.assertGreaterEqual(pb.DAILY_EXPOSURE_CAP_USD, 1000.00)
 
     def test_min_cost_usd_is_1(self):
         """$1 cost floor enforced via ceil(MIN_COST_USD / price) post-Kelly.
