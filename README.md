@@ -168,6 +168,13 @@ Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
   Kalshi `/portfolio/settlements`, and (with `--include-active`) Kalshi
   `/markets/{ticker}` endpoint. Argparse: `--gate <NAME>`, `--action`,
   `--days N`, `--include-active`, `--list-gates`.
+- `source_audit.py` — per-source forecast accuracy vs actual CLI low.
+  For every historical candidate that has settled, compares NBP / HRRR /
+  NBM-OM / bot's chosen μ / blended (NBP+HRRR mean, triple-mean) against
+  the actual CLI low. Reports MAE, bias, RMSE overall, by day-offset, and
+  per city. Use when validating any model-source change (e.g. NWS
+  integration, per-city primary-source override). Argparse: `--days N`,
+  `--series KXLOWTXXX`, `--day-offset {-1,0,1,2,3}`.
 
 `/home/ubuntu/paper_min_bot/MIN_BOT_BACKTEST_PLAYBOOK.md` — read this
 **before proposing any filter / threshold change**. Codifies the 5-point
