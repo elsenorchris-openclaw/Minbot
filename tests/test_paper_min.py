@@ -2643,6 +2643,46 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
                              f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
 
 
+class TestPerCityD0PrimarySource(unittest.TestCase):
+    """Per-city d-0 primary source override (2026-04-29 night). NYC/DC/BOS
+    switch from HRRR to NBP on d-0 because HRRR runs systematically cool on
+    these stations (NYC -3.30°F, DC -1.65°F, BOS -2.52°F) and NBP cuts MAE by
+    30-65%. Other cities stay on the HRRR d-0 default. ATL excluded (HRRR
+    1.48°F is slightly better than NBP 1.61°F on d-0)."""
+
+    def test_nyc_uses_nbp_on_d_zero(self):
+        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTNYC"), "nbp")
+
+    def test_dc_uses_nbp_on_d_zero(self):
+        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTDC"), "nbp")
+
+    def test_bos_uses_nbp_on_d_zero(self):
+        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTBOS"), "nbp")
+
+    def test_atl_NOT_overridden_on_d_zero(self):
+        """HRRR is genuinely better than NBP on ATL d-0 (1.48 vs 1.61). Don't
+        flip just because today's hard-stop fit a HRRR-cool pattern — that was
+        a 1.7°F miss within 1.2× MAE, not a structural issue."""
+        self.assertNotIn("KXLOWTATL", pb.PER_SERIES_D0_PRIMARY)
+
+    def test_other_cities_default_to_hrrr_on_d_zero(self):
+        # Most cities are NOT in the override dict — they fall through to HRRR.
+        for series in ("KXLOWTLAX", "KXLOWTSATX", "KXLOWTHOU", "KXLOWTAUS",
+                       "KXLOWTPHX", "KXLOWTDEN", "KXLOWTSEA", "KXLOWTPHIL",
+                       "KXLOWTATL"):
+            self.assertNotIn(series, pb.PER_SERIES_D0_PRIMARY,
+                             f"{series} should not be in PER_SERIES_D0_PRIMARY (default HRRR)")
+
+    def test_d0_override_does_not_overlap_d1_override(self):
+        """A series should not be in BOTH dicts (would mean we're switching
+        sources twice for the same city — possible but currently no city
+        needs that)."""
+        d0 = set(pb.PER_SERIES_D0_PRIMARY)
+        d1 = set(pb.PER_SERIES_D1_PRIMARY)
+        self.assertEqual(d0 & d1, set(),
+                         "no series should override both d-0 and d-1 right now")
+
+
 class TestCliIsFinal(unittest.TestCase):
     """2026-04-29 phantom-settlement fix: only treat CLI as final after
     climate_date_end_LST + 6h. Prevents settling on intra-day partial CLI

@@ -214,6 +214,33 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
     "KXLOWTOKC": "hrrr",
 }
 
+# Per-city d-0 source override. d-0 default is HRRR (freshest nowcast), but
+# 30-day candidate-log audit (2026-04-29) shows three stations where NBP is
+# materially more accurate AND less biased than HRRR on d-0. Switching d-0
+# source to NBP for these cities cuts MAE by 30-65% and removes a structural
+# HRRR-cool bias that was driving B-bracket BUY_NO losses (e.g. today's
+# NYC-B51.5 settled loss: HRRR μ=49.2 vs cli=52, 2.8°F gap).
+#
+# Source-MAE evidence (n=46-58k cycle samples per city × source):
+#   | City | NBP d-0 | HRRR d-0 | gap   | bias    | bot.mu MAE |
+#   |------|---------|----------|-------|---------|------------|
+#   | NYC  | 1.54°F  | 3.30°F   | -1.76 | -3.30°F | 3.27°F     |
+#   | DC   | 1.83°F  | 2.61°F   | -0.78 | -1.65°F | 2.60°F     |
+#   | BOS  | 1.17°F  | 2.57°F   | -1.40 | -2.52°F | 2.54°F     |
+#
+# Other cities NOT included (NBP not better enough on d-0):
+#   PHIL: NBP 2.05 vs HRRR 2.35 (-0.30°F, marginal)
+#   ATL:  NBP 1.61 vs HRRR 1.48 (HRRR slightly better — leave on HRRR)
+#
+# σ from NBP is subject to staleness inflation (already wired for "nbp" and
+# "hrrr_d1_override"; "nbp_d0_override" added to that tuple below). NBP
+# cycles every 6h so d-0 NBP can be 4-6h stale on late-evening entries.
+PER_SERIES_D0_PRIMARY: dict[str, str] = {
+    "KXLOWTNYC": "nbp",
+    "KXLOWTDC":  "nbp",
+    "KXLOWTBOS": "nbp",
+}
+
 # ─── Hard ceilings that gate execute_opportunity before placing the order
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 10000.00   # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
@@ -1830,7 +1857,15 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         #     PER_SERIES_D1_PRIMARY (CHI, OKC → HRRR — backed by source-MAE
         #     audit 2026-04-29, see constant comment).
         #   - else fall back to NBM-OM.
-        if is_today and hrrr is not None:
+        if (is_today
+                and PER_SERIES_D0_PRIMARY.get(m["series"]) == "nbp"
+                and nbp):
+            # Per-city d-0 override: NBP beats HRRR on this station's d-0
+            # min forecast (see PER_SERIES_D0_PRIMARY constant for evidence).
+            mu = nbp["mu"]
+            sigma = nbp["sigma"]
+            mu_source = "nbp_d0_override"
+        elif is_today and hrrr is not None:
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr"
@@ -1865,14 +1900,16 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             sigma = sigma * inflation
         # NBP staleness σ inflation (V2 port, 2026-04-29). NBP cycles every
         # ~6h; between cycles, forecast uncertainty grows. Linear ramp:
-        # +5%/h after 1h, capped at +30% (== 7h stale). Only applies when
-        # mu_source == "nbp" (i.e., d-1+ markets where we're using the cached
-        # NBP forecast directly). d-0 typically uses HRRR (refreshed hourly)
-        # so staleness isn't a concern there.
-        # σ from NBP is subject to staleness inflation regardless of whether
-        # μ came from NBP or HRRR (the d-1 hrrr override still uses NBP σ).
-        # Both source paths only fire on d-1+ markets.
-        if mu_source in ("nbp", "hrrr_d1_override"):
+        # +5%/h after 1h, capped at +30% (== 7h stale).
+        # Applies to any source path that consumes NBP-derived σ:
+        #   - "nbp": d-1+ default
+        #   - "hrrr_d1_override": d-1+ HRRR-primary cities (CHI/OKC); μ is
+        #     HRRR but σ is still NBP's, so staleness applies
+        #   - "nbp_d0_override": d-0 NBP-primary cities (NYC/DC/BOS); both μ
+        #     and σ are NBP. Staleness matters MORE here because d-0 entries
+        #     can be made anytime overnight, including 4-6h after the latest
+        #     NBP cycle, while HRRR (the default d-0 path) refreshes hourly.
+        if mu_source in ("nbp", "hrrr_d1_override", "nbp_d0_override"):
             with _nbp_cache_lock:
                 _ts = _nbp_cache_ts
             if _ts > 0:
