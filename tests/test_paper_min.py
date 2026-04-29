@@ -1779,8 +1779,8 @@ class TestPositionExitLogic(unittest.TestCase):
 class TestQuickWinGates(unittest.TestCase):
     """V2-inspired quick-win gates:
        - MAX_EDGE: 0.40 (initial) → 0.42 (2026-04-27) → 0.55 (2026-04-28 night,
-         paired with NBP-vs-recent-CLI consistency bypass)
-       - PRICE_ZONE block: BUY_NO + yes_bid ∈ [30, 40]c
+         paired with NBP-CLI bypass) → 0.45 (2026-04-29, bypass rolled back)
+       - PRICE_ZONE: REMOVED 2026-04-29 (2/2 historical winners blocked)
        - H_2.0: d-1+ BUY_NO + disagreement > 2°F"""
 
     def setUp(self):
@@ -1851,42 +1851,21 @@ class TestQuickWinGates(unittest.TestCase):
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1)
 
-    def test_price_zone_blocks_buy_no_at_yes_bid_30(self):
-        """yes_bid=30 → PRICE_ZONE block (BUY_NO only)."""
-        pb.execute_opportunity(self._opp(yes_bid=30, yes_ask=35,
-                                          no_bid=65, no_ask=70,
-                                          entry_price=0.70, edge=0.10,
-                                          model_prob=0.20))
-        self.assertEqual(self._captured, [])
-
-    def test_price_zone_blocks_buy_no_at_yes_bid_40(self):
-        """yes_bid=40 → PRICE_ZONE block (boundary, inclusive)."""
-        pb.execute_opportunity(self._opp(yes_bid=40, yes_ask=42,
-                                          no_bid=58, no_ask=60,
-                                          entry_price=0.60, edge=0.20,
-                                          model_prob=0.20))
-        self.assertEqual(self._captured, [])
-
-    def test_price_zone_does_not_block_at_yes_bid_29(self):
-        """yes_bid=29 → just below zone, passes other gates."""
-        opp = self._opp(yes_bid=29, yes_ask=33, no_bid=67, no_ask=70,
-                        entry_price=0.70, edge=0.10, model_prob=0.20)
-        # edge=0.10 < MIN_EDGE will block; bump model_prob to get higher edge
-        opp["edge"] = 0.25; opp["model_prob"] = 0.05  # mp<MIN_MODEL_PROB blocks though
-        # Use mp=0.15 (= MIN_MODEL_PROB), no_ask=0.60 → edge=0.25
-        opp["model_prob"] = 0.15; opp["no_ask"] = 60; opp["entry_price"] = 0.60
-        opp["yes_bid"] = 29  # just below PRICE_ZONE
+    def test_yes_bid_in_former_price_zone_no_longer_blocks(self):
+        """PRICE_ZONE removed 2026-04-29. BUY_NO with yes_bid in the formerly
+        blocked 30-40c zone should now pass (subject to other gates)."""
+        # mp=0.20 (in [0.15, 0.40] for BUY_NO directional + F2A range);
+        # no_ask=55 → entry=0.55 → edge = 0.80 − 0.55 = 0.25;
+        # yes_bid=33 sits squarely in the FORMER PRICE_ZONE [30, 40];
+        # μ=62 vs bracket [59, 60] → ABS_DIST passes (|62-59.5|=2.5°F > 0.5°F).
+        opp = self._opp(yes_bid=33, yes_ask=37,
+                        no_bid=53, no_ask=55,
+                        entry_price=0.55, edge=0.25,
+                        model_prob=0.20, mu=62.0,
+                        floor=59.0, cap=60.0)
         pb.execute_opportunity(opp)
-        self.assertEqual(len(self._captured), 1, "yes_bid=29 should pass PRICE_ZONE")
-
-    def test_price_zone_does_not_block_buy_yes(self):
-        """PRICE_ZONE is BUY_NO-only. BUY_YES with yes_bid=35 passes."""
-        opp = self._opp(action="BUY_YES", model_prob=0.70,
-                        yes_bid=35, yes_ask=40, no_bid=58, no_ask=65,
-                        entry_price=0.40, edge=0.30,
-                        mu=45.5)  # YES sweet spot
-        pb.execute_opportunity(opp)
-        self.assertEqual(len(self._captured), 1)
+        self.assertEqual(len(self._captured), 1,
+                         "yes_bid=33 in former PRICE_ZONE should pass post-removal")
 
     def test_h_2_0_blocks_d1_buy_no_when_disagree(self):
         """D-1+ BUY_NO with disagreement 2.5°F > H_2_0_DISAGREE_F=2.0°F → block."""
@@ -1913,19 +1892,19 @@ class TestQuickWinGates(unittest.TestCase):
         pb.execute_opportunity(self._opp(is_today=False, disagreement=2.0))
         self.assertEqual(len(self._captured), 1)
 
-    def test_obs_alive_bypasses_price_zone_and_h_2_0(self):
-        """Obs-confirmed-alive overrides PRICE_ZONE and H_2.0 (forecast gates)."""
+    def test_obs_alive_bypasses_h_2_0(self):
+        """Obs-confirmed-alive overrides H_2.0 forecast gate."""
         opp = self._opp(
-            yes_bid=35,                    # PRICE_ZONE territory
-            no_ask=65, no_bid=63,
-            entry_price=0.65,
+            yes_bid=20,                    # outside any price zone concern
+            no_ask=80, no_bid=78,
+            entry_price=0.80,
             is_today=False,
             disagreement=3.5,              # H_2.0 territory
             running_min=40.0,              # rm well below floor 45 → obs_alive
         )
         # Trigger obs_alive: BUY_NO + B-bracket + rm < floor−3
         pb.execute_opportunity(opp)
-        self.assertEqual(len(self._captured), 1, "obs_alive should bypass forecast gates")
+        self.assertEqual(len(self._captured), 1, "obs_alive should bypass H_2.0")
 
 
 class TestSkipLogDebounce(unittest.TestCase):

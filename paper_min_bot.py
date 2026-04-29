@@ -213,14 +213,17 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 HARD_STOP_BRACKET_LOSS_PCT = 0.80   # exit if MTM loss ≥ 80% on B-brackets
 HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery payoff)
 
-# ─── PRICE_ZONE block (V2 port, BUY_NO only) ─────────────────────────────
-# Skip BUY_NO when yes_bid ∈ [30c, 40c] — market thinks YES has 30–40% prob
-# (NO costs 60–70c, market is uncertain). V2 backtest: 50% WR / −$99 across
-# 50 trades. The market's uncertainty is a heuristic — when it doesn't lean
-# strongly either way and our model says NO with high confidence, the model
-# is usually wrong. Bypassed when _obs_confirmed_alive.
-PRICE_ZONE_LO_C = 30                # yes_bid ≥ this (cents)
-PRICE_ZONE_HI_C = 40                # yes_bid ≤ this (cents)
+# ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
+# V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").
+# Removed after all-gate audit on min_bot historical candidates: 2/2
+# PRICE_ZONE-blocked cases were winners (NYC-26APR25-B42.5 +$0.34/c,
+# ATL-26APR27-B59.5 +$0.33/c). Pattern that V2 saw on max-temp markets
+# (50% WR / −$99 / n=50) does not appear to hold for min-temp — possibly
+# because min-temp markets in the 30-40c band are pricing different signals
+# (overnight cooling vs daytime warming). Sample is small (n=2) but 100%
+# winners; the cost of keeping the gate exceeds the cost of the occasional
+# miss it might be saving us from. If a future audit flips, re-enable from
+# git history (commit before this removal).
 
 # ─── H_2.0 disagreement skip (V2-inspired, d-1+ BUY_NO only) ─────────────
 # V2's H_2.0 skips d-1 BUY_NO when NWS-HRRR diverge >2°F. min_bot has no NWS
@@ -2211,10 +2214,6 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     msg_block = _check_msg_gate(opp)
     if msg_block:
         return ("MSG", msg_block)
-    if action == "BUY_NO":
-        yb = opp.get("yes_bid")
-        if yb is not None and PRICE_ZONE_LO_C <= int(yb) <= PRICE_ZONE_HI_C:
-            return ("PRICE_ZONE", f"yes_bid {int(yb)}c in [30, 40]")
     if action == "BUY_NO" and not opp.get("is_today", False):
         disag = float(opp.get("disagreement") or 0)
         if disag > H_2_0_DISAGREE_F:
@@ -2386,17 +2385,7 @@ def execute_opportunity(opp: dict) -> bool:
         if msg_block:
             _log_skip(ticker, f"  skip {ticker}: {msg_block}")
             return False
-        # PRICE_ZONE block (V2 port, BUY_NO only). Market YES bid ∈ [30, 40]c
-        # signals "no strong directional consensus". When our model says NO
-        # with confidence in this market-uncertainty zone, the model is
-        # usually the side that's wrong (V2 backtest 50% WR / −$99 / n=50).
-        if action == "BUY_NO":
-            yb = opp.get("yes_bid")
-            if yb is not None and PRICE_ZONE_LO_C <= int(yb) <= PRICE_ZONE_HI_C:
-                _log_skip(ticker,
-                    f"  skip {ticker}: PRICE_ZONE — yes_bid {int(yb)}c in "
-                    f"[{PRICE_ZONE_LO_C}, {PRICE_ZONE_HI_C}] (market uncertain)")
-                return False
+        # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
         # have no obs to break ties between forecasts; pairwise disagreement
         # > 2°F = forecast uncertainty too high for this BUY_NO. Tighter than

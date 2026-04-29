@@ -100,7 +100,7 @@ All in `paper_min_bot.py`:
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
 | `MAX_EDGE` | `0.45` | Skip edges > 45%. Evolution: 0.40 → 0.42 (2026-04-27) → 0.55 with NBP-CLI bypass (2026-04-28 night) → **0.45 with bypass rolled back** (2026-04-29 early). Backtest on n=8 historical bypass-passers: 5/5 BUY_NO MAX_EDGE-bypass cases LOST (μ at-or-near bracket boundary — honest forecasts still landing in the wrong bracket). High apparent edge IS a real model-error signal even when NBP aligns with recent CLI. **No bypass.** |
-| **PRICE_ZONE** | `yes_bid 30-40c` | **BUY_NO only** (V2 port). Skip when market YES bid ∈ [30c, 40c] — market is uncertain (NO costs 60-70c) and our model with high BUY_NO confidence usually disagrees with the market for the wrong reasons. V2 backtest: 50% WR / −$99 / n=50. Bypassed by `_obs_confirmed_alive`. |
+| ~~PRICE_ZONE~~ | ~~yes_bid 30-40c~~ | **REMOVED 2026-04-29** after gate-audit on min_bot historical candidates: 2/2 PRICE_ZONE-blocked cases were winners (NYC-26APR25-B42.5 BUY_NO @66¢ → +$0.34/c; ATL-26APR27-B59.5 BUY_NO @67¢ → +$0.33/c). V2's max-temp finding (50% WR / −$99 / n=50) does not appear to hold for min-temp markets. Sample is small (n=2) but 100% winners and gate-cost is non-trivial; re-enable from git history if a future audit flips the signal. |
 | **H_2.0** | `disagreement 2°F` | **BUY_NO d-1+ only** (V2-inspired). Skip when pairwise forecast disagreement (NBP/HRRR/NBM max diff) > 2°F on day-1+ markets where we have no obs to break ties. Tighter than `MAX_DISAGREEMENT_F=5.0`. Bypassed by `_obs_confirmed_alive`. |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain. **Bypassed by `_nbp_consistent_with_recent_cli`** when forecast μ is within ±2°F of the station's last-7-day CLI low range. Backtest 2026-04-29: 3/3 historical bypass cases (cheap BUY_NO with mp 3-11%, μ clearly outside bracket, NBP consistent) all won — the gate was blocking legit "very confident NO" trades. Bypass kept for this gate only; same bypass on MAX_EDGE was rolled back same day after 5/5 losses. |
 | **Directional consistency** | `mp 0.40 / 0.60` | BUY_NO requires `mp ≤ 0.40`; BUY_YES requires `mp ≥ 0.60`. Don't bet against your own model. Tightened 2026-04-27 from 0.50 → 0.40/0.60 to drop coin-flip-zone entries (CHI-T41 mp=34% and NYC-T44 mp=42% were both BUY_YES losers admitted at the old 0.50 threshold). The edge formula assumes a calibrated model; with the +1.24°F NBP-cool bias, edge alone misleads when action and direction disagree. |
@@ -145,7 +145,7 @@ Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
   logging, added 2026-04-29) — `null` means the candidate would have been
   entered, otherwise the gate name (`MIN_EDGE`, `MAX_EDGE`, `MP_RANGE`,
   `DIRECTIONAL_BUY_NO`, `DIRECTIONAL_BUY_YES`, `ABS_DIST`, `F2A`, `MSG`,
-  `PRICE_ZONE`, `H_2_0`, `MAX_DISAGREEMENT`, `MU_VS_RM`, `SPREAD`,
+  `H_2_0`, `MAX_DISAGREEMENT`, `MU_VS_RM`, `SPREAD`,
   `OBS_CONFIRMED_LOSER`, `NO_ACTION`). The shadow field is populated by
   `_evaluate_gates(opp)` at candidate-record time so downstream analysis
   can ask "which gate is blocking winners?" without re-deriving gate logic.
