@@ -1769,6 +1769,20 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             # Linear inflation: 1x at 2°F disagreement, 1.5x at 5°F+
             inflation = min(1.5, 1.0 + (disagreement - 2.0) * 0.15)
             sigma = sigma * inflation
+        # NBP staleness σ inflation (V2 port, 2026-04-29). NBP cycles every
+        # ~6h; between cycles, forecast uncertainty grows. Linear ramp:
+        # +5%/h after 1h, capped at +30% (== 7h stale). Only applies when
+        # mu_source == "nbp" (i.e., d-1+ markets where we're using the cached
+        # NBP forecast directly). d-0 typically uses HRRR (refreshed hourly)
+        # so staleness isn't a concern there.
+        if mu_source == "nbp":
+            with _nbp_cache_lock:
+                _ts = _nbp_cache_ts
+            if _ts > 0:
+                age_h = (time.time() - _ts) / 3600.0
+                if age_h > 1.0:
+                    stale_mult = min(1.30, 1.0 + 0.05 * (age_h - 1.0))
+                    sigma = sigma * stale_mult
         # Per-station σ inflation (2026-04-29). Counters NBP forecasts that
         # are systematically too narrow at specific stations.
         per_series_mult = PER_SERIES_SIGMA_MULT.get(m["series"], 1.0)
