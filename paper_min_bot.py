@@ -782,6 +782,50 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
         return None
 
 
+# NEW LOW Discord alerts (2026-04-30) — mirror of V1/V2 max-bot's "NEW HIGH"
+# pattern. Min-bot doesn't write running_min itself (obs-pipeline does), so we
+# poll here once per scan and emit on a downward step. State is per-station,
+# (cd, last_rm_seen). A new climate day resets the baseline (no alert on the
+# very first obs of a new cd, since rm there is "highest seen so far" in the
+# new day, not actually a low). Threshold 0.1°F filters float noise; the
+# integer-rounded `iem_currents` source rounds to whole °F so an actual new
+# low always crosses 0.1°F.
+_last_rm_seen: dict[str, tuple[str, float]] = {}
+NEW_LOW_THRESHOLD_F = 0.1
+
+
+def _check_new_low_alerts() -> None:
+    """Poll running_min for all 20 stations; Discord-alert on new daily lows.
+    Called from scan_cycle. State persists in module-global `_last_rm_seen`."""
+    for series, info in CITIES.items():
+        station = info["station"]
+        label = info["label"]
+        tz = info["tz"]
+        cd = _climate_date_nws(tz)
+        rm = get_running_min(station, cd)
+        if rm is None:
+            continue
+        prev = _last_rm_seen.get(station)
+        if prev is None or prev[0] != cd:
+            # First sighting OR new climate day — establish baseline, no alert.
+            # On cd rollover, the first obs of the new day is "the only obs so
+            # far" and isn't really a "new low" against history.
+            _last_rm_seen[station] = (cd, rm)
+            continue
+        prev_cd, prev_rm = prev
+        if rm < prev_rm - NEW_LOW_THRESHOLD_F:
+            drop = prev_rm - rm
+            discord_send(
+                f"❄️ **NEW LOW** {label} ({station}): "
+                f"{prev_rm:.1f}°F → {rm:.1f}°F (Δ −{drop:.1f}°F)"
+            )
+            _last_rm_seen[station] = (cd, rm)
+        elif rm != prev_rm:
+            # rm shouldn't increase given lowest-wins semantics, but absorb
+            # source-disagreement edge cases without alerting.
+            _last_rm_seen[station] = (cd, rm)
+
+
 def get_latest_obs(station: str) -> Optional[dict]:
     """Latest observation (temp_f, obs_time) from obs-pipeline — used for
     current-temperature snapshot and model sigma collapse decisions."""
@@ -3324,6 +3368,13 @@ def scan_cycle() -> dict:
     _reset_cycle_budget()  # zero per-cycle counter; rolls daily exposure at UTC midnight
     stats = {"settled": 0, "markets": 0, "candidates": 0, "opps": 0, "taken": 0}
     stats["settled"] = check_settlements()
+
+    # New-low Discord alerts — poll running_min for all 20 stations and
+    # emit on downward steps. Mirrors V1/V2 max-bot's "NEW HIGH" alerts.
+    try:
+        _check_new_low_alerts()
+    except Exception as e:
+        log(f"  new-low alert check failed: {e}", "warn")
 
     # NBP refresh: HEAD-poll trigger (2026-04-30). Probes next-expected cycle
     # URL on S3 once per scan past cycle+70min; full GET only when HEAD=200.

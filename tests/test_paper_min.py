@@ -3041,5 +3041,124 @@ class TestNBPPollerStart(unittest.TestCase):
         self.assertEqual(before, after)
 
 
+class TestNewLowDiscordAlerts(unittest.TestCase):
+    """`_check_new_low_alerts()` mirrors V1/V2 max-bot's NEW HIGH pattern,
+    polling running_min and emitting Discord on a downward step."""
+
+    def setUp(self):
+        # Snapshot + clear module state so each test starts fresh.
+        self._saved_state = dict(pb._last_rm_seen)
+        pb._last_rm_seen.clear()
+        # Mock get_running_min to a controllable per-station map
+        self._rm_map: dict[tuple[str, str], float] = {}
+        self._orig_get_rm = pb.get_running_min
+        def fake_get_rm(station, cd):
+            return self._rm_map.get((station, cd))
+        pb.get_running_min = fake_get_rm
+        # Mock _climate_date_nws to return a fixed date (avoid TZ flakiness)
+        self._orig_cd = pb._climate_date_nws
+        pb._climate_date_nws = lambda tz, now_utc=None: "2026-04-30"
+        # Capture discord_send calls
+        self._discord_msgs: list[str] = []
+        self._orig_discord = pb.discord_send
+        pb.discord_send = lambda msg: self._discord_msgs.append(msg)
+
+    def tearDown(self):
+        pb._last_rm_seen.clear()
+        pb._last_rm_seen.update(self._saved_state)
+        pb.get_running_min = self._orig_get_rm
+        pb._climate_date_nws = self._orig_cd
+        pb.discord_send = self._orig_discord
+
+    def test_first_sighting_no_alert(self):
+        # Fresh start, first rm seen — establish baseline, no Discord.
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-04-30")] = 60.0
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+        self.assertEqual(len(pb._last_rm_seen), 20)
+
+    def test_drop_fires_alert(self):
+        # Establish baseline, then drop one station's rm by 1.5°F.
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-04-30")] = 50.0
+        pb._check_new_low_alerts()  # baseline
+        self.assertEqual(self._discord_msgs, [])
+        # Drop KAUS only
+        self._rm_map[("KAUS", "2026-04-30")] = 48.5
+        pb._check_new_low_alerts()
+        self.assertEqual(len(self._discord_msgs), 1)
+        msg = self._discord_msgs[0]
+        self.assertIn("KAUS", msg)
+        self.assertIn("Austin", msg)
+        self.assertIn("50.0°F", msg)
+        self.assertIn("48.5°F", msg)
+        self.assertIn("−1.5°F", msg)
+
+    def test_below_threshold_no_alert(self):
+        # 0.05°F change is below NEW_LOW_THRESHOLD_F (0.1); shouldn't alert.
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-04-30")] = 50.0
+        pb._check_new_low_alerts()
+        self._rm_map[("KAUS", "2026-04-30")] = 49.95
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+
+    def test_cd_rollover_resets_baseline(self):
+        # Baseline at 50.0 on Apr 30. Roll to May 1 with new rm 55.0 — must
+        # NOT alert (new cd, fresh baseline). And should not regress on a
+        # later May 1 drop check.
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-04-30")] = 50.0
+        pb._check_new_low_alerts()  # baseline Apr 30
+        # Switch climate date
+        pb._climate_date_nws = lambda tz, now_utc=None: "2026-05-01"
+        # First obs of new cd is 55.0 (would be a "rise" against Apr 30 50.0,
+        # but the cd guard should prevent any alert and reset baseline).
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-05-01")] = 55.0
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+        # Drop on May 1 → alert
+        self._rm_map[("KAUS", "2026-05-01")] = 53.0
+        pb._check_new_low_alerts()
+        self.assertEqual(len(self._discord_msgs), 1)
+        self.assertIn("55.0°F", self._discord_msgs[0])
+        self.assertIn("53.0°F", self._discord_msgs[0])
+
+    def test_increase_no_alert_but_state_updates(self):
+        # rm "rising" can happen briefly during source disagreement / clock
+        # skew. Don't alert, but absorb the new value to avoid stale baseline.
+        for series, info in pb.CITIES.items():
+            self._rm_map[(info["station"], "2026-04-30")] = 50.0
+        pb._check_new_low_alerts()
+        self._rm_map[("KAUS", "2026-04-30")] = 51.0
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+        # State should now hold 51.0, so a subsequent drop to 49.0 is a 2°F drop.
+        self.assertEqual(pb._last_rm_seen["KAUS"], ("2026-04-30", 51.0))
+        self._rm_map[("KAUS", "2026-04-30")] = 49.0
+        pb._check_new_low_alerts()
+        self.assertEqual(len(self._discord_msgs), 1)
+        self.assertIn("−2.0°F", self._discord_msgs[0])
+
+    def test_missing_rm_skipped(self):
+        # If get_running_min returns None for a station (no obs yet), don't
+        # crash and don't establish baseline — keep waiting for first real obs.
+        # All other stations get a baseline.
+        for series, info in pb.CITIES.items():
+            if info["station"] != "KSEA":
+                self._rm_map[(info["station"], "2026-04-30")] = 50.0
+            # KSEA absent
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+        self.assertNotIn("KSEA", pb._last_rm_seen)
+        # Now KSEA gets first obs at 47 → no alert (first sighting)
+        self._rm_map[("KSEA", "2026-04-30")] = 47.0
+        pb._check_new_low_alerts()
+        self.assertEqual(self._discord_msgs, [])
+        self.assertEqual(pb._last_rm_seen["KSEA"], ("2026-04-30", 47.0))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

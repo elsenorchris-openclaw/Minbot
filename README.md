@@ -176,10 +176,18 @@ Set `WALLET = "v2"` for the obs-pipeline-bot's secondary account
 
 ## Discord notifications
 
-- Channel `1497464077608550570` receives `ENTRY` and `SETTLED` messages.
+- Channel `1497464077608550570` receives `ENTRY`, `SETTLED`, and `❄️ NEW LOW`
+  messages.
 - Bot token comes from `DISCORD_BOT_TOKEN` in `~/.env` (same token V1/V2 use;
   must already be a member of the channel).
 - One bounded queue + one worker thread; non-blocking; drops on overflow.
+- **NEW LOW alerts** (2026-04-30): on each scan, `_check_new_low_alerts()`
+  polls running_min for all 20 stations and emits `❄️ NEW LOW <city> (<icao>):
+  X°F → Y°F (Δ −Z°F)` whenever rm drops by ≥ `NEW_LOW_THRESHOLD_F` (0.1°F)
+  vs the last seen value. State is per-station; cd rollover resets the
+  baseline so the first obs of a new climate day doesn't false-fire. Mirrors
+  V1/V2 max-bot's `NEW HIGH` pattern. Detection latency = scan interval (60s
+  normal / 15s pre-dawn) + obs-pipeline lag (~9 min p50 from `madis_fsl2`).
 
 ## Data dir
 
