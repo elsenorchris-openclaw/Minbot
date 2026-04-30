@@ -363,25 +363,23 @@ class TestPerEventCascade(unittest.TestCase):
         self.assertEqual(pb._open_count_for_event(""), 0)
 
 
-class TestCooldowns(unittest.TestCase):
-    """Cooldown helpers ported from V2 H-2 fix."""
+class TestNoUnnecessaryCooldownsInOrderPath(unittest.TestCase):
+    """2026-04-30: removed _paused_cooldown + _insufficient_balance_cooldown
+    helpers per `feedback_no_unnecessary_cooldowns.md`. Verify the symbols
+    are gone and the order-placement path no longer references them — so a
+    future refactor can't silently re-introduce a hammer-throttle."""
 
-    def setUp(self):
-        with pb._cooldown_lock:
-            pb._paused_tickers.clear()
-        pb._insufficient_balance_until = 0.0
+    def test_paused_cooldown_helpers_removed(self):
+        self.assertFalse(hasattr(pb, "_in_paused_cooldown"))
+        self.assertFalse(hasattr(pb, "_set_paused_cooldown"))
+        self.assertFalse(hasattr(pb, "_paused_tickers"))
+        self.assertFalse(hasattr(pb, "PAUSED_COOLDOWN_SEC"))
 
-    def test_paused_cooldown(self):
-        self.assertFalse(pb._in_paused_cooldown("KXLOWTNYC-26APR25-T45"))
-        pb._set_paused_cooldown("KXLOWTNYC-26APR25-T45")
-        self.assertTrue(pb._in_paused_cooldown("KXLOWTNYC-26APR25-T45"))
-        # Other tickers unaffected
-        self.assertFalse(pb._in_paused_cooldown("KXLOWTCHI-26APR25-T45"))
-
-    def test_insufficient_balance_cooldown(self):
-        self.assertFalse(pb._in_insufficient_balance_cooldown())
-        pb._set_insufficient_balance_cooldown()
-        self.assertTrue(pb._in_insufficient_balance_cooldown())
+    def test_insufficient_balance_cooldown_helpers_removed(self):
+        self.assertFalse(hasattr(pb, "_in_insufficient_balance_cooldown"))
+        self.assertFalse(hasattr(pb, "_set_insufficient_balance_cooldown"))
+        self.assertFalse(hasattr(pb, "_insufficient_balance_until"))
+        self.assertFalse(hasattr(pb, "INSUFFICIENT_BALANCE_COOLDOWN_SEC"))
 
 
 class TestLiveSafetyConstants(unittest.TestCase):

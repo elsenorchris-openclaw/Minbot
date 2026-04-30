@@ -661,12 +661,12 @@ def get_kalshi_balance() -> Optional[float]:
 def place_kalshi_order(ticker: str, side: str, count: int,
                        price_cents: int) -> Optional[str]:
     """Place a limit BUY at price_cents. Returns order_id or None on failure.
-    Ports V2's 409-trading_paused + 400-insufficient_balance cooldown handling
-    (V2 H-2 fix 2026-04-16; without it V1 logged 11k retries in one day)."""
-    if _in_paused_cooldown(ticker):
-        return None
-    if _in_insufficient_balance_cooldown():
-        return None
+
+    2026-04-30: removed 409 trading_is_paused and 400 insufficient_balance
+    cooldowns. Per `feedback_no_unnecessary_cooldowns.md`: speed > politeness;
+    cost of retry is one HTTP RTT and a log line, no fee, no fill. Faster
+    retry = faster fill the moment Kalshi unpauses or a balance refresh
+    (every 60s) repopulates the cache."""
     body = {
         "ticker": ticker, "action": "buy", "side": side,
         "type": "limit", "count": count,
@@ -683,11 +683,6 @@ def place_kalshi_order(ticker: str, side: str, count: int,
         log(f"  ORDER buy {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
         return oid
     except Exception as e:
-        emsg = str(e).lower()
-        if "409" in str(e) or "trading is paused" in emsg or "trading_is_paused" in emsg:
-            _set_paused_cooldown(ticker)
-        elif "insufficient_balance" in emsg or "insufficient balance" in emsg:
-            _set_insufficient_balance_cooldown()
         log(f"  ORDER FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
         return None
 
@@ -697,8 +692,6 @@ def place_kalshi_sell_order(ticker: str, side: str, count: int,
     """Place a limit SELL at price_cents. Used by hard-stop exits.
     `side` is the side we currently HOLD (e.g. 'no' if we hold BUY_NO).
     Returns order_id or None on failure."""
-    if _in_paused_cooldown(ticker):
-        return None
     body = {
         "ticker": ticker, "action": "sell", "side": side,
         "type": "limit", "count": count,
@@ -715,9 +708,6 @@ def place_kalshi_sell_order(ticker: str, side: str, count: int,
         log(f"  ORDER sell {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
         return oid
     except Exception as e:
-        emsg = str(e).lower()
-        if "409" in str(e) or "trading is paused" in emsg or "trading_is_paused" in emsg:
-            _set_paused_cooldown(ticker)
         log(f"  SELL FAILED {ticker} {side} {count}@{price_cents}c: {e}", "error")
         return None
 
@@ -1374,48 +1364,87 @@ def get_nbp_forecast(series: str, date_str: str) -> Optional[dict]:
 
 _nbm_om_cache: dict[str, dict] = {}
 _nbm_om_cache_lock = threading.Lock()
-NBM_OM_TTL_SEC = 3600      # refresh hourly
+NBM_OM_TTL_SEC = 3600      # refresh hourly (best_match doesn't have a tight pub window)
 
 _hrrr_cache: dict[str, dict] = {}
 _hrrr_cache_lock = threading.Lock()
-HRRR_TTL_SEC = 600         # refresh every 10 min; HRRR updates hourly
+# 2026-04-30 (Plan C): tightened from 600s → 60s general with 5s during HH:43-55
+# UTC pub window. HRRR new runs land at HH:43-55 each hour from NCEP via Open-Meteo,
+# so polling fast inside the window catches the new run within 5s. Outside the
+# window the upstream data isn't changing — 60s is plenty. Combined with batched
+# fetches (20 cities → 1 request) this matches V2's HRRR detection latency at
+# ~5,500 calls/day vs the previous 2,880/day per-city (~2× cost for ~120× speed).
+HRRR_TTL_SEC = 60          # general TTL outside HH:43-55
+HRRR_TTL_SEC_NEW_RUN_WINDOW = 5  # tighter TTL during HH:43-55 UTC
 
 
-def _fetch_open_meteo_daily_min(model: str, cache: dict, cache_lock: threading.Lock,
-                                  label: str) -> None:
-    """Generic Open-Meteo daily min fetcher. Shared by NBM + HRRR."""
-    for series, meta in CITIES.items():
-        try:
-            r = httpx.get(
-                "https://api.open-meteo.com/v1/forecast",
-                params={
-                    "latitude": meta["lat"], "longitude": meta["lon"],
-                    "models": model,
-                    "daily": "temperature_2m_min",
-                    "temperature_unit": "fahrenheit",
-                    "timezone": meta["tz"],
-                    "forecast_days": 3,
-                },
-                timeout=10.0,
-            )
-            r.raise_for_status()
-            data = r.json()
-            daily = data.get("daily", {})
-            dates = daily.get("time", [])
-            mins = daily.get("temperature_2m_min", [])
-            by_date = {}
-            for d, m in zip(dates, mins):
-                if m is not None:
-                    by_date[d] = {"min_f": float(m), "fetched": time.time()}
+def _hrrr_dynamic_ttl() -> int:
+    """Current HRRR cache TTL based on UTC clock. During HH:43-55 (when a new
+    HRRR run is being published from NCEP via Open-Meteo) use the tighter TTL
+    to detect new runs ~5s after they're available; otherwise the baseline."""
+    minute = datetime.now(timezone.utc).minute
+    if 43 <= minute <= 55:
+        return HRRR_TTL_SEC_NEW_RUN_WINDOW
+    return HRRR_TTL_SEC
+
+
+def _fetch_open_meteo_batched(url: str, model: str, daily_var: str,
+                               cache: dict, cache_lock: threading.Lock,
+                               label: str, apikey: Optional[str] = None) -> None:
+    """Multi-location batched Open-Meteo fetch. One HTTP request returns data
+    for all 20 cities (vs the previous per-city loop = 20× fewer requests).
+    Open-Meteo accepts comma-separated lat/lon and returns a list of result
+    objects in input order; with timezone=auto each result carries its own
+    local timezone."""
+    lats = ",".join(str(m["lat"]) for m in CITIES.values())
+    lons = ",".join(str(m["lon"]) for m in CITIES.values())
+    params = {
+        "latitude": lats, "longitude": lons,
+        "models": model,
+        "daily": daily_var,
+        "temperature_unit": "fahrenheit",
+        "timezone": "auto",
+        "forecast_days": 3,
+    }
+    if apikey:
+        params["apikey"] = apikey
+    try:
+        r = httpx.get(url, params=params, timeout=15.0)
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log(f"  {label} batched fetch failed: {e}", "warn")
+        return
+    if not isinstance(data, list):
+        data = [data]
+    fetched = 0
+    now_ts = time.time()
+    for series, city_data in zip(CITIES.keys(), data):
+        daily = city_data.get("daily", {}) if isinstance(city_data, dict) else {}
+        dates = daily.get("time", []) or []
+        mins = daily.get(daily_var, []) or []
+        by_date = {}
+        for d, m in zip(dates, mins):
+            if m is not None:
+                by_date[d] = {"min_f": float(m), "fetched": now_ts}
+        if by_date:
             with cache_lock:
                 cache[series] = by_date
-        except Exception as e:
-            log(f"  {label} fetch {series}: {e}", "warn")
+            fetched += 1
+    if fetched:
+        log(f"  {label}: {fetched}/{len(CITIES)} cities (1 batched req)")
 
 
 def refresh_nbm_om_forecasts() -> None:
-    """Fetch NBM daily min via Open-Meteo for all 20 cities."""
-    _fetch_open_meteo_daily_min("best_match", _nbm_om_cache, _nbm_om_cache_lock, "NBM-OM")
+    """Fetch best_match daily min via Open-Meteo (batched, free endpoint)."""
+    _fetch_open_meteo_batched(
+        "https://api.open-meteo.com/v1/forecast",
+        model="best_match",
+        daily_var="temperature_2m_min",
+        cache=_nbm_om_cache,
+        cache_lock=_nbm_om_cache_lock,
+        label="NBM-OM",
+    )
 
 
 # Open-Meteo paid endpoint — required for HRRR access. Same key as V1/V2.
@@ -1438,11 +1467,15 @@ def _load_open_meteo_key() -> None:
 
 def refresh_hrrr_forecasts() -> None:
     """Fetch HRRR hourly temperatures via Open-Meteo's PAID endpoint
-    (customer-api.open-meteo.com) using `models=hrrr_conus`. Computes daily
-    min from hourly trajectory. Free endpoint does NOT support HRRR.
+    (customer-api.open-meteo.com) using `models=ncep_hrrr_conus`. Computes
+    daily min from hourly trajectory. Free endpoint does NOT support HRRR.
 
     HRRR is high-res (3km), updates hourly, ~48h horizon — best available
     nowcast for upcoming overnight lows.
+
+    2026-04-30 (Plan C): batched 20 cities into 1 request and dynamic TTL
+    (60s general / 5s during HH:43-55 UTC pub window). 20× fewer requests
+    per refresh, ~5s detection latency for new HRRR runs (vs prior ~10min).
     """
     global _HRRR_DISABLED
     if _HRRR_DISABLED:
@@ -1453,49 +1486,56 @@ def refresh_hrrr_forecasts() -> None:
         log("  HRRR disabled: OPEN_METEO_API_KEY not in .env", "warn")
         return
 
-    paid_url = "https://customer-api.open-meteo.com/v1/forecast"
+    lats = ",".join(str(m["lat"]) for m in CITIES.values())
+    lons = ",".join(str(m["lon"]) for m in CITIES.values())
+    try:
+        r = httpx.get(
+            "https://customer-api.open-meteo.com/v1/forecast",
+            params={
+                "latitude": lats, "longitude": lons,
+                "models": "ncep_hrrr_conus", "hourly": "temperature_2m",
+                "temperature_unit": "fahrenheit",
+                "timezone": "auto",
+                "forecast_days": 3,
+                "apikey": _OPEN_METEO_API_KEY,
+            },
+            timeout=15.0,
+        )
+        if r.status_code in (401, 403):
+            _HRRR_DISABLED = True
+            log(f"  HRRR disabled: paid endpoint auth failed ({r.status_code})", "warn")
+            return
+        r.raise_for_status()
+        data = r.json()
+    except Exception as e:
+        log(f"  HRRR batched fetch failed: {e}", "warn")
+        return
+    if not isinstance(data, list):
+        data = [data]
+    now_ts = time.time()
     fetched_count = 0
-    for series, meta in CITIES.items():
-        try:
-            r = httpx.get(
-                paid_url,
-                params={
-                    "latitude": meta["lat"], "longitude": meta["lon"],
-                    "models": "ncep_hrrr_conus", "hourly": "temperature_2m",
-                    "temperature_unit": "fahrenheit",
-                    "timezone": meta["tz"],
-                    "forecast_days": 3,
-                    "apikey": _OPEN_METEO_API_KEY,
-                },
-                timeout=10.0,
-            )
-            if r.status_code == 401 or r.status_code == 403:
-                _HRRR_DISABLED = True
-                log(f"  HRRR disabled: paid endpoint auth failed ({r.status_code})", "warn")
-                return
-            r.raise_for_status()
-            data = r.json()
-            hourly = data.get("hourly", {})
-            times = hourly.get("time", [])
-            temps = hourly.get("temperature_2m", [])
-            by_date: dict[str, float] = {}
-            for t, temp in zip(times, temps):
-                if temp is None:
-                    continue
-                date_str = t[:10]
-                if date_str not in by_date or temp < by_date[date_str]:
-                    by_date[date_str] = float(temp)
-            if by_date:
-                with _hrrr_cache_lock:
-                    _hrrr_cache[series] = {
-                        d: {"min_f": v, "fetched": time.time()}
-                        for d, v in by_date.items()
-                    }
-                fetched_count += 1
-        except Exception as e:
-            log(f"  HRRR fetch {series}: {e}", "warn")
+    for series, city_data in zip(CITIES.keys(), data):
+        if not isinstance(city_data, dict):
+            continue
+        hourly = city_data.get("hourly", {})
+        times = hourly.get("time", []) or []
+        temps = hourly.get("temperature_2m", []) or []
+        by_date: dict[str, float] = {}
+        for t, temp in zip(times, temps):
+            if temp is None:
+                continue
+            date_str = t[:10]
+            if date_str not in by_date or temp < by_date[date_str]:
+                by_date[date_str] = float(temp)
+        if by_date:
+            with _hrrr_cache_lock:
+                _hrrr_cache[series] = {
+                    d: {"min_f": v, "fetched": now_ts}
+                    for d, v in by_date.items()
+                }
+            fetched_count += 1
     if fetched_count:
-        log(f"  HRRR: fetched {fetched_count}/{len(CITIES)} cities (paid Open-Meteo)")
+        log(f"  HRRR: {fetched_count}/{len(CITIES)} cities (1 batched req)")
 
 
 def get_nbm_om_min(series: str, date_str: str) -> Optional[float]:
@@ -1522,14 +1562,20 @@ def get_hrrr_min(series: str, date_str: str) -> Optional[float]:
     if not entry:
         return None
     age_s = time.time() - entry.get("fetched", 0)
-    if age_s > HRRR_TTL_SEC * 3:
+    # 2026-04-30: HRRR has ~hourly publication cadence regardless of cache TTL.
+    # Block-served threshold scales off the 60s general TTL but keeps a
+    # generous 30-minute window to tolerate a missed pub or a brief
+    # Open-Meteo outage. Stale-served alert fires when we cross 5 minutes
+    # (the prior "standard" served-stale threshold), so degraded refresh
+    # surfaces visibly without flooding Discord during the normal hourly
+    # gap between pub windows.
+    _block_threshold_s = 1800        # 30 min (was HRRR_TTL_SEC * 3 = 30 min before retune)
+    _stale_threshold_s = 300         # 5 min (was HRRR_TTL_SEC = 10 min before retune)
+    if age_s > _block_threshold_s:
         return None
-    # 2026-04-29: HRRR stale-but-served alert. TTL=10min; *3 fallback (30min)
-    # means up to 30min-old HRRR is served when refresh fails. Alert when
-    # we cross the standard TTL.
-    if age_s > HRRR_TTL_SEC:
-        _stale_cache_alert("HRRR", series, age_s, HRRR_TTL_SEC,
-                            HRRR_TTL_SEC * 3)
+    if age_s > _stale_threshold_s:
+        _stale_cache_alert("HRRR", series, age_s, _stale_threshold_s,
+                            _block_threshold_s)
     return float(entry["min_f"])
 
 
@@ -2344,14 +2390,16 @@ _cycle_new_count = 0                          # reset each cycle
 _today_exposure_usd = 0.0                     # cost of today's entries
 _today_date_utc: str = ""                     # tracks UTC midnight rollover
 
-# Per-ticker cooldowns ported from V2 (H-2 fix 2026-04-16): if Kalshi 409s a
-# market with "trading_is_paused", or 400s the account with insufficient_balance,
-# stop hammering it for a window. Without this V1 had an 11k retry storm.
-_cooldown_lock = threading.Lock()
-_paused_tickers: dict[str, float] = {}        # ticker → unix-time when cooldown ends
-_insufficient_balance_until: float = 0.0      # account-wide; 0 = no cooldown
-PAUSED_COOLDOWN_SEC = 60.0
-INSUFFICIENT_BALANCE_COOLDOWN_SEC = 300.0     # 5 min, since the bankroll is small
+# 2026-04-30: per-ticker paused cooldown + account-wide insufficient_balance
+# cooldown removed. Per `feedback_no_unnecessary_cooldowns.md`: don't add
+# cooldowns/sleeps unless they prevent actual harm. Cost of retry on 409
+# (trading_is_paused) is one HTTP RTT + log line — no fee, no fill, no rate-
+# limit penalty observed. Faster retry = faster fill the moment Kalshi
+# unpauses. Insufficient_balance self-recovers within 60s via the bankroll
+# cache refresh, so a 5-min cooldown only delayed recovery without saving
+# anything. The 11k-retry storm the original V2 H-2 fix was protecting
+# against was a different bug (V1 didn't have the cycle-aligned scan loop
+# that bounds retries to one per scan).
 
 
 def _reset_cycle_budget() -> None:
@@ -2399,27 +2447,6 @@ def _budget_record(cost_usd: float, event_ticker: str = "") -> None:
     with _cycle_budget_lock:
         _cycle_new_count += 1
         _today_exposure_usd += cost_usd
-
-
-def _in_paused_cooldown(ticker: str) -> bool:
-    with _cooldown_lock:
-        until = _paused_tickers.get(ticker, 0.0)
-    return time.time() < until
-
-
-def _set_paused_cooldown(ticker: str) -> None:
-    with _cooldown_lock:
-        _paused_tickers[ticker] = time.time() + PAUSED_COOLDOWN_SEC
-
-
-def _in_insufficient_balance_cooldown() -> bool:
-    return time.time() < _insufficient_balance_until
-
-
-def _set_insufficient_balance_cooldown() -> None:
-    global _insufficient_balance_until
-    _insufficient_balance_until = time.time() + INSUFFICIENT_BALANCE_COOLDOWN_SEC
-    log(f"  insufficient_balance cooldown set for {INSUFFICIENT_BALANCE_COOLDOWN_SEC:.0f}s", "warn")
 
 
 def _compute_today_exposure() -> float:
@@ -3487,9 +3514,12 @@ def scan_cycle() -> dict:
     except Exception as e:
         log(f"  NBM-OM refresh failed: {e}", "warn")
 
-    # HRRR refresh — more frequent (10-min TTL) since HRRR updates hourly
+    # HRRR refresh — dynamic TTL (60s general / 5s during HH:43-55 pub window).
+    # Inside the pub window the loop will trigger a fresh fetch ~5s after the
+    # previous one, catching new NCEP runs as soon as Open-Meteo has them.
     try:
         need_refresh = False
+        _hrrr_ttl_now = _hrrr_dynamic_ttl()
         with _hrrr_cache_lock:
             for series in CITIES:
                 entries = _hrrr_cache.get(series, {})
@@ -3497,7 +3527,7 @@ def scan_cycle() -> dict:
                     need_refresh = True
                     break
                 newest = max((e.get("fetched", 0) for e in entries.values()), default=0)
-                if time.time() - newest > HRRR_TTL_SEC:
+                if time.time() - newest > _hrrr_ttl_now:
                     need_refresh = True
                     break
         if need_refresh:
