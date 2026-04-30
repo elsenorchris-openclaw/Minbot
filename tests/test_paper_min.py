@@ -2958,5 +2958,88 @@ class TestNBPCacheCycleDtPersistence(unittest.TestCase):
         self.assertIsNone(pb._nbp_cache_cycle_dt)
 
 
+class TestNBPPollerInterval(unittest.TestCase):
+    """`_nbp_poll_interval_sec()` adapts to the cycle publish window."""
+
+    def setUp(self):
+        self._saved_cycle = pb._nbp_cache_cycle_dt
+
+    def tearDown(self):
+        pb._nbp_cache_cycle_dt = self._saved_cycle
+
+    def test_cold_start_ticks_active(self):
+        # No cycle pointer yet — first boot should poll fast.
+        pb._nbp_cache_cycle_dt = None
+        self.assertEqual(pb._nbp_poll_interval_sec(), pb.NBP_POLL_TICK_ACTIVE_SEC)
+
+    def test_inside_window_ticks_active(self):
+        # Cycle 80 min past nominal next-cycle time → publish window is open.
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(minutes=80)
+        self.assertEqual(pb._nbp_poll_interval_sec(), pb.NBP_POLL_TICK_ACTIVE_SEC)
+
+    def test_too_early_ticks_idle(self):
+        # Just fetched cycle — next cycle is 6h away. Idle.
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now
+        self.assertEqual(pb._nbp_poll_interval_sec(), pb.NBP_POLL_TICK_IDLE_SEC)
+
+    def test_window_ended_ticks_idle(self):
+        # 5h past next-cycle nominal → window has closed (>240min). Idle.
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(hours=5)
+        self.assertEqual(pb._nbp_poll_interval_sec(), pb.NBP_POLL_TICK_IDLE_SEC)
+
+
+class TestNBPRefreshLockSerializes(unittest.TestCase):
+    """`refresh_nbp_forecasts()` is non-blocking-locked so a poller fetch and
+    a scan-loop fetch can't both pull the 33MB bulletin."""
+
+    def test_concurrent_caller_returns_immediately(self):
+        # Hold the lock from this thread; reentrant call must bail out
+        # without invoking _nbp_fetch_latest_bulletin.
+        called = {"n": 0}
+        orig_fetch = pb._nbp_fetch_latest_bulletin
+        def watcher():
+            called["n"] += 1
+            return None
+        pb._nbp_fetch_latest_bulletin = watcher
+
+        try:
+            self.assertTrue(pb._nbp_refresh_lock.acquire(blocking=False))
+            try:
+                pb.refresh_nbp_forecasts()      # should hit the bail-out
+                self.assertEqual(called["n"], 0)
+            finally:
+                pb._nbp_refresh_lock.release()
+
+            # After release, calling again should reach the fetcher.
+            pb.refresh_nbp_forecasts()
+            self.assertEqual(called["n"], 1)
+        finally:
+            pb._nbp_fetch_latest_bulletin = orig_fetch
+
+
+class TestNBPPollerStart(unittest.TestCase):
+    """`_start_nbp_poller()` spins exactly one daemon thread, even on
+    repeated calls (deploy / test setup safety)."""
+
+    def setUp(self):
+        self._saved_started = pb._nbp_poller_started
+
+    def tearDown(self):
+        pb._nbp_poller_started = self._saved_started
+
+    def test_idempotent_start(self):
+        # Pretend the daemon was already started. Calling _start_nbp_poller
+        # again must NOT spawn another thread.
+        pb._nbp_poller_started = True
+        import threading as _t
+        before = _t.active_count()
+        pb._start_nbp_poller()
+        after = _t.active_count()
+        self.assertEqual(before, after)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

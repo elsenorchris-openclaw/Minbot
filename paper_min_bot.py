@@ -1116,26 +1116,42 @@ def _nbp_fetch_latest_bulletin() -> Optional[tuple[str, int, str]]:
     return None
 
 
+# Non-reentrant lock around the full fetch+parse+commit. Held only by the
+# thread doing real work; concurrent callers (poller daemon vs scan loop)
+# bail out instead of double-fetching the 33MB bulletin.
+_nbp_refresh_lock = threading.Lock()
+
+
 def refresh_nbp_forecasts() -> None:
-    """Fetch NBP bulletin + parse + update cache. Idempotent; call periodically."""
-    global _nbp_cache, _nbp_cache_ts, _nbp_cache_cycle_dt
-    fetched = _nbp_fetch_latest_bulletin()
-    if not fetched:
-        log("  NBP: fetch failed — keeping stale cache", "warn")
+    """Fetch NBP bulletin + parse + update cache. Idempotent; call periodically.
+
+    Non-blocking guard: if another thread is already inside this function,
+    return immediately. The 33MB GET takes 1–3s and we don't want the
+    poller-daemon and the scan-loop to race-fetch the same cycle.
+    """
+    if not _nbp_refresh_lock.acquire(blocking=False):
         return
-    text, cycle_hour, bulletin_date = fetched
-    parsed = _nbp_parse_bulletin(text, cycle_hour, bulletin_date)
-    cycle_dt = datetime(
-        int(bulletin_date[:4]), int(bulletin_date[4:6]), int(bulletin_date[6:8]),
-        cycle_hour, tzinfo=timezone.utc,
-    )
-    with _nbp_cache_lock:
-        for st, dates in parsed.items():
-            _nbp_cache.setdefault(st, {}).update(dates)
-        _nbp_cache_ts = time.time()
-        _nbp_cache_cycle_dt = cycle_dt
-    _save_nbp_cache_to_disk()
-    log(f"  NBP: parsed {len(parsed)} stations (cycle {bulletin_date}/{cycle_hour:02d}z)")
+    try:
+        global _nbp_cache, _nbp_cache_ts, _nbp_cache_cycle_dt
+        fetched = _nbp_fetch_latest_bulletin()
+        if not fetched:
+            log("  NBP: fetch failed — keeping stale cache", "warn")
+            return
+        text, cycle_hour, bulletin_date = fetched
+        parsed = _nbp_parse_bulletin(text, cycle_hour, bulletin_date)
+        cycle_dt = datetime(
+            int(bulletin_date[:4]), int(bulletin_date[4:6]), int(bulletin_date[6:8]),
+            cycle_hour, tzinfo=timezone.utc,
+        )
+        with _nbp_cache_lock:
+            for st, dates in parsed.items():
+                _nbp_cache.setdefault(st, {}).update(dates)
+            _nbp_cache_ts = time.time()
+            _nbp_cache_cycle_dt = cycle_dt
+        _save_nbp_cache_to_disk()
+        log(f"  NBP: parsed {len(parsed)} stations (cycle {bulletin_date}/{cycle_hour:02d}z)")
+    finally:
+        _nbp_refresh_lock.release()
 
 
 def _nbp_next_cycle_available() -> bool:
@@ -1183,6 +1199,65 @@ def _nbp_next_cycle_available() -> bool:
     except Exception:
         return False
     return r.status_code == 200
+
+
+# Tick intervals for the background NBP poller daemon. 5s during the
+# active publish window collapses worst-case detection latency from ~60s
+# (scan-loop interval) to ~5s. 60s outside the window keeps the loop
+# responsive to clock changes and pointer updates without burning resources.
+NBP_POLL_TICK_ACTIVE_SEC = 5.0
+NBP_POLL_TICK_IDLE_SEC = 60.0
+# Active window opens at cycle+60min and closes at cycle+240min. Outside
+# the window the daemon idles at IDLE tick. The scan loop's own
+# `_nbp_next_cycle_available()` call still covers cycles that publish
+# beyond +240min (NCEP outage).
+NBP_POLL_WINDOW_START_MIN = 60
+NBP_POLL_WINDOW_END_MIN = 240
+
+
+def _nbp_poll_interval_sec() -> float:
+    """Return the tick interval the poller daemon should sleep for.
+    Active-window pace (5s) once we're past cycle+60min, idle pace (60s)
+    otherwise. Cold start (no cycle pointer yet) ticks at active pace so
+    a fresh boot doesn't sit idle for 60s before its first probe."""
+    with _nbp_cache_lock:
+        last_cycle = _nbp_cache_cycle_dt
+    if last_cycle is None:
+        return NBP_POLL_TICK_ACTIVE_SEC
+    next_cycle = last_cycle + timedelta(hours=6)
+    elapsed_min = (datetime.now(timezone.utc) - next_cycle).total_seconds() / 60.0
+    if NBP_POLL_WINDOW_START_MIN <= elapsed_min <= NBP_POLL_WINDOW_END_MIN:
+        return NBP_POLL_TICK_ACTIVE_SEC
+    return NBP_POLL_TICK_IDLE_SEC
+
+
+def _nbp_poller_loop() -> None:
+    """Background thread: HEAD-poll S3 for new NBP cycles independently of
+    the scan loop. Detection latency drops from ~scan_interval (60s) to
+    ~tick (5s) because we don't have to wait for the next scan to even
+    look at S3."""
+    log("  NBP poller: thread started")
+    while not _shutdown.is_set():
+        try:
+            if _nbp_next_cycle_available():
+                refresh_nbp_forecasts()
+        except Exception as e:
+            log(f"  NBP poller error: {e}", "warn")
+        _shutdown.wait(_nbp_poll_interval_sec())
+    log("  NBP poller: thread exiting")
+
+
+def _start_nbp_poller() -> None:
+    """Start the background NBP poller daemon. Idempotent — guarded by a
+    module-level flag so repeated calls during deploy / test setup are safe."""
+    global _nbp_poller_started
+    if _nbp_poller_started:
+        return
+    _nbp_poller_started = True
+    threading.Thread(target=_nbp_poller_loop, name="nbp-poller", daemon=True).start()
+
+
+_nbp_poller_started: bool = False
 
 
 def get_nbp_forecast(series: str, date_str: str) -> Optional[dict]:
@@ -3380,6 +3455,10 @@ def main() -> None:
         refresh_nbp_forecasts()
     except Exception as e:
         log(f"  initial NBP fetch failed: {e}", "warn")
+    # Background NBP poller — HEAD-polls S3 every 5s during the publish
+    # window so a new cycle lands in cache within ~5s of S3 publish instead
+    # of waiting up to a full scan interval.
+    _start_nbp_poller()
     try:
         refresh_nbm_om_forecasts()
     except Exception as e:

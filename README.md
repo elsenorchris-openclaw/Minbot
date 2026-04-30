@@ -26,14 +26,19 @@ built. Full evolution in the constants table below.
   the d-0 primary source for all cities, AND the d-1+ primary for CHI / OKC
   via `PER_SERIES_D1_PRIMARY` (source-MAE audit 2026-04-29: HRRR beat NBP
   5× / 1.6× respectively at those stations).
-- **NBP refresh — HEAD-poll trigger** (2026-04-30). NBP cycles run 01/07/13/19
-  UTC; S3 publish typically 75–90 min after cycle nominal time. Each scan
-  HEAD-probes the next-expected cycle URL once cycle+70min has elapsed; full
-  GET fires only when HEAD returns 200. Detection latency ≈ scan interval
-  (15–60s) instead of the prior age>6h trigger that left ~3.5h of avoidable
-  staleness between cycles. Cache pointer (`_nbp_cache_cycle_dt`) is
-  disk-persisted so restarts don't reset the schedule. Hard-stale safety net
-  (>8h) covers stuck pointer / S3 outage. See `_nbp_next_cycle_available()`.
+- **NBP refresh — HEAD-poll trigger + background poller** (2026-04-30).
+  NBP cycles run 01/07/13/19 UTC; S3 publish typically 75–90 min after
+  cycle nominal time. A dedicated `nbp-poller` daemon thread HEAD-probes
+  the next-expected cycle URL on a 5s tick during the active publish
+  window (cycle+60 to +240min), 60s tick otherwise. Full GET (33MB) fires
+  only on HEAD 200, behind a non-blocking `_nbp_refresh_lock` so the
+  poller and the scan loop can't double-fetch. Detection-to-usable
+  latency ≈ **5–8s** after S3 publish (vs ~3.5h under the prior age>6h
+  trigger; vs ~30s if we relied on the scan-loop probe alone). Cache
+  pointer (`_nbp_cache_cycle_dt`) is disk-persisted so restarts don't
+  reset the schedule. Hard-stale safety net (>8h) covers stuck pointer /
+  S3 outage. The scan-loop also calls `_nbp_next_cycle_available()` as a
+  belt-and-suspenders fallback in case the daemon thread dies.
 - **Model**: truncated Gaussian bounded above by `running_min + 1.0°F` (the
   +1°F is the ASOS-vs-CLI buffer; CLI rounds to integer and our 5-min obs
   may be 0.5°F off). σ inflation pipeline (in order, all multiplicative):
