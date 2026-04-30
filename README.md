@@ -26,11 +26,22 @@ built. Full evolution in the constants table below.
   the d-0 primary source for all cities, AND the d-1+ primary for CHI / OKC
   via `PER_SERIES_D1_PRIMARY` (source-MAE audit 2026-04-29: HRRR beat NBP
   5× / 1.6× respectively at those stations).
+- **NBP refresh — HEAD-poll trigger** (2026-04-30). NBP cycles run 01/07/13/19
+  UTC; S3 publish typically 75–90 min after cycle nominal time. Each scan
+  HEAD-probes the next-expected cycle URL once cycle+70min has elapsed; full
+  GET fires only when HEAD returns 200. Detection latency ≈ scan interval
+  (15–60s) instead of the prior age>6h trigger that left ~3.5h of avoidable
+  staleness between cycles. Cache pointer (`_nbp_cache_cycle_dt`) is
+  disk-persisted so restarts don't reset the schedule. Hard-stale safety net
+  (>8h) covers stuck pointer / S3 outage. See `_nbp_next_cycle_available()`.
 - **Model**: truncated Gaussian bounded above by `running_min + 1.0°F` (the
   +1°F is the ASOS-vs-CLI buffer; CLI rounds to integer and our 5-min obs
   may be 0.5°F off). σ inflation pipeline (in order, all multiplicative):
   disagreement-based (1×→1.5× as NBP/HRRR/NBM diverge 2°F→5°F) → NBP
-  staleness (1×→1.30× as NBP cache ages 1h→7h, d-1+ only) → per-station
+  staleness (1×→1.30× as NBP cache ages 1h→7h, d-1+ only; **Discord alert
+  raised from >1h to >3h on 2026-04-30** — HEAD-poll refresh now lands a
+  fresh cycle sub-2h after publish, so >3h implies a real fetch failure
+  worth pinging) → per-station
   multiplier (`PER_SERIES_SIGMA_MULT`: KLAX=2.5, KPHX=2.0, KDEN=1.5,
   KLAS=1.5 — the 4 stations with HRRR MAE > 4°F per source_audit).
   *Post-sunrise σ collapse was DISABLED 2026-04-25*: the heuristic was too

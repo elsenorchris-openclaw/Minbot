@@ -949,19 +949,33 @@ def _nbp_consistent_with_recent_cli(opp: dict,
 _nbp_cache: dict[str, dict] = {}      # {station: {'date_str': {'mu': f, 'sigma': f, 'fetched': ts}}}
 _nbp_cache_lock = threading.Lock()
 _nbp_cache_ts: float = 0.0
+# Nominal cycle time of the bulletin currently in cache (UTC). Used by the
+# HEAD-poll trigger to compute the next-expected cycle URL.
+_nbp_cache_cycle_dt: Optional[datetime] = None
 
-NBP_CYCLES = ["00", "06", "12", "18"]  # bulletins available every 6h
-NBP_MAX_AGE_SEC = 8 * 3600             # 8h — one cycle past
+NBP_CYCLE_HOURS = (1, 7, 13, 19)        # NBP Probabilistic full cycles (TXNMN populated)
+NBP_PUBLISH_LATENCY_MIN = 70            # don't probe S3 before cycle+70min — model still running
+NBP_HARD_STALE_SEC = 8 * 3600           # safety net: refresh unconditionally if cache > 8h old
 
 def _load_nbp_cache_from_disk() -> None:
-    global _nbp_cache, _nbp_cache_ts
+    global _nbp_cache, _nbp_cache_ts, _nbp_cache_cycle_dt
     try:
         if NBP_CACHE_FILE.exists():
             with open(NBP_CACHE_FILE) as f:
                 data = json.load(f)
+            cycle_iso = data.get("cycle_dt")
+            cycle_dt = None
+            if cycle_iso:
+                try:
+                    cycle_dt = datetime.fromisoformat(cycle_iso)
+                    if cycle_dt.tzinfo is None:
+                        cycle_dt = cycle_dt.replace(tzinfo=timezone.utc)
+                except Exception:
+                    cycle_dt = None
             with _nbp_cache_lock:
                 _nbp_cache = data.get("cache", {})
                 _nbp_cache_ts = float(data.get("ts", 0.0))
+                _nbp_cache_cycle_dt = cycle_dt
             log(f"  NBP cache loaded: {sum(len(v) for v in _nbp_cache.values())} entries")
     except Exception as e:
         log(f"  NBP cache load failed (non-critical): {e}", "warn")
@@ -970,7 +984,8 @@ def _load_nbp_cache_from_disk() -> None:
 def _save_nbp_cache_to_disk() -> None:
     try:
         with _nbp_cache_lock:
-            snap = {"cache": dict(_nbp_cache), "ts": _nbp_cache_ts}
+            cycle_iso = _nbp_cache_cycle_dt.isoformat() if _nbp_cache_cycle_dt else None
+            snap = {"cache": dict(_nbp_cache), "ts": _nbp_cache_ts, "cycle_dt": cycle_iso}
         _atomic_write_json(NBP_CACHE_FILE, snap)
     except Exception as e:
         log(f"  NBP cache save failed: {e}", "warn")
@@ -1103,19 +1118,71 @@ def _nbp_fetch_latest_bulletin() -> Optional[tuple[str, int, str]]:
 
 def refresh_nbp_forecasts() -> None:
     """Fetch NBP bulletin + parse + update cache. Idempotent; call periodically."""
-    global _nbp_cache, _nbp_cache_ts
+    global _nbp_cache, _nbp_cache_ts, _nbp_cache_cycle_dt
     fetched = _nbp_fetch_latest_bulletin()
     if not fetched:
         log("  NBP: fetch failed — keeping stale cache", "warn")
         return
     text, cycle_hour, bulletin_date = fetched
     parsed = _nbp_parse_bulletin(text, cycle_hour, bulletin_date)
+    cycle_dt = datetime(
+        int(bulletin_date[:4]), int(bulletin_date[4:6]), int(bulletin_date[6:8]),
+        cycle_hour, tzinfo=timezone.utc,
+    )
     with _nbp_cache_lock:
         for st, dates in parsed.items():
             _nbp_cache.setdefault(st, {}).update(dates)
         _nbp_cache_ts = time.time()
+        _nbp_cache_cycle_dt = cycle_dt
     _save_nbp_cache_to_disk()
-    log(f"  NBP: parsed {len(parsed)} stations")
+    log(f"  NBP: parsed {len(parsed)} stations (cycle {bulletin_date}/{cycle_hour:02d}z)")
+
+
+def _nbp_next_cycle_available() -> bool:
+    """HEAD-poll trigger for refresh_nbp_forecasts().
+
+    Returns True iff the bot should attempt a refresh this scan. Logic:
+      - Cold start (no cycle in cache): True (let _nbp_fetch_latest_bulletin walk back).
+      - Cache is hard-stale (>8h): True (safety net for stuck pointer / S3 outage).
+      - Less than 70 min since next-expected cycle nominal time: False (model still running).
+      - Otherwise: HEAD-probe the next-expected cycle URL on S3.
+        Return True iff S3 returns 200.
+
+    NBP cycles run 01/07/13/19 UTC. Typical S3 publish latency 75–90 min.
+    HEAD probes are ~50 bytes; ~30 probes per cycle in steady state.
+    """
+    with _nbp_cache_lock:
+        last_cycle = _nbp_cache_cycle_dt
+        last_ts = _nbp_cache_ts
+
+    # Cold start — fall through to existing latest-cycle walkback in the fetcher.
+    if last_cycle is None or last_ts <= 0:
+        return True
+
+    # Hard-stale safety net — covers stuck pointer or extended S3 outage.
+    if (time.time() - last_ts) > NBP_HARD_STALE_SEC:
+        return True
+
+    next_cycle = last_cycle + timedelta(hours=6)
+    elapsed_min = (datetime.now(timezone.utc) - next_cycle).total_seconds() / 60.0
+
+    # Future cycle (clock skew or wrong pointer) — don't probe.
+    if elapsed_min < 0:
+        return False
+
+    # Model still running — typical NBM publish is 75–90 min after cycle nominal.
+    if elapsed_min < NBP_PUBLISH_LATENCY_MIN:
+        return False
+
+    d = next_cycle.strftime("%Y%m%d")
+    h = next_cycle.strftime("%H")
+    url = (f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/"
+           f"blend.{d}/{h}/text/blend_nbptx.t{h}z")
+    try:
+        r = httpx.head(url, timeout=5.0)
+    except Exception:
+        return False
+    return r.status_code == 200
 
 
 def get_nbp_forecast(series: str, date_str: str) -> Optional[dict]:
@@ -1325,9 +1392,10 @@ def _stale_cache_alert(source: str, series: str, age_s: float,
 
 
 def _nbp_staleness_alert(age_h: float) -> None:
-    """Fire a rate-limited Discord alert when NBP cache age forces sigma
-    inflation (age_h > 1.0). Single global key — NBP cache is one shared
-    cycle, not per-series."""
+    """Fire a rate-limited Discord alert when NBP cache is meaningfully stale
+    (age_h > 3.0 — past the point where HEAD-poll refresh should have caught
+    a new cycle). Single global key — NBP cache is one shared cycle, not
+    per-series."""
     key = "stale:NBP:cache"
     now = time.time()
     last = _stale_alert_last_ts.get(key, 0.0)
@@ -1337,10 +1405,10 @@ def _nbp_staleness_alert(age_h: float) -> None:
     msg = (
         f":warning: **STALE CACHE FALLBACK** `NBP` — "
         f"cache age={age_h:.1f}h "
-        f"(NBP cycle ~6h; sigma inflation active >1h, capped at 7h). "
-        f"Throttled 30m."
+        f"(HEAD-poll refresh should land sub-2h post-cycle; >3h implies "
+        f"S3/parse failure). σ inflated. Throttled 30m."
     )
-    log(f"  [stale-cache] NBP cache age={age_h:.1f}h (>1h triggers σ inflation)", "warn")
+    log(f"  [stale-cache] NBP cache age={age_h:.1f}h (>3h — refresh likely failing)", "warn")
     discord_send(msg)
 
 
@@ -2002,10 +2070,11 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
                 if age_h > 1.0:
                     stale_mult = min(1.30, 1.0 + 0.05 * (age_h - 1.0))
                     sigma = sigma * stale_mult
-                    # 2026-04-29: rate-limited Discord alert when NBP staleness
-                    # actually inflates sigma. Throttled 30m globally — NBP
-                    # cycles every 6h, so a single alert per cycle is enough.
-                    _nbp_staleness_alert(age_h)
+                    # 2026-04-30: alert raised from >1h to >3h. With HEAD-poll
+                    # refresh, fresh cycle lands sub-2h after publish; >3h
+                    # implies a real S3/parse failure worth pinging.
+                    if age_h > 3.0:
+                        _nbp_staleness_alert(age_h)
         # Per-station σ inflation (2026-04-29). Counters NBP forecasts that
         # are systematically too narrow at specific stations.
         per_series_mult = PER_SERIES_SIGMA_MULT.get(m["series"], 1.0)
@@ -3181,11 +3250,11 @@ def scan_cycle() -> dict:
     stats = {"settled": 0, "markets": 0, "candidates": 0, "opps": 0, "taken": 0}
     stats["settled"] = check_settlements()
 
-    # Forecast refresh (throttled by internal TTL)
-    global _nbp_cache_ts
-    with _nbp_cache_lock:
-        nbp_age = time.time() - _nbp_cache_ts
-    if nbp_age > 6 * 3600:
+    # NBP refresh: HEAD-poll trigger (2026-04-30). Probes next-expected cycle
+    # URL on S3 once per scan past cycle+70min; full GET only when HEAD=200.
+    # Detects new NBP cycles within one scan interval (15–60s) of S3 publish
+    # vs ~3.5h gap under the prior age>6h trigger.
+    if _nbp_next_cycle_available():
         try:
             refresh_nbp_forecasts()
         except Exception as e:

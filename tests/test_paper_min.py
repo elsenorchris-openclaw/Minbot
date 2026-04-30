@@ -2776,5 +2776,187 @@ class TestCliIsFinal(unittest.TestCase):
             self.assertEqual(pb._STATION_TZ[info["station"]], info["tz"])
 
 
+class TestNBPHeadPollTrigger(unittest.TestCase):
+    """`_nbp_next_cycle_available()` HEAD-poll trigger (2026-04-30).
+
+    Replaces the prior age>6h trigger so a fresh cycle is detected sub-2h
+    instead of ~3.5h after S3 publish.
+    """
+
+    def setUp(self):
+        # Snapshot + clear cache state so each test starts deterministically.
+        self._saved_ts = pb._nbp_cache_ts
+        self._saved_cycle = pb._nbp_cache_cycle_dt
+        pb._nbp_cache_ts = 0.0
+        pb._nbp_cache_cycle_dt = None
+
+    def tearDown(self):
+        pb._nbp_cache_ts = self._saved_ts
+        pb._nbp_cache_cycle_dt = self._saved_cycle
+
+    def test_cold_start_returns_true(self):
+        # No cycle pointer → fall through to fetcher's latest-cycle walkback.
+        pb._nbp_cache_ts = 0.0
+        pb._nbp_cache_cycle_dt = None
+        self.assertTrue(pb._nbp_next_cycle_available())
+
+    def test_hard_stale_returns_true(self):
+        # Cache > 8h old → safety net fires regardless of HEAD outcome.
+        pb._nbp_cache_ts = pb.time.time() - (pb.NBP_HARD_STALE_SEC + 60)
+        pb._nbp_cache_cycle_dt = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=10)
+        self.assertTrue(pb._nbp_next_cycle_available())
+
+    def test_too_early_after_cycle_returns_false_without_probe(self):
+        # next_cycle just 30 min ago → NCEP still running, skip probe.
+        now = dt.datetime.now(dt.timezone.utc)
+        # last_cycle was 6h - 30min ago, so next_cycle is 30 min in the past.
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) + dt.timedelta(minutes=30)
+        pb._nbp_cache_ts = pb.time.time() - 30 * 60
+
+        # Patch httpx.head so we'd notice if it got called.
+        called = {"n": 0}
+        orig_head = pb.httpx.head
+        def boom(*a, **kw):
+            called["n"] += 1
+            raise AssertionError("HEAD probe should not run before publish-latency window")
+        pb.httpx.head = boom
+        try:
+            self.assertFalse(pb._nbp_next_cycle_available())
+            self.assertEqual(called["n"], 0)
+        finally:
+            pb.httpx.head = orig_head
+
+    def test_head_200_returns_true(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        # Make next_cycle 80 min in the past (past the 70min wait).
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(minutes=80)
+        pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
+
+        class FakeResp:
+            status_code = 200
+        orig_head = pb.httpx.head
+        pb.httpx.head = lambda *a, **kw: FakeResp()
+        try:
+            self.assertTrue(pb._nbp_next_cycle_available())
+        finally:
+            pb.httpx.head = orig_head
+
+    def test_head_404_returns_false(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(minutes=80)
+        pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
+
+        class FakeResp:
+            status_code = 404
+        orig_head = pb.httpx.head
+        pb.httpx.head = lambda *a, **kw: FakeResp()
+        try:
+            self.assertFalse(pb._nbp_next_cycle_available())
+        finally:
+            pb.httpx.head = orig_head
+
+    def test_head_exception_returns_false(self):
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(minutes=80)
+        pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
+
+        orig_head = pb.httpx.head
+        def boom(*a, **kw):
+            raise RuntimeError("network down")
+        pb.httpx.head = boom
+        try:
+            self.assertFalse(pb._nbp_next_cycle_available())
+        finally:
+            pb.httpx.head = orig_head
+
+    def test_future_cycle_returns_false(self):
+        # Pointer was somehow set in the future (clock skew). Don't probe.
+        now = dt.datetime.now(dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = now + dt.timedelta(hours=2)
+        pb._nbp_cache_ts = pb.time.time()
+        # Even if HEAD would return 200, we shouldn't reach it.
+        called = {"n": 0}
+        orig_head = pb.httpx.head
+        def watcher(*a, **kw):
+            called["n"] += 1
+            class R: status_code = 200
+            return R()
+        pb.httpx.head = watcher
+        try:
+            self.assertFalse(pb._nbp_next_cycle_available())
+            self.assertEqual(called["n"], 0)
+        finally:
+            pb.httpx.head = orig_head
+
+    def test_head_url_matches_next_cycle(self):
+        # Bot must probe blend.{YYYYMMDD}/{HH}/text/blend_nbptx.t{HH}z for
+        # last_cycle + 6h (not last_cycle itself).
+        last = dt.datetime(2026, 4, 29, 19, tzinfo=dt.timezone.utc)
+        pb._nbp_cache_cycle_dt = last
+        pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
+
+        captured = {}
+        orig_head = pb.httpx.head
+        def grab(url, *a, **kw):
+            captured["url"] = url
+            class R: status_code = 200
+            return R()
+        pb.httpx.head = grab
+        try:
+            pb._nbp_next_cycle_available()
+        finally:
+            pb.httpx.head = orig_head
+        # next cycle is 2026-04-30 01z
+        self.assertIn("blend.20260430/01/text/blend_nbptx.t01z", captured["url"])
+
+
+class TestNBPCacheCycleDtPersistence(unittest.TestCase):
+    """`_nbp_cache_cycle_dt` round-trips through disk save/load (2026-04-30)."""
+
+    def setUp(self):
+        self._saved_ts = pb._nbp_cache_ts
+        self._saved_cycle = pb._nbp_cache_cycle_dt
+        self._saved_cache = dict(pb._nbp_cache)
+
+    def tearDown(self):
+        pb._nbp_cache_ts = self._saved_ts
+        pb._nbp_cache_cycle_dt = self._saved_cycle
+        pb._nbp_cache = self._saved_cache
+
+    def test_save_and_load_preserves_cycle_dt(self):
+        cycle = dt.datetime(2026, 4, 29, 19, tzinfo=dt.timezone.utc)
+        pb._nbp_cache = {"KAUS": {"2026-04-30": {"mu": 65.0, "sigma": 2.5}}}
+        pb._nbp_cache_ts = 1234567890.0
+        pb._nbp_cache_cycle_dt = cycle
+
+        pb._save_nbp_cache_to_disk()
+
+        # Wipe in-memory state, then reload from disk.
+        pb._nbp_cache = {}
+        pb._nbp_cache_ts = 0.0
+        pb._nbp_cache_cycle_dt = None
+        pb._load_nbp_cache_from_disk()
+
+        self.assertEqual(pb._nbp_cache_ts, 1234567890.0)
+        self.assertEqual(pb._nbp_cache_cycle_dt, cycle)
+        self.assertEqual(pb._nbp_cache["KAUS"]["2026-04-30"]["mu"], 65.0)
+
+    def test_load_handles_legacy_cache_without_cycle_dt(self):
+        # Write a legacy snapshot (pre-2026-04-30, no cycle_dt key) and ensure
+        # load doesn't raise — cycle_dt stays None, scan loop will treat it
+        # as cold-start and refresh.
+        legacy = {"cache": {"KAUS": {"2026-04-30": {"mu": 65.0, "sigma": 2.5}}},
+                  "ts": 1234567890.0}
+        pb.NBP_CACHE_FILE.write_text(json.dumps(legacy))
+
+        pb._nbp_cache = {}
+        pb._nbp_cache_ts = 0.0
+        pb._nbp_cache_cycle_dt = "sentinel"  # ensure load actually overwrites
+        pb._load_nbp_cache_from_disk()
+
+        self.assertEqual(pb._nbp_cache_ts, 1234567890.0)
+        self.assertIsNone(pb._nbp_cache_cycle_dt)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
