@@ -841,7 +841,8 @@ class TestDirectionalConsistency(unittest.TestCase):
         self.assertEqual(self._order_calls, [], "place_kalshi_order should not have been called")
 
     def test_buy_no_with_low_mp_allowed_through_gate(self):
-        """BUY_NO with mp in F2A's allowed range (0.05 ≤ mp < 0.30) passes."""
+        """BUY_NO with mp at the directional ceiling (0.20) passes (gate is
+        strict `>`, not `>=`). 2026-04-29 night: gate tightened 0.40→0.20."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.20))
         self.assertEqual(len(self._order_calls), 1, "place_kalshi_order should have been called once")
 
@@ -1101,8 +1102,11 @@ class TestSizingMinCostFloor(unittest.TestCase):
 
 
 class TestDirectionalGateTightened(unittest.TestCase):
-    """Directional gate tightened from 0.50 → 0.40/0.60 on 2026-04-27.
-    BUY_NO requires mp ≤ 0.40; BUY_YES requires mp ≥ 0.60."""
+    """Directional gate evolution:
+       2026-04-27: tightened 0.50 → 0.40/0.60 (added action-vs-model rule)
+       2026-04-29 night: BUY_NO further tightened 0.40 → 0.20 (V2 port; deduped
+                 pool n=42 confirmed h:h 12:1 lift +$5.16). BUY_YES kept at 0.60.
+    Current: BUY_NO requires mp ≤ 0.20; BUY_YES requires mp ≥ 0.60."""
 
     def setUp(self):
         with pb._positions_lock:
@@ -1151,11 +1155,22 @@ class TestDirectionalGateTightened(unittest.TestCase):
         pb.execute_opportunity(self._opp("BUY_NO", 0.41))
         self.assertEqual(self._order_calls, [])
 
-    def test_buy_no_below_f2a_threshold_passes(self):
-        """Effective BUY_NO threshold is now F2A_PROB_HI=0.30 (stricter than
-        directional 0.40). mp=0.29 below F2A → both gates pass."""
+    def test_buy_no_at_29_now_blocked_by_directional(self):
+        """2026-04-29 night: BUY_NO directional tightened 0.40→0.20. mp=0.29
+        now blocks via DIRECTIONAL_BUY_NO (was previously blocked by F2A_high
+        at 0.30; now directional fires first at >0.20)."""
         pb.execute_opportunity(self._opp("BUY_NO", 0.29))
+        self.assertEqual(self._order_calls, [])
+
+    def test_buy_no_at_19_passes(self):
+        """mp=0.19 just below 0.20 directional threshold — passes."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.19))
         self.assertEqual(len(self._order_calls), 1)
+
+    def test_buy_no_at_21_blocked(self):
+        """mp=0.21 just above 0.20 — blocks via directional consistency."""
+        pb.execute_opportunity(self._opp("BUY_NO", 0.21))
+        self.assertEqual(self._order_calls, [])
 
     def test_buy_yes_at_old_boundary_now_blocked(self):
         """CHI-T41 reconstruction: mp=0.34 BUY_YES lost. Now blocked."""
@@ -2541,12 +2556,14 @@ class TestLaxFixes(unittest.TestCase):
         pb._cached_bankroll = 0.0
 
     def _lax_t_high_buy_no(self, **overrides):
-        """Reconstruct LAX-26APR27-T54 BUY_NO loser: μ=53.1 σ=2.0 (post σ-mult
-        applied here directly), entry 56c, edge 20%, mp 24%."""
+        """LAX BUY_NO T-high test fixture. Original LAX-26APR27-T54 had mp=0.24
+        but the 2026-04-29 directional tightening (BUY_NO mp ≤ 0.20) now blocks
+        that earlier — making this test target LAX_NO_THIGH specifically. Use
+        mp=0.18 (under directional ceiling) so LAX_NO_THIGH is the firing gate."""
         base = {
             "market_ticker": "KXLOWTLAX-26APR27-T54",
             "event_ticker": "KXLOWTLAX-26APR27",
-            "action": "BUY_NO", "model_prob": 0.24, "edge": 0.20,
+            "action": "BUY_NO", "model_prob": 0.18, "edge": 0.20,
             "entry_price": 0.56, "yes_bid": 42, "yes_ask": 44,
             "no_bid": 54, "no_ask": 56, "mu": 53.1, "sigma": 2.0,
             "mu_source": "nbp", "running_min": None,

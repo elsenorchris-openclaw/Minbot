@@ -129,6 +129,16 @@ MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
 MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
+# Directional consistency thresholds. BUY_NO requires mp ≤ MAX_MP; BUY_YES
+# requires mp ≥ MIN_MP. BUY_NO tightened 2026-04-29 night from 0.40 → 0.20
+# (V2 deployed the same tighter threshold; min_bot deduped pool n=42 confirmed
+# h:h 12:1 with lift +$5.16 over current 0.40 cap). BUY_YES kept at 0.60 —
+# only the BUY_NO side was validated this round; symmetric tightening to 0.80
+# would need its own backtest. Bot's mp_range_bypass (NBP-CLI consistency)
+# does NOT bypass directional consistency — directional and mp_range are
+# independent gates.
+DIRECTIONAL_BUY_NO_MAX_MP = 0.20    # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night)
+DIRECTIONAL_BUY_YES_MIN_MP = 0.60   # unchanged (asymmetric; only BUY_NO tightened)
 
 # Hard safety gates (HIGH-impact: prevent the patterns that lost money on the
 # 04:09 UTC live cycle and that V1/V2 had to fix in production).
@@ -2462,10 +2472,10 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         if not _nbp_consistent_with_recent_cli(opp):
             return ("MP_RANGE",
                     f"mp {mp:.0%} outside [{MIN_MODEL_PROB:.0%}, {MAX_MODEL_PROB:.0%}]")
-    if action == "BUY_NO" and mp > 0.40:
-        return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > 40%")
-    if action == "BUY_YES" and mp < 0.60:
-        return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < 60%")
+    if action == "BUY_NO" and mp > DIRECTIONAL_BUY_NO_MAX_MP:
+        return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%}")
+    if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
+        return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%}")
     # Per-station BUY_NO T-high block (2026-04-29 LAX audit, n=3 wr=0%,
     # NBP cool-bias structural).
     if (action == "BUY_NO"
@@ -2631,11 +2641,11 @@ def execute_opportunity(opp: dict) -> bool:
                 return False
             # else: bypass — recent CLI supports the extreme prob.
         # Directional consistency: never bet against our own model.
-        if action == "BUY_NO" and mp > 0.40:
-            _log_skip(ticker, f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > 40% (action vs model disagree)")
+        if action == "BUY_NO" and mp > DIRECTIONAL_BUY_NO_MAX_MP:
+            _log_skip(ticker, f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%} (action vs model disagree)")
             return False
-        if action == "BUY_YES" and mp < 0.60:
-            _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < 60% (action vs model disagree)")
+        if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
+            _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
             return False
         # Per-station BUY_NO T-high block (2026-04-29 LAX audit).
         if (action == "BUY_NO"
