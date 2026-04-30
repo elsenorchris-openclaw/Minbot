@@ -3507,5 +3507,113 @@ class TestSigmaAwareSizing(unittest.TestCase):
         self.assertLess(count_wide, count_ref * 0.7)
 
 
+class TestPartialExitNoOrphan(unittest.TestCase):
+    """`_execute_exit` with partial fill (filled < count) must NOT mark the
+    position settled — the unsold contracts are still ours on Kalshi.
+
+    Pre-fix (2026-04-30): AUS-26MAY01-T56 hard_stop got 11/90 fill, bot
+    marked settled=True, lost track of 79 contracts ($20.54 unrealized).
+    Post-fix: position stays open with reduced count, partial-exit pnl
+    accumulated separately, ready for next hard-stop or final settlement."""
+
+    def setUp(self):
+        self._saved_pos = dict(pb._open_positions)
+        pb._open_positions.clear()
+        # Mock kalshi_post + kalshi_delete + wait_for_fill
+        self._orig_post = pb.kalshi_post
+        self._orig_delete = pb.kalshi_delete
+        self._orig_wait = pb.wait_for_fill
+        self._orig_append = pb._append_jsonl
+        self._orig_save = pb._save_positions
+        self._orig_discord = pb.discord_send
+        pb.kalshi_post = lambda path, body: {
+            "order": {"order_id": "test-order-id", "status": "resting"}}
+        pb.kalshi_delete = lambda path: {}
+        pb._append_jsonl = lambda path, rec: None
+        pb._save_positions = lambda: None
+        pb.discord_send = lambda msg: None
+        # Default: full fill (overridden per-test)
+        self._fill_count = None
+        pb.wait_for_fill = lambda oid, expected, timeout_sec=5.0: (
+            "executed", self._fill_count if self._fill_count is not None else expected)
+
+    def tearDown(self):
+        pb._open_positions.clear()
+        pb._open_positions.update(self._saved_pos)
+        pb.kalshi_post = self._orig_post
+        pb.kalshi_delete = self._orig_delete
+        pb.wait_for_fill = self._orig_wait
+        pb._append_jsonl = self._orig_append
+        pb._save_positions = self._orig_save
+        pb.discord_send = self._orig_discord
+
+    def _aus_t56_pos(self):
+        ticker = "KXLOWTAUS-26MAY01-T56"
+        pb._open_positions[ticker] = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": "BUY_YES", "entry_price": 0.33, "count": 90,
+            "cost": 29.70, "settled": False,
+            "station": "KAUS", "date_str": "2026-05-01", "label": "Austin",
+            "floor": 56.5, "cap": None,
+        }
+        return ticker
+
+    def test_partial_fill_keeps_position_open(self):
+        ticker = self._aus_t56_pos()
+        self._fill_count = 11  # only 11/90 fill
+        ok = pb._execute_exit(ticker, pb._open_positions[ticker],
+                              sell_side="yes", sell_price_c=7,
+                              reason="hard_stop")
+        self.assertTrue(ok)
+        pos = pb._open_positions[ticker]
+        # NOT marked settled
+        self.assertFalse(pos.get("settled", False),
+                         "partial-fill exit must NOT mark settled")
+        # Count reduced
+        self.assertEqual(pos["count"], 79)
+        # Partial exit pnl recorded
+        self.assertAlmostEqual(pos["_partial_exit_pnl"], -2.86, places=2)
+        self.assertEqual(pos["_partial_exit_count"], 11)
+        self.assertEqual(pos["_partial_exit_last_reason"], "hard_stop")
+        self.assertAlmostEqual(pos["_partial_exit_last_price"], 0.07, places=4)
+
+    def test_full_fill_marks_settled(self):
+        ticker = self._aus_t56_pos()
+        self._fill_count = 90  # full fill
+        ok = pb._execute_exit(ticker, pb._open_positions[ticker],
+                              sell_side="yes", sell_price_c=7,
+                              reason="hard_stop")
+        self.assertTrue(ok)
+        pos = pb._open_positions[ticker]
+        # IS marked settled
+        self.assertTrue(pos.get("settled"))
+        self.assertEqual(pos["count"], 90)  # unchanged on full fill
+        self.assertAlmostEqual(pos["pnl"], -23.40, places=2)  # 90 * (0.07 - 0.33)
+        self.assertEqual(pos["_exit_reason"], "hard_stop")
+
+    def test_multiple_partial_fills_accumulate(self):
+        ticker = self._aus_t56_pos()
+        # First partial: 11/90 at 7c → -$2.86, count → 79
+        self._fill_count = 11
+        pb._execute_exit(ticker, pb._open_positions[ticker],
+                         sell_side="yes", sell_price_c=7,
+                         reason="hard_stop")
+        pos = pb._open_positions[ticker]
+        self.assertEqual(pos["count"], 79)
+        first_partial = pos["_partial_exit_pnl"]
+
+        # Second partial: 20/79 at 8c → 20 * (0.08 - 0.33) = -5.00, count → 59
+        self._fill_count = 20
+        pb._execute_exit(ticker, pos,
+                         sell_side="yes", sell_price_c=8,
+                         reason="hard_stop")
+        pos = pb._open_positions[ticker]
+        self.assertEqual(pos["count"], 59)
+        # Accumulated pnl: -$2.86 + -$5.00 = -$7.86
+        self.assertAlmostEqual(pos["_partial_exit_pnl"], first_partial - 5.0, places=2)
+        self.assertEqual(pos["_partial_exit_count"], 31)  # 11 + 20
+        self.assertFalse(pos.get("settled", False))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

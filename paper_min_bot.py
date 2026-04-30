@@ -3189,20 +3189,55 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
     with _positions_lock:
         existing = _open_positions.get(ticker)
         if existing is not None:
-            existing.update({
-                "settled": True,
-                "exited_ts": record["ts"],
-                "exit_price": record["exit_price"],
-                "pnl": pnl,
-                "_exit_reason": reason,
-            })
+            if filled < count:
+                # Partial fill — DO NOT mark settled. The unsold contracts
+                # are still ours on Kalshi and need to either be re-sold by
+                # the next hard-stop check or settled by check_settlements
+                # at climate-day end.
+                # 2026-04-30: pre-fix bug — bot marked settled=True after a
+                # partial-fill exit, orphaning AUS-26MAY01-T56's 79 unsold
+                # contracts (entry $29.70 → bot reported pnl=-$2.86, missed
+                # $20.54 of unrealized exposure that settles tomorrow).
+                new_count = count - filled
+                # Keep entry_price unchanged (cost basis per contract).
+                # Reduce `count` so check_settlements computes settlement
+                # against just the remaining contracts. Append-style accumulate
+                # the partial-exit pnl in case multiple partials happen.
+                existing["count"] = new_count
+                existing["cost"] = new_count * float(existing.get("entry_price", 0))
+                existing["_partial_exit_pnl"] = (
+                    existing.get("_partial_exit_pnl", 0.0) + pnl)
+                existing["_partial_exit_count"] = (
+                    existing.get("_partial_exit_count", 0) + filled)
+                existing["_partial_exit_last_ts"] = record["ts"]
+                existing["_partial_exit_last_price"] = record["exit_price"]
+                existing["_partial_exit_last_reason"] = reason
+            else:
+                # Full fill — exit complete, mark settled.
+                existing.update({
+                    "settled": True,
+                    "exited_ts": record["ts"],
+                    "exit_price": record["exit_price"],
+                    "pnl": pnl,
+                    "_exit_reason": reason,
+                })
     _save_positions()
-    log(f"  EXIT FILLED {ticker} ({reason}): {filled}x @ {sell_price_c}c | "
-        f"pnl ${pnl:+.2f}")
-    discord_send(
-        f"🟡 **EXIT** `{ticker}` {pos.get('action')} {filled}x @ {sell_price_c}c "
-        f"({reason}) — P&L **${pnl:+.2f}**"
-    )
+    if filled < count:
+        log(f"  EXIT PARTIAL {ticker} ({reason}): {filled}/{count}x @ "
+            f"{sell_price_c}c | partial pnl ${pnl:+.2f} | "
+            f"{count - filled} contracts still open")
+        discord_send(
+            f"🟡 **PARTIAL EXIT** `{ticker}` {pos.get('action')} "
+            f"{filled}/{count}x @ {sell_price_c}c ({reason}) — partial P&L "
+            f"**${pnl:+.2f}**, {count - filled} still open"
+        )
+    else:
+        log(f"  EXIT FILLED {ticker} ({reason}): {filled}x @ {sell_price_c}c | "
+            f"pnl ${pnl:+.2f}")
+        discord_send(
+            f"🟡 **EXIT** `{ticker}` {pos.get('action')} {filled}x @ "
+            f"{sell_price_c}c ({reason}) — P&L **${pnl:+.2f}**"
+        )
     return True
 
 
