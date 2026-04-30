@@ -3349,89 +3349,36 @@ class TestSettleTailFloorCapNoneGuard(unittest.TestCase):
         self.assertEqual(pb._open_positions[ticker].get("won"), False)
 
 
-class TestSigmaCap(unittest.TestCase):
-    """`SIGMA_MAX_F=4.0` blocks entries when forecast σ is too wide for the
-    edge calc to be trustworthy. Triggered by AUS-26MAY01-T56 disaster
-    (σ=5.7°F, hard-stopped 11 min after entry). Both _evaluate_gates and
-    execute_opportunity must enforce."""
+class TestSigmaCapRemoved(unittest.TestCase):
+    """σ-cap removed 2026-04-30 PM. Wide-σ entries should NOT be blocked
+    by a sigma threshold; sizing shrink + hard-stop policies are the
+    protection now. Sentinel test: verify the old SIGMA_TOO_WIDE path
+    doesn't fire and the constant is gone, so a future refactor can't
+    silently re-introduce a wide-σ filter without explicit decision."""
 
-    def setUp(self):
-        pb._cached_bankroll = 100.0
-        with pb._positions_lock:
-            pb._open_positions.clear()
-        with pb._cycle_budget_lock:
-            pb._cycle_new_count = 0
-            pb._today_exposure_usd = 0.0
-            pb._today_date_utc = ""
-        pb._reset_cycle_budget()
-        self._calls: list[tuple] = []
-        self._orig_place = pb.place_kalshi_order
-        pb.place_kalshi_order = lambda *a, **kw: (
-            self._calls.append((a, kw)) or None
-        )
+    def test_sigma_max_constant_removed(self):
+        # Sentinel: any code referencing this attribute will AttributeError,
+        # so removal is enforced and explicit.
+        self.assertFalse(hasattr(pb, "SIGMA_MAX_F"))
 
-    def tearDown(self):
-        pb.place_kalshi_order = self._orig_place
-
-    def _opp(self, sigma, **overrides):
-        base = {
+    def test_evaluate_gates_does_not_return_sigma_too_wide(self):
+        # Even at extreme σ, _evaluate_gates must not produce SIGMA_TOO_WIDE.
+        opp = {
             "market_ticker": "KXLOWTAUS-26MAY01-T56",
             "event_ticker": "KXLOWTAUS-26MAY01",
-            "action": "BUY_YES",
-            "model_prob": 0.60,
-            "edge": 0.27,
+            "action": "BUY_YES", "model_prob": 0.60, "edge": 0.27,
             "entry_price": 0.33,
-            "yes_bid": 30, "yes_ask": 33,
-            "no_bid": 67, "no_ask": 70,
-            "mu": 58.0, "sigma": sigma, "mu_source": "nbp",
+            "yes_bid": 30, "yes_ask": 33, "no_bid": 67, "no_ask": 70,
+            "mu": 58.0, "sigma": 10.0,  # absurd σ
+            "mu_source": "nbp",
             "mu_nbp": 58.0, "mu_hrrr": 58.0, "mu_nbm_om": 58.0,
             "running_min": None, "post_sunrise_lock": False,
             "disagreement": 1.0,
-            "floor": 56.5, "cap": None,  # T-high
+            "floor": 56.5, "cap": None,
             "station": "KAUS", "date_str": "2026-05-01", "label": "Austin",
             "series": "KXLOWTAUS",
         }
-        base.update(overrides)
-        return base
-
-    def test_sigma_well_above_cap_blocks_entry(self):
-        # σ=6.8 (the PHX outlier value) → blocked at cap=6.0
-        pb.execute_opportunity(self._opp(sigma=6.8))
-        self.assertEqual(len(self._calls), 0)
-
-    def test_sigma_at_six_zero_passes(self):
-        # σ=6.0 at the cap boundary (strict `>` comparison) → allowed.
-        # Preserves DEN-26APR30-B38.5 winner that had σ=6.0.
-        pb.execute_opportunity(self._opp(sigma=6.0))
-        self.assertEqual(len(self._calls), 1)
-
-    def test_sigma_just_above_cap_blocks(self):
-        # σ=6.1 just above 6.0 cap → blocked
-        pb.execute_opportunity(self._opp(sigma=6.1))
-        self.assertEqual(len(self._calls), 0)
-
-    def test_sigma_aus_t56_value_now_passes(self):
-        # σ=5.7 (the original AUS-T56 disaster trigger) → now ALLOWED.
-        # Protection at this width is the σ-aware sizing shrink (~$5 bet)
-        # plus d-1 hard-stop skip; cap no longer the primary mechanism.
-        pb.execute_opportunity(self._opp(sigma=5.7))
-        self.assertEqual(len(self._calls), 1)
-
-    def test_sigma_below_cap_allows(self):
-        # σ=2.5 well below cap → entry proceeds
-        pb.execute_opportunity(self._opp(sigma=2.5))
-        self.assertEqual(len(self._calls), 1)
-
-    def test_evaluate_gates_returns_sigma_too_wide(self):
-        opp = self._opp(sigma=6.8)
-        blocked, reason = pb._evaluate_gates(opp)
-        self.assertEqual(blocked, "SIGMA_TOO_WIDE")
-        self.assertIn("6.8", reason)
-        self.assertIn("6.0", reason)
-
-    def test_evaluate_gates_passes_below_cap(self):
-        opp = self._opp(sigma=2.0)
-        blocked, _ = pb._evaluate_gates(opp)
+        blocked, _reason = pb._evaluate_gates(opp)
         self.assertNotEqual(blocked, "SIGMA_TOO_WIDE")
 
 

@@ -286,26 +286,25 @@ F2A_PROB_LO = 0.05                  # mp < this is a price-asymmetry trap (97c c
 F2A_PROB_HI = 0.30                  # mp ≥ this is calibration cliff (model says YES too likely)
 F2A_SIGMA_MIN = 1.5                 # sigma < this is over-confident model (tight-σ zones lost in V2)
 
-# ─── σ-aware sizing + entry cap (2026-04-30) ──────────────────────────────
-# Triggered by AUS-26MAY01-T56: bot bet $29.70 on a d-1 BUY_YES tail with
-# σ=5.7°F. Market priced 33% YES, model said 60%. Hard-stop fired 11 min
-# later when MTM dropped to 7c (79% loss). The "27% edge" was an illusion
-# wrapped around model uncertainty. Two protections, layered:
-#   1. SIGMA_MAX_F: refuse entries above this σ — at this width the model
-#      genuinely doesn't know, edge calc is mostly noise the market is more
-#      accurate about.
-#   2. SIGMA_REF_F + quadratic shrink: for entries within the allowed band,
-#      shrink the Kelly bet by (REF/σ)². At σ=2.5 (typical NBP), no shrink.
-#      At σ=4.0, bet is 39% of base. Recognizes: same edge with wider σ is
-#      a fundamentally weaker signal that should size down.
-# REF=2.5 chosen as median NBP σ pre-inflation; cap=6.0 (raised from 5.0
-# 2026-04-30 PM) after audit showed too-tight cap was discarding +EV trades.
-# Data: σ ∈ [6,7) had 1 winner (DEN-26APR30-B38.5, +$2.90), no losers; the
-# AUS-T56 disaster was hard-stop-driven, not σ-driven. With σ-aware sizing
-# already in place, wider cap captures more edge while still blocking the
-# clear outliers (PHX σ=6.8 still gets caught).
+# ─── σ-aware Kelly sizing (2026-04-30) ────────────────────────────────────
+# Quadratic shrink as σ grows above SIGMA_REF_F: at σ=2.5 (typical NBP), no
+# shrink. At σ=4.0, bet is 39% of base. At σ=6.8, bet is 13.5%. Recognizes
+# that same-edge-with-wider-σ is a fundamentally weaker signal that should
+# size down. Triggered by AUS-26MAY01-T56 (σ=5.7) where bot bet $29.70 on a
+# d-1 BUY_YES tail with effective coin-flip confidence.
+#
+# 2026-04-30 PM: SIGMA_MAX_F entry cap REMOVED. Earlier ship was a reactive
+# fix on n=1 (AUS-T56) that turned out to mostly forfeit edge rather than
+# prevent harm. The disaster path is now fully closed by:
+#   1. σ-aware sizing — wide-σ bets shrink to ~$5
+#   2. Hard-stop skip on rm-None — d-1 / early d-0 protected
+#   3. Hard-stop skip on BUY_YES T-high — held to settlement
+#   4. Partial-fill exit fix — no orphan contracts
+# Without these, the cap was load-bearing. With them, the cap was blocking
+# ~1 candidate/day (PHX σ=6.8) for no demonstrated harm-prevention. n=1
+# winner (DEN σ=6.0) was being forfeited. Removed to gather data; can
+# re-add if running data shows σ ≥ 6 zone is genuinely -EV.
 SIGMA_REF_F = 2.5                   # reference σ for full-Kelly sizing
-SIGMA_MAX_F = 6.0                   # hard cap; entries blocked when sigma > this
 # F2A_DIST_MIN: V2 uses 0.5°F from NBM. NOT ported — min-bot audit (n=15) found
 # `mu at bracket edge` is the BUY_NO winner pattern (cli flips OUTSIDE the bracket
 # from there 60-100% of the time). MIN_ABS_DISTANCE_F (mu vs bracket MID, 0.5°F)
@@ -2762,10 +2761,6 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     if _check_obs_confirmed_loser(opp):
         return ("OBS_CONFIRMED_LOSER",
                 f"rm={opp.get('running_min')} in YES territory")
-    sigma = float(opp.get("sigma") or 0)
-    if sigma > SIGMA_MAX_F:
-        return ("SIGMA_TOO_WIDE",
-                f"σ {sigma:.1f}°F > {SIGMA_MAX_F:.1f}°F (model too uncertain)")
     if edge > MAX_EDGE:
         return ("MAX_EDGE", f"{edge:.2%} > {MAX_EDGE:.0%}")
     if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
@@ -2892,17 +2887,9 @@ def execute_opportunity(opp: dict) -> bool:
     if edge < edge_floor:
         return False
 
-    # σ-cap: refuse entries when the model's σ exceeds SIGMA_MAX_F. At wide
-    # σ the model is essentially uncertain and the apparent edge is noise the
-    # market is more accurate about. Trigger case: AUS-26MAY01-T56 with σ=5.7.
-    # Bypassed by obs_alive (rm has decisively settled the bracket so σ is
-    # irrelevant to the outcome).
+    # σ extracted for Kelly-shrink below. (σ-cap removed 2026-04-30 PM —
+    # other defenses now cover the wide-σ disaster path; see SIGMA_REF_F docs.)
     sigma = float(opp.get("sigma") or 0)
-    if not obs_alive and sigma > SIGMA_MAX_F:
-        _log_skip(ticker,
-            f"  skip {ticker}: SIGMA_TOO_WIDE σ={sigma:.1f}°F > "
-            f"{SIGMA_MAX_F:.1f}°F (model too uncertain)")
-        return False
 
     # Kelly sizing — anchor on bankroll (V2 fix; pre-fix anchored on MAX_BET_USD,
     # under-sizing every trade by ~4× when bankroll > MAX_BET_USD). Kelly boost
