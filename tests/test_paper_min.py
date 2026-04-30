@@ -3620,36 +3620,38 @@ class TestPartialExitNoOrphan(unittest.TestCase):
         self.assertFalse(pos.get("settled", False))
 
 
-class TestHardStopSkipsD1(unittest.TestCase):
-    """`check_open_positions_for_exit` must skip hard-stop on d-1+ positions
-    (climate day not yet started for the station's local LST). Without obs
-    available, hard-stopping fires on bid microstructure noise. Trigger:
-    AUS-26MAY01-T56 hard_stopped 11min after entry, settles tomorrow on
-    actual climate-day low (likely a winner)."""
+class TestHardStopSkipsWithoutObs(unittest.TestCase):
+    """`check_open_positions_for_exit` must skip hard-stop when no obs are
+    available for the position's climate day. Covers:
+      - d-1+ trades (climate day not started)
+      - Early d-0 trades pre-first-obs (cd started but obs not landed yet —
+        Chris's edge case: AUS-T56 transitioning d-1→d-0 at 06:00 UTC May 1
+        before any May 1 obs lands)
+      - obs-pipeline DB outage scenarios
+
+    Once rm becomes available, hard-stop logic resumes normally."""
 
     def setUp(self):
         self._saved_pos = dict(pb._open_positions)
         pb._open_positions.clear()
-        # Mock _climate_date_nws to return a fixed today
-        self._orig_cd = pb._climate_date_nws
-        pb._climate_date_nws = lambda tz, now_utc=None: "2026-04-30"
+        # rm fetcher — controllable per-test
+        self._rm_value = None
+        self._orig_get_rm = pb.get_running_min
+        pb.get_running_min = lambda st, cd: self._rm_value
         # Mock _execute_exit to count calls
         self._orig_exit = pb._execute_exit
         self._exit_calls: list[tuple] = []
         pb._execute_exit = lambda ticker, pos, sell_side, sell_price_c, reason: (
             self._exit_calls.append((ticker, sell_side, sell_price_c, reason)) or True)
-        # Mock running_min lookup so obs-winner override doesn't trip
-        self._orig_get_rm = pb.get_running_min
-        pb.get_running_min = lambda st, cd: None
 
     def tearDown(self):
         pb._open_positions.clear()
         pb._open_positions.update(self._saved_pos)
-        pb._climate_date_nws = self._orig_cd
         pb._execute_exit = self._orig_exit
         pb.get_running_min = self._orig_get_rm
 
-    def _pos(self, ticker, date_str, action="BUY_YES", entry=0.33, count=90):
+    def _pos(self, ticker, date_str, action="BUY_YES", entry=0.33, count=90,
+             running_min=None):
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
             "action": action, "entry_price": entry, "count": count,
@@ -3658,35 +3660,77 @@ class TestHardStopSkipsD1(unittest.TestCase):
             "floor": 56.5 if action == "BUY_YES" else 48.0,
             "cap": None if action == "BUY_YES" else 49.0,
             "sigma": 5.7,
+            "running_min": running_min,
         }
 
-    def test_d1_position_skipped_at_huge_loss(self):
-        # AUS-T56 cd=2026-05-01, today's cd=2026-04-30 → d-1+. Even at
-        # 91% MTM loss, no exit fires.
+    def test_d1_no_obs_skipped_at_huge_loss(self):
+        # AUS-T56 d-1, rm=None (cd hasn't started) → no exit even at -91% MTM
         ticker = "KXLOWTAUS-26MAY01-T56"
-        self._pos(ticker, date_str="2026-05-01")
+        self._pos(ticker, date_str="2026-05-01", running_min=None)
+        self._rm_value = None  # DB also returns None
         market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 0)
         self.assertEqual(self._exit_calls, [])
 
-    def test_d0_position_still_hard_stopped(self):
-        # Same loss profile but cd=today → hard-stop fires.
+    def test_d0_no_obs_yet_also_skipped(self):
+        # Chris's edge case: position transitioned to d-0 but no obs yet
+        # (early in cd window). Without obs, no exit.
         ticker = "KXLOWTAUS-26APR30-T56"
-        self._pos(ticker, date_str="2026-04-30")
+        self._pos(ticker, date_str="2026-04-30", running_min=None)
+        self._rm_value = None  # no obs landed yet
+        market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
+        n = pb.check_open_positions_for_exit(market_quotes)
+        self.assertEqual(n, 0)
+
+    def test_d0_with_obs_hard_stops_normally(self):
+        # cd started, rm available, MTM bad, rm not in winning territory →
+        # hard-stop fires.
+        ticker = "KXLOWTAUS-26APR30-T56"  # T-high, BUY_YES, floor=56.5
+        self._pos(ticker, date_str="2026-04-30", running_min=None)
+        # rm=58 means low so far is 58, which is ≥ 57 → in BUY_YES winning
+        # territory. Use rm=50 to make it NOT winning.
+        self._rm_value = 50.0
         market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 1)
-        self.assertEqual(self._exit_calls[0][0], ticker)
         self.assertEqual(self._exit_calls[0][3], "hard_stop")
 
-    def test_d2_position_also_skipped(self):
-        # 2-day-out market — definitely d-1+, definitely skipped.
-        ticker = "KXLOWTAUS-26MAY02-T56"
-        self._pos(ticker, date_str="2026-05-02")
-        market_quotes = {ticker: {"yes_bid": 1, "yes_ask": 3, "no_bid": 97, "no_ask": 99}}
+    def test_d0_with_obs_winner_override_holds(self):
+        # BUY_YES T-low: cap=53.5, floor=None, rm ≤ cap-1 (52.5) → winner.
+        # Override fires; position holds even at 91% MTM loss.
+        # (Note: T-high BUY_YES override is INTENTIONALLY disabled per memory
+        # `min_bot BUY_YES T-high obs_alive bypass removed 2026-04-28` —
+        # rm above floor doesn't lock min markets because of evening cooling.
+        # T-low IS lockable since rm only decreases.)
+        ticker = "KXLOWTLAX-26APR30-T54"
+        pb._open_positions[ticker] = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": "BUY_YES", "entry_price": 0.33, "count": 90,
+            "cost": 29.70, "settled": False,
+            "station": "KLAX", "date_str": "2026-04-30", "label": "LA",
+            "floor": None, "cap": 53.5,  # T-low (low ≤ 53)
+            "sigma": 2.5, "running_min": None,
+        }
+        self._rm_value = 50.0  # well below cap-1.0=52.5 → confirmed winner
+        market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 0)
+        self.assertEqual(n, 0)  # obs-winner override held
+
+    def test_d1_skipped_even_if_db_returns_rm(self):
+        # If somehow get_running_min returns a value for a future climate
+        # date (shouldn't normally happen), the rm-is-None gate doesn't
+        # protect — but obs-winner / hard-stop logic STILL fire correctly.
+        # This tests that we don't have a regression where d-1 positions
+        # always skip regardless of rm.
+        ticker = "KXLOWTAUS-26MAY01-T56"
+        self._pos(ticker, date_str="2026-05-01", running_min=None)
+        self._rm_value = 50.0  # not winning
+        market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
+        n = pb.check_open_positions_for_exit(market_quotes)
+        # If rm came back from DB, hard-stop CAN fire. This is acceptable
+        # because rm being non-None means we DO have obs evidence.
+        self.assertEqual(n, 1)
 
 
 if __name__ == "__main__":

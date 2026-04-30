@@ -3274,15 +3274,28 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         entry_price = float(pos.get("entry_price", 0))
         if entry_price <= 0:
             continue
-        # d-1+ skip: position's climate date hasn't started yet for its
-        # station's local LST. With no obs, hard-stop fires on bid noise
-        # (AUS-T56 case). Hold to settlement; rely on σ-aware sizing for
-        # downside protection.
-        station = pos.get("station", "")
-        date_str = pos.get("date_str", "")
-        tz_str = _STATION_TZ.get(station)
-        if tz_str and date_str and date_str > _climate_date_nws(tz_str):
-            continue
+        # No-obs skip: skip hard-stop entirely when no obs are available
+        # for the position's climate day. Covers:
+        #   - d-1+ trades (cd hasn't started — Austin entered today for
+        #     tomorrow's market is the canonical case)
+        #   - Early d-0 trades after cd starts but BEFORE first obs lands
+        #     (the transition window where bid may still be depressed from
+        #     overnight panic but no obs to verify direction)
+        #   - obs-pipeline DB outages
+        # Without obs, the hard-stop is firing on bid microstructure noise
+        # uncorrelated with actual probability changes. Hold to settlement;
+        # rely on σ-aware sizing as the only protection until obs available.
+        # AUS-T56 was the trigger: hard_stopped 11min after entry on bid
+        # drop, no obs to confirm any adverse signal.
+        rm = pos.get("running_min")
+        if rm is None:
+            station = pos.get("station")
+            date_str = pos.get("date_str")
+            if station and date_str:
+                rm = get_running_min(station, date_str)
+        if rm is None:
+            continue  # no obs → no hard-stop
+
         # Determine sell side and current bid.
         if action == "BUY_YES":
             sell_side = "yes"
@@ -3298,13 +3311,6 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         loss_pct = (entry_price - current_price) / entry_price
 
         # OBS_CONFIRMED_WINNER override — never sell a guaranteed winner.
-        rm = pos.get("running_min")
-        # If pos was reconciled from Kalshi without rm context, fetch current rm.
-        if rm is None:
-            station = pos.get("station")
-            date_str = pos.get("date_str")
-            if station and date_str:
-                rm = get_running_min(station, date_str)
         if rm is not None:
             try:
                 if _check_position_obs_winning(pos, float(rm)):
