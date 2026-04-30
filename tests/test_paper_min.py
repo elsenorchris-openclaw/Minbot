@@ -3344,5 +3344,168 @@ class TestSettleTailFloorCapNoneGuard(unittest.TestCase):
         self.assertEqual(pb._open_positions[ticker].get("won"), False)
 
 
+class TestSigmaCap(unittest.TestCase):
+    """`SIGMA_MAX_F=4.0` blocks entries when forecast σ is too wide for the
+    edge calc to be trustworthy. Triggered by AUS-26MAY01-T56 disaster
+    (σ=5.7°F, hard-stopped 11 min after entry). Both _evaluate_gates and
+    execute_opportunity must enforce."""
+
+    def setUp(self):
+        pb._cached_bankroll = 100.0
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._calls.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, sigma, **overrides):
+        base = {
+            "market_ticker": "KXLOWTAUS-26MAY01-T56",
+            "event_ticker": "KXLOWTAUS-26MAY01",
+            "action": "BUY_YES",
+            "model_prob": 0.60,
+            "edge": 0.27,
+            "entry_price": 0.33,
+            "yes_bid": 30, "yes_ask": 33,
+            "no_bid": 67, "no_ask": 70,
+            "mu": 58.0, "sigma": sigma, "mu_source": "nbp",
+            "mu_nbp": 58.0, "mu_hrrr": 58.0, "mu_nbm_om": 58.0,
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": 56.5, "cap": None,  # T-high
+            "station": "KAUS", "date_str": "2026-05-01", "label": "Austin",
+            "series": "KXLOWTAUS",
+        }
+        base.update(overrides)
+        return base
+
+    def test_sigma_above_cap_blocks_entry(self):
+        # σ=5.7 (the AUS disaster value) → blocked
+        pb.execute_opportunity(self._opp(sigma=5.7))
+        self.assertEqual(len(self._calls), 0)
+
+    def test_sigma_at_cap_passes(self):
+        # σ=4.5 below 5.0 cap → allowed (preserves ATL B59.5 historical
+        # winner with σ=4.5).
+        pb.execute_opportunity(self._opp(sigma=4.5))
+        self.assertEqual(len(self._calls), 1)
+
+    def test_sigma_above_cap_5_1_blocks(self):
+        # σ=5.1 just above 5.0 cap → blocked
+        pb.execute_opportunity(self._opp(sigma=5.1))
+        self.assertEqual(len(self._calls), 0)
+
+    def test_sigma_below_cap_allows(self):
+        # σ=2.5 well below cap → entry proceeds (place_kalshi_order called)
+        pb.execute_opportunity(self._opp(sigma=2.5))
+        self.assertEqual(len(self._calls), 1)
+
+    def test_evaluate_gates_returns_sigma_too_wide(self):
+        # Pure-function gate replay used by candidate logging.
+        opp = self._opp(sigma=5.7)
+        blocked, reason = pb._evaluate_gates(opp)
+        self.assertEqual(blocked, "SIGMA_TOO_WIDE")
+        self.assertIn("5.7", reason)
+        self.assertIn("5.0", reason)
+
+    def test_evaluate_gates_passes_below_cap(self):
+        opp = self._opp(sigma=2.0)
+        blocked, _ = pb._evaluate_gates(opp)
+        # Should NOT be SIGMA_TOO_WIDE (may pass entirely or fail another gate)
+        self.assertNotEqual(blocked, "SIGMA_TOO_WIDE")
+
+
+class TestSigmaAwareSizing(unittest.TestCase):
+    """σ-aware Kelly shrink (2026-04-30): bet shrinks quadratically as σ
+    grows above SIGMA_REF_F=2.5. Same edge with wider σ is a weaker signal
+    that should size down."""
+
+    def setUp(self):
+        # Bankroll chosen so Kelly × bankroll lands BELOW MAX_BET_USD across
+        # the σ range we test — otherwise the cap masks the shrink.
+        # At σ=2.5, edge=0.30, price=0.50: kelly=0.15, bet=0.15*$50=$7.50, OK.
+        pb._cached_bankroll = 50.0
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda ticker, side, count, price_cents: (
+            self._calls.append((ticker, side, count, price_cents)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, sigma, **overrides):
+        base = {
+            "market_ticker": "KXLOWTNYC-26MAY01-B45.5",
+            "event_ticker": "KXLOWTNYC-26MAY01",
+            "action": "BUY_NO",
+            "model_prob": 0.10,
+            "edge": 0.30,
+            "entry_price": 0.50,
+            "yes_bid": 47, "yes_ask": 50,
+            "no_bid": 48, "no_ask": 50,
+            "mu": 41.0, "sigma": sigma, "mu_source": "nbp",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KNYC", "date_str": "2026-05-01", "label": "NYC",
+            "series": "KXLOWTNYC",
+        }
+        base.update(overrides)
+        return base
+
+    def test_sigma_at_ref_full_size(self):
+        # σ=2.5 (REF) → no shrink
+        pb.execute_opportunity(self._opp(sigma=2.5))
+        self.assertEqual(len(self._calls), 1)
+        count_ref = self._calls[0][2]
+        self.assertGreater(count_ref, 0)
+        self._calls.clear()
+
+        # σ=2.0 (below REF) → still no shrink (capped at 1.0)
+        pb._reset_cycle_budget()
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        pb.execute_opportunity(self._opp(sigma=2.0))
+        self.assertEqual(len(self._calls), 1)
+        count_low = self._calls[0][2]
+        self.assertEqual(count_low, count_ref)
+
+    def test_sigma_wider_shrinks_count(self):
+        # σ=3.5 → shrink to (2.5/3.5)² = 0.51× of σ=2.5 base
+        pb.execute_opportunity(self._opp(sigma=2.5))
+        count_ref = self._calls[0][2]
+        self._calls.clear()
+
+        # Reset state for second call
+        pb._reset_cycle_budget()
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        pb.execute_opportunity(self._opp(sigma=3.5))
+        self.assertEqual(len(self._calls), 1)
+        count_wide = self._calls[0][2]
+        # Allow some rounding slack — wider σ must shrink count meaningfully.
+        self.assertLess(count_wide, count_ref)
+        # Quadratic shrink at σ=3.5: ~0.51× — count should be roughly half.
+        self.assertLess(count_wide, count_ref * 0.7)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
