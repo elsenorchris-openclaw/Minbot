@@ -298,12 +298,14 @@ F2A_SIGMA_MIN = 1.5                 # sigma < this is over-confident model (tigh
 #      shrink the Kelly bet by (REF/σ)². At σ=2.5 (typical NBP), no shrink.
 #      At σ=4.0, bet is 39% of base. Recognizes: same edge with wider σ is
 #      a fundamentally weaker signal that should size down.
-# REF=2.5 chosen as median NBP σ pre-inflation; cap=5.0 chosen to allow
-# per-station σ-mult cases (LAX 2.5×, PHX 2.0× — base ~2 → effective ~4-5)
-# while still rejecting extreme outliers like AUS-T56's 5.7. Historical
-# ATL-26APR27-B59.5 winner had σ=4.5 — preserved.
+# REF=2.5 chosen as median NBP σ pre-inflation; cap=6.0 (raised from 5.0
+# 2026-04-30 PM) after audit showed too-tight cap was discarding +EV trades.
+# Data: σ ∈ [6,7) had 1 winner (DEN-26APR30-B38.5, +$2.90), no losers; the
+# AUS-T56 disaster was hard-stop-driven, not σ-driven. With σ-aware sizing
+# already in place, wider cap captures more edge while still blocking the
+# clear outliers (PHX σ=6.8 still gets caught).
 SIGMA_REF_F = 2.5                   # reference σ for full-Kelly sizing
-SIGMA_MAX_F = 5.0                   # hard cap; entries blocked above this
+SIGMA_MAX_F = 6.0                   # hard cap; entries blocked when sigma > this
 # F2A_DIST_MIN: V2 uses 0.5°F from NBM. NOT ported — min-bot audit (n=15) found
 # `mu at bracket edge` is the BUY_NO winner pattern (cli flips OUTSIDE the bracket
 # from there 60-100% of the time). MIN_ABS_DISTANCE_F (mu vs bracket MID, 0.5°F)
@@ -3246,10 +3248,16 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
     current bid in market_quotes (caller passes a {ticker: market_dict} index
     from discover_markets). Triggers:
 
-      1. OBS_CONFIRMED_WINNER override → SKIP exit (hold guaranteed wins
+      1. d-1+ SKIP — climate day hasn't started for this station, no obs to
+         verify adverse moves. Let σ-aware sizing be the only protection;
+         hold to settlement. Tail markets at d-1 swing 30%+ on thin
+         microstructure noise unrelated to actual probability changes.
+         Trigger: AUS-26MAY01-T56 hard_stopped 11min after entry on bid
+         drop, settled tomorrow on climate-day low (likely a winner).
+      2. OBS_CONFIRMED_WINNER override → SKIP exit (hold guaranteed wins
          even if MTM looks awful — V2 lesson: thin-book price noise faked
          losses on confirmed winners).
-      2. HARD STOP: MTM loss ≥ HARD_STOP_BRACKET_LOSS_PCT (B-bracket) or
+      3. HARD STOP: MTM loss ≥ HARD_STOP_BRACKET_LOSS_PCT (B-bracket) or
          HARD_STOP_TAIL_LOSS_PCT (tail) → SELL at current bid.
 
     Returns count of exits executed."""
@@ -3265,6 +3273,15 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         action = pos.get("action")
         entry_price = float(pos.get("entry_price", 0))
         if entry_price <= 0:
+            continue
+        # d-1+ skip: position's climate date hasn't started yet for its
+        # station's local LST. With no obs, hard-stop fires on bid noise
+        # (AUS-T56 case). Hold to settlement; rely on σ-aware sizing for
+        # downside protection.
+        station = pos.get("station", "")
+        date_str = pos.get("date_str", "")
+        tz_str = _STATION_TZ.get(station)
+        if tz_str and date_str and date_str > _climate_date_nws(tz_str):
             continue
         # Determine sell side and current bid.
         if action == "BUY_YES":

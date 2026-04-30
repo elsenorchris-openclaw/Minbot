@@ -3389,39 +3389,44 @@ class TestSigmaCap(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_sigma_above_cap_blocks_entry(self):
-        # σ=5.7 (the AUS disaster value) → blocked
-        pb.execute_opportunity(self._opp(sigma=5.7))
+    def test_sigma_well_above_cap_blocks_entry(self):
+        # σ=6.8 (the PHX outlier value) → blocked at cap=6.0
+        pb.execute_opportunity(self._opp(sigma=6.8))
         self.assertEqual(len(self._calls), 0)
 
-    def test_sigma_at_cap_passes(self):
-        # σ=4.5 below 5.0 cap → allowed (preserves ATL B59.5 historical
-        # winner with σ=4.5).
-        pb.execute_opportunity(self._opp(sigma=4.5))
+    def test_sigma_at_six_zero_passes(self):
+        # σ=6.0 at the cap boundary (strict `>` comparison) → allowed.
+        # Preserves DEN-26APR30-B38.5 winner that had σ=6.0.
+        pb.execute_opportunity(self._opp(sigma=6.0))
         self.assertEqual(len(self._calls), 1)
 
-    def test_sigma_above_cap_5_1_blocks(self):
-        # σ=5.1 just above 5.0 cap → blocked
-        pb.execute_opportunity(self._opp(sigma=5.1))
+    def test_sigma_just_above_cap_blocks(self):
+        # σ=6.1 just above 6.0 cap → blocked
+        pb.execute_opportunity(self._opp(sigma=6.1))
         self.assertEqual(len(self._calls), 0)
 
+    def test_sigma_aus_t56_value_now_passes(self):
+        # σ=5.7 (the original AUS-T56 disaster trigger) → now ALLOWED.
+        # Protection at this width is the σ-aware sizing shrink (~$5 bet)
+        # plus d-1 hard-stop skip; cap no longer the primary mechanism.
+        pb.execute_opportunity(self._opp(sigma=5.7))
+        self.assertEqual(len(self._calls), 1)
+
     def test_sigma_below_cap_allows(self):
-        # σ=2.5 well below cap → entry proceeds (place_kalshi_order called)
+        # σ=2.5 well below cap → entry proceeds
         pb.execute_opportunity(self._opp(sigma=2.5))
         self.assertEqual(len(self._calls), 1)
 
     def test_evaluate_gates_returns_sigma_too_wide(self):
-        # Pure-function gate replay used by candidate logging.
-        opp = self._opp(sigma=5.7)
+        opp = self._opp(sigma=6.8)
         blocked, reason = pb._evaluate_gates(opp)
         self.assertEqual(blocked, "SIGMA_TOO_WIDE")
-        self.assertIn("5.7", reason)
-        self.assertIn("5.0", reason)
+        self.assertIn("6.8", reason)
+        self.assertIn("6.0", reason)
 
     def test_evaluate_gates_passes_below_cap(self):
         opp = self._opp(sigma=2.0)
         blocked, _ = pb._evaluate_gates(opp)
-        # Should NOT be SIGMA_TOO_WIDE (may pass entirely or fail another gate)
         self.assertNotEqual(blocked, "SIGMA_TOO_WIDE")
 
 
@@ -3613,6 +3618,75 @@ class TestPartialExitNoOrphan(unittest.TestCase):
         self.assertAlmostEqual(pos["_partial_exit_pnl"], first_partial - 5.0, places=2)
         self.assertEqual(pos["_partial_exit_count"], 31)  # 11 + 20
         self.assertFalse(pos.get("settled", False))
+
+
+class TestHardStopSkipsD1(unittest.TestCase):
+    """`check_open_positions_for_exit` must skip hard-stop on d-1+ positions
+    (climate day not yet started for the station's local LST). Without obs
+    available, hard-stopping fires on bid microstructure noise. Trigger:
+    AUS-26MAY01-T56 hard_stopped 11min after entry, settles tomorrow on
+    actual climate-day low (likely a winner)."""
+
+    def setUp(self):
+        self._saved_pos = dict(pb._open_positions)
+        pb._open_positions.clear()
+        # Mock _climate_date_nws to return a fixed today
+        self._orig_cd = pb._climate_date_nws
+        pb._climate_date_nws = lambda tz, now_utc=None: "2026-04-30"
+        # Mock _execute_exit to count calls
+        self._orig_exit = pb._execute_exit
+        self._exit_calls: list[tuple] = []
+        pb._execute_exit = lambda ticker, pos, sell_side, sell_price_c, reason: (
+            self._exit_calls.append((ticker, sell_side, sell_price_c, reason)) or True)
+        # Mock running_min lookup so obs-winner override doesn't trip
+        self._orig_get_rm = pb.get_running_min
+        pb.get_running_min = lambda st, cd: None
+
+    def tearDown(self):
+        pb._open_positions.clear()
+        pb._open_positions.update(self._saved_pos)
+        pb._climate_date_nws = self._orig_cd
+        pb._execute_exit = self._orig_exit
+        pb.get_running_min = self._orig_get_rm
+
+    def _pos(self, ticker, date_str, action="BUY_YES", entry=0.33, count=90):
+        pb._open_positions[ticker] = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": action, "entry_price": entry, "count": count,
+            "cost": count * entry, "settled": False,
+            "station": "KAUS", "date_str": date_str, "label": "Austin",
+            "floor": 56.5 if action == "BUY_YES" else 48.0,
+            "cap": None if action == "BUY_YES" else 49.0,
+            "sigma": 5.7,
+        }
+
+    def test_d1_position_skipped_at_huge_loss(self):
+        # AUS-T56 cd=2026-05-01, today's cd=2026-04-30 → d-1+. Even at
+        # 91% MTM loss, no exit fires.
+        ticker = "KXLOWTAUS-26MAY01-T56"
+        self._pos(ticker, date_str="2026-05-01")
+        market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
+        n = pb.check_open_positions_for_exit(market_quotes)
+        self.assertEqual(n, 0)
+        self.assertEqual(self._exit_calls, [])
+
+    def test_d0_position_still_hard_stopped(self):
+        # Same loss profile but cd=today → hard-stop fires.
+        ticker = "KXLOWTAUS-26APR30-T56"
+        self._pos(ticker, date_str="2026-04-30")
+        market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
+        n = pb.check_open_positions_for_exit(market_quotes)
+        self.assertEqual(n, 1)
+        self.assertEqual(self._exit_calls[0][0], ticker)
+        self.assertEqual(self._exit_calls[0][3], "hard_stop")
+
+    def test_d2_position_also_skipped(self):
+        # 2-day-out market — definitely d-1+, definitely skipped.
+        ticker = "KXLOWTAUS-26MAY02-T56"
+        self._pos(ticker, date_str="2026-05-02")
+        market_quotes = {ticker: {"yes_bid": 1, "yes_ask": 3, "no_bid": 97, "no_ask": 99}}
+        n = pb.check_open_positions_for_exit(market_quotes)
+        self.assertEqual(n, 0)
 
 
 if __name__ == "__main__":
