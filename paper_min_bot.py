@@ -793,6 +793,60 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
 _last_rm_seen: dict[str, tuple[str, float]] = {}
 NEW_LOW_THRESHOLD_F = 0.1
 
+# 6-hour rolling summary of running_min across all 20 stations. Fires once
+# at startup (so a fresh boot has immediate visibility) and then every 6h.
+SUMMARY_INTERVAL_SEC = 6 * 3600
+_last_summary_ts: float = 0.0
+
+
+def _send_running_low_summary() -> None:
+    """Post a 'running low' summary for all 20 stations to the Discord
+    channel. Each line: <city> (<icao>): X°F  age=Nm  src=...
+    Stations with no rm yet are listed as '—'."""
+    now_utc = datetime.now(timezone.utc)
+    lines = [f"🌡️ **6h Running-Min Summary** ({now_utc.strftime('%Y-%m-%d %H:%M UTC')})"]
+    lines.append("```")
+    for series, info in CITIES.items():
+        station = info["station"]
+        label = info["label"]
+        tz = info["tz"]
+        cd = _climate_date_nws(tz)
+        rm = get_running_min(station, cd)
+        if rm is None:
+            lines.append(f"{station:6s} {label:14s}     —    cd {cd}  (no obs yet)")
+            continue
+        # Pull the min_obs_time for context
+        try:
+            conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+            row = conn.execute(
+                "SELECT min_obs_time, source FROM running_min WHERE station=? AND climate_date=?",
+                (station, cd),
+            ).fetchone()
+            conn.close()
+        except sqlite3.Error:
+            row = None
+        mot = row[0] if row else None
+        src = row[1] if row else "?"
+        age_min = ((now_utc.timestamp() - mot) / 60.0) if mot else None
+        age_str = f"{age_min:>4.0f}m" if age_min is not None else "  ?"
+        cd_short = cd[5:]  # MM-DD
+        lines.append(f"{station:6s} {label:14s} {rm:>5.1f}°F cd {cd_short} obs_age={age_str} src={src}")
+    lines.append("```")
+    discord_send("\n".join(lines))
+
+
+def _maybe_send_low_summary() -> None:
+    """Time-gated wrapper for _send_running_low_summary. Called from scan_cycle."""
+    global _last_summary_ts
+    now = time.time()
+    if now - _last_summary_ts < SUMMARY_INTERVAL_SEC:
+        return
+    try:
+        _send_running_low_summary()
+        _last_summary_ts = now
+    except Exception as e:
+        log(f"  running-low summary failed: {e}", "warn")
+
 
 def _check_new_low_alerts() -> None:
     """Poll running_min for all 20 stations; Discord-alert on new daily lows.
@@ -3375,6 +3429,9 @@ def scan_cycle() -> dict:
         _check_new_low_alerts()
     except Exception as e:
         log(f"  new-low alert check failed: {e}", "warn")
+
+    # 6-hour rolling summary of running_min across all 20 stations.
+    _maybe_send_low_summary()
 
     # NBP refresh: HEAD-poll trigger (2026-04-30). Probes next-expected cycle
     # URL on S3 once per scan past cycle+70min; full GET only when HEAD=200.

@@ -3160,5 +3160,64 @@ class TestNewLowDiscordAlerts(unittest.TestCase):
         self.assertEqual(pb._last_rm_seen["KSEA"], ("2026-04-30", 47.0))
 
 
+class TestRunningLowSummary(unittest.TestCase):
+    """`_maybe_send_low_summary()` time-gated wrapper around
+    `_send_running_low_summary()`. Fires on first scan, then once per
+    SUMMARY_INTERVAL_SEC."""
+
+    def setUp(self):
+        self._saved_ts = pb._last_summary_ts
+        pb._last_summary_ts = 0.0
+        # Mock get_running_min
+        self._rm_map = {info["station"]: 50.0 for series, info in pb.CITIES.items()}
+        self._orig_get_rm = pb.get_running_min
+        pb.get_running_min = lambda st, cd: self._rm_map.get(st)
+        # Mock _climate_date_nws
+        self._orig_cd = pb._climate_date_nws
+        pb._climate_date_nws = lambda tz, now_utc=None: "2026-04-30"
+        # Capture discord_send
+        self._discord_msgs = []
+        self._orig_discord = pb.discord_send
+        pb.discord_send = lambda msg: self._discord_msgs.append(msg)
+
+    def tearDown(self):
+        pb._last_summary_ts = self._saved_ts
+        pb.get_running_min = self._orig_get_rm
+        pb._climate_date_nws = self._orig_cd
+        pb.discord_send = self._orig_discord
+
+    def test_first_call_fires_summary(self):
+        pb._maybe_send_low_summary()
+        self.assertEqual(len(self._discord_msgs), 1)
+        msg = self._discord_msgs[0]
+        self.assertIn("Running-Min Summary", msg)
+        # All 20 stations + header lines
+        for series, info in pb.CITIES.items():
+            self.assertIn(info["station"], msg)
+
+    def test_throttle_within_interval(self):
+        pb._maybe_send_low_summary()
+        pb._maybe_send_low_summary()  # too soon
+        pb._maybe_send_low_summary()
+        self.assertEqual(len(self._discord_msgs), 1)
+
+    def test_re_fires_after_interval(self):
+        pb._maybe_send_low_summary()
+        # Wind the clock back so the next call looks like 6h+1s later
+        pb._last_summary_ts -= pb.SUMMARY_INTERVAL_SEC + 1
+        pb._maybe_send_low_summary()
+        self.assertEqual(len(self._discord_msgs), 2)
+
+    def test_missing_rm_renders_dash(self):
+        # Drop one station's rm — line should render '—' / 'no obs yet'
+        self._rm_map.pop("KSEA")
+        pb._maybe_send_low_summary()
+        msg = self._discord_msgs[0]
+        # Find the KSEA line
+        lines = [l for l in msg.split("\n") if "KSEA" in l]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("no obs yet", lines[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
