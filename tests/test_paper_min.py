@@ -790,6 +790,10 @@ class TestDirectionalConsistency(unittest.TestCase):
     return None to fail-fast out of execute_opportunity)."""
 
     def setUp(self):
+        # 2026-04-30: cold-start bankroll guard refuses to size when
+        # _cached_bankroll<=0. Seed a real value so sizing reaches the
+        # mock-place path rather than short-circuiting to refuse-trade.
+        pb._cached_bankroll = 100.0
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -874,6 +878,7 @@ class TestAbsDistanceGate(unittest.TestCase):
     ATL-B61.5 (mp=19%, abs_dist 0.5°F)."""
 
     def setUp(self):
+        pb._cached_bankroll = 100.0  # cold-start guard requires verified bankroll
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -1007,6 +1012,7 @@ class TestSizingMinCostFloor(unittest.TestCase):
     keeps the floor from blowing the ceiling on cheap contracts."""
 
     def setUp(self):
+        pb._cached_bankroll = 100.0  # cold-start guard requires verified bankroll
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -1109,6 +1115,7 @@ class TestDirectionalGateTightened(unittest.TestCase):
     Current: BUY_NO requires mp ≤ 0.20; BUY_YES requires mp ≥ 0.60."""
 
     def setUp(self):
+        pb._cached_bankroll = 100.0  # cold-start guard requires verified bankroll
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -3217,6 +3224,126 @@ class TestRunningLowSummary(unittest.TestCase):
         lines = [l for l in msg.split("\n") if "KSEA" in l]
         self.assertEqual(len(lines), 1)
         self.assertIn("no obs yet", lines[0])
+
+
+class TestBankrollColdStart(unittest.TestCase):
+    """`_get_bankroll_cached()` must return 0.0 when no real balance ever
+    fetched (cold start during Kalshi outage). Callers must refuse to size
+    rather than fall back to a synthetic MAX_BET_USD bankroll."""
+
+    def setUp(self):
+        self._saved_bankroll = pb._cached_bankroll
+        self._saved_ts = pb._bankroll_cache_ts
+        pb._cached_bankroll = 0.0
+        pb._bankroll_cache_ts = 0.0
+        self._orig_get_balance = pb.get_kalshi_balance
+
+    def tearDown(self):
+        pb._cached_bankroll = self._saved_bankroll
+        pb._bankroll_cache_ts = self._saved_ts
+        pb.get_kalshi_balance = self._orig_get_balance
+
+    def test_cold_start_returns_zero_when_balance_fetch_fails(self):
+        # get_kalshi_balance returns None (401 etc). Cached must stay 0.
+        pb.get_kalshi_balance = lambda: None
+        self.assertEqual(pb._get_bankroll_cached(), 0.0)
+        self.assertEqual(pb._cached_bankroll, 0.0)
+
+    def test_returns_real_balance_when_fetch_succeeds(self):
+        pb.get_kalshi_balance = lambda: 274.87
+        self.assertEqual(pb._get_bankroll_cached(), 274.87)
+        self.assertEqual(pb._cached_bankroll, 274.87)
+
+    def test_returns_cached_when_within_refresh_interval(self):
+        # Seed a cached value, set ts=now, fetch should not re-call balance.
+        pb._cached_bankroll = 100.0
+        pb._bankroll_cache_ts = pb.time.time()
+        called = {"n": 0}
+        def watcher():
+            called["n"] += 1
+            return 999.0
+        pb.get_kalshi_balance = watcher
+        self.assertEqual(pb._get_bankroll_cached(), 100.0)
+        self.assertEqual(called["n"], 0)
+
+    def test_no_synthetic_max_bet_fallback(self):
+        # Fixed-bug regression: previously returned MAX_BET_USD when cached <=0.
+        # Confirm we DON'T do that anymore.
+        pb._cached_bankroll = 0.0
+        pb.get_kalshi_balance = lambda: None
+        self.assertNotEqual(pb._get_bankroll_cached(), pb.MAX_BET_USD)
+        self.assertEqual(pb._get_bankroll_cached(), 0.0)
+
+
+class TestSettleTailFloorCapNoneGuard(unittest.TestCase):
+    """`check_settlements` must skip positions with floor=None AND cap=None
+    rather than silently mis-settle (April 27 phantom-bug class)."""
+
+    def setUp(self):
+        # Snapshot module state we'll mutate
+        self._saved_pos = dict(pb._open_positions)
+        pb._open_positions.clear()
+        # Mock CLI lookup to return a known value
+        self._orig_cli = pb.get_cli_low
+        pb.get_cli_low = lambda st, cd: 50  # arbitrary final CLI
+        # Mock _cli_is_final to True so we go into the CLI settlement path
+        self._orig_final = pb._cli_is_final
+        pb._cli_is_final = lambda st, cd, tz: True
+        # Capture log warnings + settlements written
+        self._warns = []
+        self._orig_log = pb.log
+        def cap_log(msg, level="info"):
+            if level == "warn":
+                self._warns.append(msg)
+        pb.log = cap_log
+        self._appended = []
+        self._orig_append = pb._append_jsonl
+        pb._append_jsonl = lambda path, record: self._appended.append((str(path), record))
+
+    def tearDown(self):
+        pb._open_positions.clear()
+        pb._open_positions.update(self._saved_pos)
+        pb.get_cli_low = self._orig_cli
+        pb._cli_is_final = self._orig_final
+        pb.log = self._orig_log
+        pb._append_jsonl = self._orig_append
+
+    def test_floor_and_cap_both_none_skips_settlement(self):
+        # Inject a malformed T-tail position (no floor, no cap).
+        ticker = "KXLOWTSEA-26APR28-T42"
+        pb._open_positions[ticker] = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": "BUY_YES", "entry_price": 0.50, "count": 5, "cost": 2.50,
+            "station": "KSEA", "date_str": "2026-04-28",
+            "floor": None, "cap": None,
+            "settled": False,
+        }
+        n = pb.check_settlements()
+        # No settlement record written; no settled flag set.
+        self.assertEqual(n, 0)
+        self.assertFalse(pb._open_positions[ticker].get("settled", False))
+        # Warning logged
+        self.assertTrue(any("floor=cap=None" in w for w in self._warns),
+                        f"Expected guard warning, got: {self._warns}")
+        # No settlement appended
+        settle_writes = [a for a in self._appended if "settlements" in a[0]]
+        self.assertEqual(len(settle_writes), 0)
+
+    def test_normal_tail_still_settles(self):
+        # T-low with cap set (floor=None) — should settle normally.
+        ticker = "KXLOWTSEA-26APR28-T42"
+        pb._open_positions[ticker] = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": "BUY_YES", "entry_price": 0.50, "count": 5, "cost": 2.50,
+            "station": "KSEA", "date_str": "2026-04-28",
+            "floor": None, "cap": 41.5,  # T42 = "low ≤ 41"
+            "settled": False,
+        }
+        # cli_low=50 > 41.5 → not in bracket → BUY_YES loses
+        n = pb.check_settlements()
+        self.assertEqual(n, 1)
+        self.assertTrue(pb._open_positions[ticker].get("settled", False))
+        self.assertEqual(pb._open_positions[ticker].get("won"), False)
 
 
 if __name__ == "__main__":

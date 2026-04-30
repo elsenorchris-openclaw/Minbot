@@ -1940,9 +1940,15 @@ _bankroll_cache_ts: float = 0.0
 
 
 def _get_bankroll_cached() -> float:
-    """Return Kalshi bankroll, refreshed every BANKROLL_REFRESH_SEC. On fetch
-    failure, falls back to the cached value (or MAX_BET_USD on cold start —
-    preserves pre-fix sizing as a safety net)."""
+    """Return Kalshi bankroll, refreshed every BANKROLL_REFRESH_SEC.
+    Returns 0.0 if no real balance has ever been cached (cold start or
+    persistent Kalshi-auth failure). Callers must treat 0.0 as 'unverified
+    bankroll, refuse to size'.
+
+    2026-04-30: removed MAX_BET_USD fallback. Pre-fix, a cold start during
+    a Kalshi outage would size trades against a synthetic $30 bankroll and
+    happily place orders sized for that fictional balance. Now we refuse
+    to size until balance fetch succeeds at least once."""
     global _cached_bankroll, _bankroll_cache_ts
     now = time.time()
     if now - _bankroll_cache_ts > BANKROLL_REFRESH_SEC:
@@ -1950,7 +1956,7 @@ def _get_bankroll_cached() -> float:
         if b is not None:
             _cached_bankroll = b
             _bankroll_cache_ts = now
-    return _cached_bankroll if _cached_bankroll > 0 else MAX_BET_USD
+    return _cached_bankroll  # 0.0 when never successfully fetched
 
 
 # ─── Obs-confirmed-alive helpers (V2 port) ────────────────────────────────
@@ -2842,6 +2848,14 @@ def execute_opportunity(opp: dict) -> bool:
     if obs_alive:
         kelly *= SIGNAL_KELLY_MULT
     bankroll = _get_bankroll_cached()
+    if bankroll <= 0:
+        # Cold start with no successful balance fetch (e.g. Kalshi 401-ing).
+        # Refuse rather than size against a synthetic fallback. Caller will
+        # try again next scan; balance refresh runs inside _get_bankroll_cached.
+        _log_skip(ticker,
+            f"  skip {ticker}: no verified bankroll yet "
+            f"(get_kalshi_balance returned None); refusing trade")
+        return False
     bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * bankroll))
     count = max(1, int(bet_usd / price))
     count = max(count, math.ceil(MIN_COST_USD / price))
@@ -3345,6 +3359,17 @@ def check_settlements() -> int:
             # Determine outcome from CLI low
             floor = pos.get("floor")
             cap = pos.get("cap")
+            # Defense-in-depth (2026-04-30): if both bounds are None we'd
+            # silently default in_bracket=True, inverting BUY_NO/BUY_YES
+            # settlement (Apr 27 phantom: CHI-T48 +$8.28, SEA-T42 +$3.32,
+            # LV-T58 −$0.80). _reconcile_kalshi_positions already filters
+            # such records at creation, but a stale positions.json from
+            # before the reconcile fix could still hold one. Skip rather
+            # than mis-settle.
+            if floor is None and cap is None:
+                log(f"  SKIP settle {ticker}: floor=cap=None — would invert "
+                    f"settlement. Reconcile should have resolved tail bounds.", "warn")
+                continue
             in_bracket = True
             if floor is not None and cli_low < floor:
                 in_bracket = False
