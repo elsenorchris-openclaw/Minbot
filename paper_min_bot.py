@@ -3296,6 +3296,22 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         if rm is None:
             continue  # no obs → no hard-stop
 
+        # BUY_YES T-high: skip hard-stop entirely. Per memory
+        # `min_bot BUY_YES T-high obs_alive bypass removed 2026-04-28`, the
+        # obs-winner override is INTENTIONALLY disabled for T-high BUY_YES
+        # because rm-above-floor doesn't lock min-temp (evening cooling can
+        # still drop the low below threshold). With override disabled,
+        # hard-stop fires on bid noise even when rm is showing we're likely
+        # winning — same disaster pattern that produced AUS-26MAY01-T56's
+        # $26 loss on what was likely a settlement winner. Decision
+        # 2026-04-30: hold T-high BUY_YES to settlement entirely. σ-aware
+        # sizing shrinks the bet (~$5-10 typical), bounding max loss; the
+        # asymmetric tail payoff makes settlement risk acceptable.
+        floor_v = pos.get("floor")
+        cap_v = pos.get("cap")
+        if action == "BUY_YES" and floor_v is not None and cap_v is None:
+            continue
+
         # Determine sell side and current bid.
         if action == "BUY_YES":
             sell_side = "yes"
