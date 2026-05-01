@@ -3801,11 +3801,15 @@ def scan_cycle() -> dict:
     # edge ≥ OBS_ALIVE_MIN_EDGE; execute_opportunity itself decides.
     taken = [o for o in opps if o.get("edge", 0) >= OBS_ALIVE_MIN_EDGE]
     stats["opps"] = sum(1 for o in opps if o.get("edge", 0) > 0)
+    # 2026-05-01: outer dedup removed. The pre-fix `if ticker in _open_positions:
+    # continue` blocked every ticker with a partial-fill record from reaching
+    # execute_opportunity, which is where add-on eligibility is decided. With
+    # the V2-style add-on path (commit 9ef1201), execute_opportunity owns the
+    # full eligibility check (settled / exited / partial-exited / at-intended /
+    # at-MAX_BET_USD); the outer dedup was the V1-era assumption that one
+    # ticker = one entry attempt. Real-money result of leaving it: 0 add-ons
+    # fired in 6h across 13 partial-fill positions — capital under-deployed.
     for opp in taken:
-        ticker = opp["market_ticker"]
-        with _positions_lock:
-            if ticker in _open_positions:
-                continue
         if execute_opportunity(opp):
             stats["taken"] += 1
     return stats

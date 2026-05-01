@@ -4223,5 +4223,85 @@ class TestAddOnPath(unittest.TestCase):
         self.assertGreater(pb._today_exposure_usd, before_exposure)
 
 
+class TestScanAndTradeAddonIntegration(unittest.TestCase):
+    """REGRESSION (2026-05-01): scan_cycle must NOT skip tickers already
+    in _open_positions before reaching execute_opportunity. Pre-fix at
+    paper_min_bot.py:3804-3808 had an outer dedup `if ticker in _open_positions:
+    continue` that blocked every partial-fill ticker from getting an add-on
+    call. Add-on eligibility is owned by execute_opportunity (settled /
+    exited / partial-exited / at-intended / at-MAX_BET_USD); the outer
+    dedup was V1-era one-ticker-one-entry that defeats the V2 add-on port.
+
+    This test exercises scan_cycle end-to-end with stubbed I/O. Without
+    the fix it FAILS (execute_opportunity is never called). With the fix
+    it PASSES."""
+
+    def setUp(self):
+        self._exec_calls: list[dict] = []
+        self._orig_execute = pb.execute_opportunity
+        self._orig_discover = pb.discover_markets
+        self._orig_check = pb.check_open_positions_for_exit
+        self._orig_find = pb.find_opportunities
+        self._orig_record = pb.record_candidate
+
+        # Stub I/O — execute_opportunity captures the opp it was called with.
+        pb.execute_opportunity = lambda opp: (self._exec_calls.append(opp) or True)
+        pb.discover_markets = lambda: [{
+            "market_ticker": "KXLOWTBOS-26APR28-B45.5",
+            "event_ticker": "KXLOWTBOS-26APR28",
+        }]
+        pb.check_open_positions_for_exit = lambda mkts: 0
+        pb.record_candidate = lambda opp: None
+        # find_opportunities returns the partial-fill ticker as a takeable opp.
+        pb.find_opportunities = lambda mkts: [{
+            "market_ticker": "KXLOWTBOS-26APR28-B45.5",
+            "event_ticker": "KXLOWTBOS-26APR28",
+            "edge": 0.30,  # > OBS_ALIVE_MIN_EDGE (0.05)
+            "action": "BUY_NO",
+        }]
+
+        # Pre-seed _open_positions with an addon-eligible partial fill.
+        with pb._positions_lock:
+            pb._open_positions.clear()
+            pb._open_positions["KXLOWTBOS-26APR28-B45.5"] = {
+                "kind": "entry", "market_ticker": "KXLOWTBOS-26APR28-B45.5",
+                "action": "BUY_NO", "entry_price": 0.30, "count": 2,
+                "cost": 0.60,
+                "_intended_count": 50, "_filled_count": 2, "_n_orders": 1,
+                "settled": False,
+            }
+
+    def tearDown(self):
+        pb.execute_opportunity = self._orig_execute
+        pb.discover_markets = self._orig_discover
+        pb.check_open_positions_for_exit = self._orig_check
+        pb.find_opportunities = self._orig_find
+        pb.record_candidate = self._orig_record
+        with pb._positions_lock:
+            pb._open_positions.clear()
+
+    def test_partial_fill_ticker_reaches_execute_opportunity(self):
+        """The exact regression: scan_cycle must call execute_opportunity
+        for a ticker that already has a partial-fill open position, so the
+        add-on path inside execute_opportunity gets a chance to fire."""
+        pb.scan_cycle()
+        self.assertEqual(len(self._exec_calls), 1,
+            "execute_opportunity must be called for ticker in _open_positions "
+            "when the position is addon-eligible (partial fill)")
+        self.assertEqual(self._exec_calls[0]["market_ticker"],
+                         "KXLOWTBOS-26APR28-B45.5")
+
+    def test_fully_filled_ticker_still_reaches_execute_opportunity(self):
+        """Even a fully-filled position must reach execute_opportunity — the
+        eligibility check there returns False quickly (cur_count >= intended).
+        Outer scan_cycle is no longer the gatekeeper."""
+        with pb._positions_lock:
+            pb._open_positions["KXLOWTBOS-26APR28-B45.5"]["count"] = 50
+            pb._open_positions["KXLOWTBOS-26APR28-B45.5"]["_filled_count"] = 50
+        pb.scan_cycle()
+        # Still called — execute_opportunity now decides via internal check.
+        self.assertEqual(len(self._exec_calls), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
