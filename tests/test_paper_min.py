@@ -3179,7 +3179,11 @@ class TestRunningLowSummary(unittest.TestCase):
 
     def setUp(self):
         self._saved_ts = pb._last_summary_ts
-        pb._last_summary_ts = 0.0
+        # 2026-05-01: lazy-anchor fix — when _last_summary_ts == 0.0, the
+        # first call records `now` and returns WITHOUT sending (was a per-
+        # restart spam bug). Tests that need a send to fire must pre-anchor
+        # _last_summary_ts to >= 6h ago.
+        pb._last_summary_ts = pb.time.time() - (pb.SUMMARY_INTERVAL_SEC + 1)
         # Mock get_running_min
         self._rm_map = {info["station"]: 50.0 for series, info in pb.CITIES.items()}
         self._orig_get_rm = pb.get_running_min
@@ -3199,6 +3203,7 @@ class TestRunningLowSummary(unittest.TestCase):
         pb.discord_send = self._orig_discord
 
     def test_first_call_fires_summary(self):
+        # _last_summary_ts pre-anchored 6h+1s ago in setUp → fires.
         pb._maybe_send_low_summary()
         self.assertEqual(len(self._discord_msgs), 1)
         msg = self._discord_msgs[0]
@@ -3208,16 +3213,16 @@ class TestRunningLowSummary(unittest.TestCase):
             self.assertIn(info["station"], msg)
 
     def test_throttle_within_interval(self):
-        pb._maybe_send_low_summary()
-        pb._maybe_send_low_summary()  # too soon
+        pb._maybe_send_low_summary()  # fires (anchored 6h+1s ago in setUp)
+        pb._maybe_send_low_summary()  # too soon — last fire just now
         pb._maybe_send_low_summary()
         self.assertEqual(len(self._discord_msgs), 1)
 
     def test_re_fires_after_interval(self):
-        pb._maybe_send_low_summary()
+        pb._maybe_send_low_summary()  # 1st fire
         # Wind the clock back so the next call looks like 6h+1s later
         pb._last_summary_ts -= pb.SUMMARY_INTERVAL_SEC + 1
-        pb._maybe_send_low_summary()
+        pb._maybe_send_low_summary()  # 2nd fire
         self.assertEqual(len(self._discord_msgs), 2)
 
     def test_missing_rm_renders_dash(self):
@@ -4301,6 +4306,72 @@ class TestScanAndTradeAddonIntegration(unittest.TestCase):
         pb.scan_cycle()
         # Still called — execute_opportunity now decides via internal check.
         self.assertEqual(len(self._exec_calls), 1)
+
+
+class TestLowSummaryThrottle(unittest.TestCase):
+    """REGRESSION (2026-05-01): _last_summary_ts initialized at 0.0 caused
+    a free 6h-running-low summary to fire on every bot restart, because
+    `now - 0` is always >> SUMMARY_INTERVAL_SEC=21600. Five restarts today
+    = ~5 summaries instead of 1. Fix: initialize _last_summary_ts to
+    time.time() at module import so the throttle window is anchored to
+    bot startup time, not the unix epoch.
+
+    These tests stub `_send_running_low_summary` to count calls without
+    actually building a city snapshot."""
+
+    def setUp(self):
+        self._send_count = 0
+        self._orig_send_summary = pb._send_running_low_summary
+
+        def _stub_send():
+            self._send_count += 1
+
+        pb._send_running_low_summary = _stub_send
+        # Stash original module global so we can restore.
+        self._orig_last_ts = pb._last_summary_ts
+
+    def tearDown(self):
+        pb._send_running_low_summary = self._orig_send_summary
+        pb._last_summary_ts = self._orig_last_ts
+
+    def test_no_summary_immediately_after_module_init(self):
+        """Simulate bot restart: _last_summary_ts == 0.0 (the buggy init).
+        Post-fix the function lazy-anchors the window on first call; pre-fix
+        it would fire because now - 0.0 >> 6h. This is the actual regression
+        test for the every-restart-triggers-a-summary bug."""
+        pb._last_summary_ts = 0.0  # simulate fresh import / pre-fix init
+        pb._maybe_send_low_summary()
+        self.assertEqual(self._send_count, 0,
+            "Should not send on first call after restart (when _last_summary_ts=0.0). "
+            "Without lazy-init guard, now - 0 >> 6h triggers a free summary every restart.")
+        # And after the lazy anchor, _last_summary_ts must be set to a real ts
+        # so subsequent calls in the window are also suppressed.
+        self.assertGreater(pb._last_summary_ts, 0,
+            "Lazy-init must set _last_summary_ts to current time on first call.")
+
+    def test_no_summary_at_5h_59m(self):
+        """5h 59m after last fire: still suppressed."""
+        pb._last_summary_ts = pb.time.time() - (5 * 3600 + 59 * 60)
+        pb._maybe_send_low_summary()
+        self.assertEqual(self._send_count, 0)
+
+    def test_summary_fires_after_6h(self):
+        """6h + 1s after last fire: summary fires exactly once."""
+        pb._last_summary_ts = pb.time.time() - (6 * 3600 + 1)
+        pb._maybe_send_low_summary()
+        self.assertEqual(self._send_count, 1)
+
+    def test_summary_only_fires_once_per_window(self):
+        """After firing, immediate re-call within window must not fire again."""
+        pb._last_summary_ts = pb.time.time() - (6 * 3600 + 1)
+        pb._maybe_send_low_summary()
+        pb._maybe_send_low_summary()
+        self.assertEqual(self._send_count, 1)
+
+    def test_summary_interval_is_6_hours(self):
+        """The constant must be exactly 6 hours — guards against edits that
+        accidentally tighten the throttle to a smaller value."""
+        self.assertEqual(pb.SUMMARY_INTERVAL_SEC, 6 * 3600)
 
 
 if __name__ == "__main__":

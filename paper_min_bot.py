@@ -860,9 +860,21 @@ def _send_running_low_summary() -> None:
 
 
 def _maybe_send_low_summary() -> None:
-    """Time-gated wrapper for _send_running_low_summary. Called from scan_cycle."""
+    """Time-gated wrapper for _send_running_low_summary. Called from scan_cycle.
+
+    2026-05-01: lazy anchor. `_last_summary_ts: float = 0.0` at module init
+    used to mean "never sent" — but `now - 0.0 >> SUMMARY_INTERVAL_SEC` so
+    every bot restart would trigger an immediate summary on the first scan.
+    With ~5 restarts in a single day that's ~5 summaries instead of the
+    intended 1 per 6h. Fix: on the first call after a fresh process start
+    (when _last_summary_ts == 0.0), record `now` and return WITHOUT sending,
+    anchoring the 6h window to bot startup time."""
     global _last_summary_ts
     now = time.time()
+    if _last_summary_ts == 0.0:
+        # Fresh process — anchor the throttle window, don't send yet.
+        _last_summary_ts = now
+        return
     if now - _last_summary_ts < SUMMARY_INTERVAL_SEC:
         return
     try:
