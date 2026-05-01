@@ -3896,5 +3896,332 @@ class TestAbsDistanceSigmaRelative(unittest.TestCase):
         self.assertNotEqual(blocked, "ABS_DIST")
 
 
+class TestAddOnPath(unittest.TestCase):
+    """V2-style add-on path (2026-04-30 PM): when a position partial-fills,
+    the bot retries on subsequent scans to fill the gap up to the original
+    Kelly-determined intended count, capped by remaining MAX_BET_USD budget.
+    Same gate stack as entry. No add-on after settled / exited / partial-exit."""
+
+    def setUp(self):
+        # Bankroll plenty large so Kelly bet is capped by MAX_BET_USD, not by
+        # bankroll, making intended count predictable. Setting
+        # _bankroll_cache_ts = now() prevents _get_bankroll_cached from
+        # overwriting our seed with a real (server-side) Kalshi fetch.
+        pb._cached_bankroll = 1000.0
+        pb._bankroll_cache_ts = pb.time.time()
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+
+        # Captured trade records and Discord messages.
+        self._trade_records: list[dict] = []
+        self._discord_msgs: list[str] = []
+        # Defaults for fill stub: full fill of requested count.
+        self._fill_count = None
+        self._next_order_id = "test-order-1"
+        # Capture place_kalshi_order call counts (for "no place" assertions).
+        self._place_calls: list[tuple] = []
+
+        # Save originals.
+        self._orig_place = pb.place_kalshi_order
+        self._orig_wait = pb.wait_for_fill
+        self._orig_delete = pb.kalshi_delete
+        self._orig_append = pb._append_jsonl
+        self._orig_save = pb._save_positions
+        self._orig_discord = pb.discord_send
+        self._orig_notify = pb.notify_discord_entry
+        self._orig_obs_alive = pb._check_obs_confirmed_alive
+        self._orig_obs_loser = pb._check_obs_confirmed_loser
+        self._orig_f2a = pb._check_f2a_gate
+        self._orig_msg = pb._check_msg_gate
+        self._orig_recent = pb.get_recent_cli_range
+
+        def _place(ticker, side, count, price_cents):
+            self._place_calls.append((ticker, side, count, price_cents))
+            return self._next_order_id
+
+        def _wait(oid, expected, timeout_sec=5.0):
+            return ("executed",
+                    self._fill_count if self._fill_count is not None else expected)
+
+        def _append(path, rec):
+            self._trade_records.append(rec)
+
+        def _discord(msg):
+            self._discord_msgs.append(msg)
+
+        pb.place_kalshi_order = _place
+        pb.wait_for_fill = _wait
+        pb.kalshi_delete = lambda path: {}
+        pb._append_jsonl = _append
+        pb._save_positions = lambda: None
+        pb.discord_send = _discord
+        pb.notify_discord_entry = lambda r, o: _discord(
+            f"ENTRY {r['count']}x")
+        pb._check_obs_confirmed_alive = lambda opp: False
+        pb._check_obs_confirmed_loser = lambda opp: False
+        pb._check_f2a_gate = lambda opp: None
+        pb._check_msg_gate = lambda opp: None
+        pb.get_recent_cli_range = lambda *a, **kw: None
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+        pb.wait_for_fill = self._orig_wait
+        pb.kalshi_delete = self._orig_delete
+        pb._append_jsonl = self._orig_append
+        pb._save_positions = self._orig_save
+        pb.discord_send = self._orig_discord
+        pb.notify_discord_entry = self._orig_notify
+        pb._check_obs_confirmed_alive = self._orig_obs_alive
+        pb._check_obs_confirmed_loser = self._orig_obs_loser
+        pb._check_f2a_gate = self._orig_f2a
+        pb._check_msg_gate = self._orig_msg
+        pb.get_recent_cli_range = self._orig_recent
+        with pb._positions_lock:
+            pb._open_positions.clear()
+
+    def _opp(self, **overrides):
+        # Standard BUY_NO B-bracket that passes all gates: edge=0.30, mp=0.20
+        # (passes directional ≤0.20), σ=2.0 (passes σ-relative ABS_DIST since
+        # abs_dist = |43.0 − 45.5| = 2.5 > max(0.5, 0.25*2.0)=0.5).
+        # Tight 4c spread under MAX_SPREAD_CENTS=10.
+        base = {
+            "market_ticker": "KXLOWTBOS-26APR28-B45.5",
+            "event_ticker": "KXLOWTBOS-26APR28",
+            "action": "BUY_NO", "model_prob": 0.20, "edge": 0.30,
+            "entry_price": 0.30, "yes_bid": 65, "yes_ask": 70,
+            "no_bid": 28, "no_ask": 32, "mu": 43.0, "sigma": 2.0,
+            "mu_source": "nbp",
+            "mu_nbp": 43.0, "mu_hrrr": 43.0, "mu_nbm_om": 43.0,
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 0.5,
+            "floor": 45.0, "cap": 46.0,
+            "station": "KBOS", "date_str": "2026-04-28", "label": "Boston",
+            "series": "KXLOWTBOS",
+        }
+        base.update(overrides)
+        return base
+
+    def _seed_partial(self, ticker, *, count, intended, cost,
+                      entry_price=0.30, **extras):
+        """Helper: pre-populate _open_positions with an addon-eligible record."""
+        rec = {
+            "kind": "entry", "market_ticker": ticker,
+            "action": "BUY_NO", "entry_price": entry_price, "count": count,
+            "cost": cost,
+            "_intended_count": intended, "_filled_count": count, "_n_orders": 1,
+            "settled": False,
+            "station": "KBOS", "date_str": "2026-04-28", "label": "Boston",
+            "floor": 45.0, "cap": 46.0,
+            "edge": 0.30, "model_prob": 0.20, "mu": 43.0, "sigma": 2.0,
+            "mu_source": "nbp", "running_min": None,
+        }
+        rec.update(extras)
+        with pb._positions_lock:
+            pb._open_positions[ticker] = rec
+
+    # ─── First-entry behavior ──────────────────────────────────────────
+
+    def test_first_entry_full_fill_records_intended_count(self):
+        """First entry, full fill: _intended_count == count, _n_orders=1,
+        _is_addon=False."""
+        ok = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok)
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["_intended_count"], pos["count"])
+        self.assertEqual(pos["_filled_count"], pos["count"])
+        self.assertEqual(pos["_n_orders"], 1)
+        self.assertFalse(pos.get("_is_addon", False))
+
+    def test_first_entry_partial_fill_remembers_intended(self):
+        """First entry, partial fill: _intended_count > count → addon-eligible."""
+        self._fill_count = 5
+        ok = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok)
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], 5)
+        self.assertEqual(pos["_filled_count"], 5)
+        self.assertGreater(pos["_intended_count"], 5,
+                           "intended must exceed filled when partial")
+        self.assertEqual(pos["_n_orders"], 1)
+
+    # ─── Add-on triggering ─────────────────────────────────────────────
+
+    def test_addon_fires_on_subsequent_scan_when_partial(self):
+        """Partial first fill → next scan triggers addon to fill the gap."""
+        self._fill_count = 5
+        opp = self._opp()
+        self.assertTrue(pb.execute_opportunity(opp))
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        intended = pos["_intended_count"]
+        # Second scan: full fill of requested gap.
+        self._fill_count = None
+        self._next_order_id = "test-order-2"
+        self.assertTrue(pb.execute_opportunity(opp), "addon should succeed")
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], intended,
+                         f"after addon, count must reach intended {intended}")
+        self.assertEqual(pos["_n_orders"], 2)
+        self.assertEqual(pos["_filled_count"], intended)
+
+    def test_addon_caps_to_remaining_intended(self):
+        """Addon never exceeds the original Kelly intended count."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=20, cost=1.50)
+        ok = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok)
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], 20, "addon must cap at intended=20")
+
+    def test_addon_caps_to_max_bet_usd(self):
+        """When existing cost is near MAX_BET_USD, addon size shrinks to fit."""
+        # 95@30c = $28.50; remaining = $1.50; @30c → 5 contracts max.
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=95, intended=200, cost=28.50)
+        ok = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok)
+        # Only 1 place_kalshi_order call, requested 5 contracts.
+        self.assertEqual(len(self._place_calls), 1)
+        self.assertEqual(self._place_calls[0][2], 5,
+                         "addon must request only 5 contracts")
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertLessEqual(pos["cost"], pb.MAX_BET_USD + 0.01)
+
+    # ─── Add-on blocking conditions ────────────────────────────────────
+
+    def test_addon_blocked_when_at_max_bet_usd(self):
+        """Position exactly at MAX_BET_USD cost → no add-on."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=100, intended=200, cost=pb.MAX_BET_USD)
+        self.assertFalse(pb.execute_opportunity(self._opp()))
+        self.assertEqual(self._place_calls, [],
+                         "place_kalshi_order should not be called")
+
+    def test_addon_blocked_when_fully_filled(self):
+        """count >= intended → no add-on."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=50, intended=50, cost=15.0)
+        self.assertFalse(pb.execute_opportunity(self._opp()))
+        self.assertEqual(self._place_calls, [])
+
+    def test_addon_blocked_after_partial_exit(self):
+        """_partial_exit_count > 0 → no add-on (don't average back into stop)."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=30, intended=100, cost=9.0,
+                           _partial_exit_count=20, _partial_exit_pnl=-3.0)
+        self.assertFalse(pb.execute_opportunity(self._opp()))
+        self.assertEqual(self._place_calls, [])
+
+    def test_addon_blocked_on_settled_position(self):
+        """settled=True → no add-on."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=50, cost=1.50, settled=True)
+        self.assertFalse(pb.execute_opportunity(self._opp()))
+        self.assertEqual(self._place_calls, [])
+
+    def test_addon_blocked_on_exited_position(self):
+        """exited_ts set (full hard-stop fill) → no add-on."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=50, intended=50, cost=15.0,
+                           settled=True,
+                           exited_ts="2026-04-30T15:00:00+00:00",
+                           exit_price=0.05, _exit_reason="hard_stop")
+        self.assertFalse(pb.execute_opportunity(self._opp()))
+        self.assertEqual(self._place_calls, [])
+
+    def test_addon_respects_gates(self):
+        """Edge has eroded above MAX_EDGE since first entry → no add-on."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=50, cost=1.50)
+        opp = self._opp(edge=0.50)  # > MAX_EDGE
+        self.assertFalse(pb.execute_opportunity(opp),
+                         "addon must respect MAX_EDGE gate")
+        self.assertEqual(self._place_calls, [])
+
+    # ─── Cumulative state correctness ──────────────────────────────────
+
+    def test_addon_weighted_avg_entry_price(self):
+        """After addon at higher price, entry_price = weighted avg."""
+        # Seed: 10 contracts @ 30c = $3.00, intended=30
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=10, intended=30, cost=3.00, entry_price=0.30)
+        # Addon at 50c: 10 contracts × $0.50 = $5.00 → wait, intended=30, gap=20
+        # 20 × $0.50 = $10.00. Total cost: $3 + $10 = $13. avg = 13/30.
+        opp = self._opp(entry_price=0.50, no_ask=51, no_bid=49)
+        self.assertTrue(pb.execute_opportunity(opp))
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], 30)
+        self.assertAlmostEqual(pos["cost"], 13.00, places=2)
+        self.assertAlmostEqual(pos["entry_price"], 13.0 / 30.0, places=4)
+        self.assertEqual(pos["_n_orders"], 2)
+
+    def test_addon_partial_addon_fill_keeps_eligible(self):
+        """If addon itself partial-fills, count grows but stays under intended;
+        next scan can fire ANOTHER addon."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=50, cost=1.50)
+        # First addon partial: only 10 contracts fill (out of 45 requested).
+        self._fill_count = 10
+        opp = self._opp()
+        self.assertTrue(pb.execute_opportunity(opp))
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], 15)  # 5 existing + 10 addon fill
+        self.assertEqual(pos["_n_orders"], 2)
+        # Second addon: full fill of remaining 35.
+        self._fill_count = None
+        self._next_order_id = "test-order-3"
+        self.assertTrue(pb.execute_opportunity(opp))
+        pos = pb._open_positions["KXLOWTBOS-26APR28-B45.5"]
+        self.assertEqual(pos["count"], 50)
+        self.assertEqual(pos["_n_orders"], 3)
+
+    def test_trade_record_marks_is_addon(self):
+        """trades.jsonl: _is_addon=False on first entry, True on add-on."""
+        self._fill_count = 5
+        opp = self._opp()
+        pb.execute_opportunity(opp)
+        first = self._trade_records[-1]
+        self.assertFalse(first["_is_addon"])
+        # Trigger addon
+        self._fill_count = None
+        pb.execute_opportunity(opp)
+        addon_rec = self._trade_records[-1]
+        self.assertTrue(addon_rec["_is_addon"])
+
+    def test_addon_does_not_block_other_brackets_via_event_cap(self):
+        """Per-event cap is bypassed for add-ons (same ticker), but a NEW
+        bracket on the same event still hits MAX_OPEN_PER_EVENT=1."""
+        # Seed an addon-eligible position on B45.5
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=50, cost=1.50)
+        # An addon on the SAME ticker: should succeed
+        ok_addon = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok_addon, "addon on same ticker must bypass event cap")
+        # A first entry on a DIFFERENT ticker on the SAME event: blocked
+        opp_other = self._opp(market_ticker="KXLOWTBOS-26APR28-B47.5",
+                              floor=47.0, cap=48.0, mu=44.0)
+        # mu=44.0, mid=47.5 → abs_dist=3.5 ≥ threshold; gates fine but event cap blocks
+        ok_other = pb.execute_opportunity(opp_other)
+        self.assertFalse(ok_other,
+                         "different bracket on same event must be blocked by event cap")
+
+    def test_addon_does_not_increment_cycle_count(self):
+        """Add-on dollars count toward daily exposure but NOT cycle-new-count."""
+        self._seed_partial("KXLOWTBOS-26APR28-B45.5",
+                           count=5, intended=50, cost=1.50)
+        before = pb._cycle_new_count
+        before_exposure = pb._today_exposure_usd
+        ok = pb.execute_opportunity(self._opp())
+        self.assertTrue(ok)
+        # Cycle counter unchanged
+        self.assertEqual(pb._cycle_new_count, before)
+        # Daily exposure increased by addon cost
+        self.assertGreater(pb._today_exposure_usd, before_exposure)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

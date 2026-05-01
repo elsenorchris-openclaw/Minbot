@@ -2458,28 +2458,40 @@ def _open_count_for_event(event_ticker: str) -> int:
         )
 
 
-def _budget_can_take(cost_usd: float, event_ticker: str = "") -> tuple[bool, str]:
+def _budget_can_take(cost_usd: float, event_ticker: str = "",
+                     is_addon: bool = False) -> tuple[bool, str]:
     """Check live-mode caps. Returns (ok, reason_if_blocked).
 
     Per-event cap counts against `_open_positions` (lifetime, not per-cycle),
     so once any bracket on an event is open we won't add another bracket on
-    the same event until that one settles. Correlated-bet protection."""
-    if event_ticker:
-        open_n = _open_count_for_event(event_ticker)
-        if open_n >= MAX_OPEN_PER_EVENT:
-            return False, f"event_cap({event_ticker} open={open_n})"
+    the same event until that one settles. Correlated-bet protection.
+
+    is_addon=True (V2-style add-on filling out a previously partial-filled
+    position): skip event-cap (the existing position already counts and is
+    the one we're growing) and skip cycle-cap (this is not a NEW position).
+    Daily $ cap still applies — add-on dollars come from the same wallet."""
+    if not is_addon:
+        if event_ticker:
+            open_n = _open_count_for_event(event_ticker)
+            if open_n >= MAX_OPEN_PER_EVENT:
+                return False, f"event_cap({event_ticker} open={open_n})"
     with _cycle_budget_lock:
-        if _cycle_new_count >= MAX_NEW_POSITIONS_PER_CYCLE:
-            return False, f"cycle_cap({_cycle_new_count}/{MAX_NEW_POSITIONS_PER_CYCLE})"
+        if not is_addon:
+            if _cycle_new_count >= MAX_NEW_POSITIONS_PER_CYCLE:
+                return False, f"cycle_cap({_cycle_new_count}/{MAX_NEW_POSITIONS_PER_CYCLE})"
         if _today_exposure_usd + cost_usd > DAILY_EXPOSURE_CAP_USD:
             return False, f"daily_cap(${_today_exposure_usd:.2f}+${cost_usd:.2f}>${DAILY_EXPOSURE_CAP_USD:.2f})"
     return True, ""
 
 
-def _budget_record(cost_usd: float, event_ticker: str = "") -> None:
+def _budget_record(cost_usd: float, event_ticker: str = "",
+                   is_addon: bool = False) -> None:
+    """Record spend against daily exposure. Cycle-new-count is incremented only
+    on first entries — add-ons don't open a new slot."""
     global _cycle_new_count, _today_exposure_usd
     with _cycle_budget_lock:
-        _cycle_new_count += 1
+        if not is_addon:
+            _cycle_new_count += 1
         _today_exposure_usd += cost_usd
 
 
@@ -2886,16 +2898,46 @@ def execute_opportunity(opp: dict) -> bool:
     """Enforce caps, place a real Kalshi limit-buy at the ask, wait up to
     ORDER_FILL_TIMEOUT_SEC for fill via WS cache, cancel any unfilled
     remainder, record actual fill_count + cost. Returns True on a real
-    entry, False if any gate blocked or no fill landed."""
+    entry, False if any gate blocked or no fill landed.
+
+    2026-04-30 PM: V2-style add-on path. Once a position partial-fills, the
+    bot can re-attempt to fill the remaining gap on subsequent scans (up to
+    the original Kelly-determined intended count, capped by remaining
+    MAX_BET_USD budget). Same gate stack as entry — if model edge has
+    eroded, no add-on. No add-on after partial-exit / hard-stop."""
     if opp.get("action") is None or opp.get("entry_price") is None:
         return False
     edge = float(opp["edge"])
     ticker = opp["market_ticker"]
 
-    # Per-ticker dedupe — never double up on the same market.
+    # Per-ticker check: existing position may be eligible for ADD-ON, or
+    # block (settled / exited / fully-filled).
+    is_addon = False
+    addon_intended = 0     # original Kelly target
+    addon_filled = 0       # contracts already owned
+    addon_existing_cost = 0.0
     with _positions_lock:
-        if ticker in _open_positions:
-            return False
+        existing = _open_positions.get(ticker)
+        if existing is not None:
+            if existing.get("settled"):
+                return False  # already settled, never re-enter
+            if existing.get("exited_ts") is not None:
+                return False  # was exited (hard-stop full fill); don't re-enter
+            if existing.get("_partial_exit_count", 0) > 0:
+                return False  # partial-exited via hard-stop; don't average back in
+            cur_count = int(existing.get("count", 0))
+            cur_cost = float(existing.get("cost", 0.0))
+            # _intended_count missing on legacy records → treat as fully filled
+            intended = int(existing.get("_intended_count", cur_count))
+            if cur_count >= intended:
+                return False  # already at intended size
+            if cur_cost >= MAX_BET_USD:
+                return False  # already at MAX_BET_USD; no further capacity
+            # Eligible for add-on
+            is_addon = True
+            addon_intended = intended
+            addon_filled = cur_count
+            addon_existing_cost = cur_cost
 
     # _obs_confirmed_alive: rm has decisively settled the bracket in our favor.
     # When True, bypass forecast-based gates (directional, abs_dist, F2A, MSG,
@@ -2931,10 +2973,22 @@ def execute_opportunity(opp: dict) -> bool:
             f"  skip {ticker}: no verified bankroll yet "
             f"(get_kalshi_balance returned None); refusing trade")
         return False
-    bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * bankroll))
-    count = max(1, int(bet_usd / price))
-    count = max(count, math.ceil(MIN_COST_USD / price))
-    count = min(count, max(1, int(MAX_BET_USD / price)))
+    if is_addon:
+        # Add-on path: skip fresh Kelly recompute. Fill the gap up to the
+        # original intended count, capped by remaining MAX_BET_USD budget.
+        # If price moved up since first entry, max_count_by_budget shrinks
+        # naturally — we never spend more than MAX_BET_USD per ticker.
+        remaining_to_intended = max(0, addon_intended - addon_filled)
+        remaining_budget_usd = max(0.0, MAX_BET_USD - addon_existing_cost)
+        max_count_by_budget = int(remaining_budget_usd / price) if price > 0 else 0
+        count = min(remaining_to_intended, max_count_by_budget)
+        if count < 1:
+            return False  # nothing to add
+    else:
+        bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * bankroll))
+        count = max(1, int(bet_usd / price))
+        count = max(count, math.ceil(MIN_COST_USD / price))
+        count = min(count, max(1, int(MAX_BET_USD / price)))
     intended_cost = count * price
     action = opp["action"]
     mp = float(opp.get("model_prob", 0.0))
@@ -3057,7 +3111,8 @@ def execute_opportunity(opp: dict) -> bool:
         _log_skip(ticker, f"  skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS}c")
         return False
     # Per-cycle / daily / per-event budget.
-    ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""))
+    ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""),
+                                   is_addon=is_addon)
     if not ok:
         _log_skip(ticker, f"  skip {ticker}: {reason}")
         return False
@@ -3084,8 +3139,11 @@ def execute_opportunity(opp: dict) -> bool:
             log(f"  cancel-remainder failed for {order_id} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  partial fill {filled}/{count} on {ticker}; cancelled remainder")
     actual_cost = filled * price
-    _budget_record(actual_cost, opp.get("event_ticker", ""))
-    record = {
+    _budget_record(actual_cost, opp.get("event_ticker", ""),
+                   is_addon=is_addon)
+    # Per-order trade record (always reflects THIS order, not cumulative
+    # position state — keeps trades.jsonl as a clean per-order audit log).
+    trade_record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "entry",
         "market_ticker": ticker, "action": opp["action"],
@@ -3096,16 +3154,75 @@ def execute_opportunity(opp: dict) -> bool:
         "running_min": opp["running_min"],
         "floor": opp.get("floor"), "cap": opp.get("cap"),
         "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
+        "_is_addon": is_addon,
     }
-    _append_jsonl(_trades_file_today(), record)
+    _append_jsonl(_trades_file_today(), trade_record)
+    cumulative_count = filled
+    cumulative_cost = actual_cost
     with _positions_lock:
-        _open_positions[ticker] = record
+        if is_addon:
+            existing = _open_positions.get(ticker)
+            if existing is None:
+                # Defensive: another thread cleared the position between
+                # eligibility check and fill arrival. Treat this fill as a
+                # standalone first entry. Stamp _intended_count = filled so
+                # we don't try to add more on top of an unknown plan.
+                position_record = dict(trade_record)
+                position_record["_intended_count"] = filled
+                position_record["_filled_count"] = filled
+                position_record["_n_orders"] = 1
+                position_record["_is_addon"] = False
+                _open_positions[ticker] = position_record
+            else:
+                # Weighted-avg entry_price, accumulated count + cost.
+                # Stat fields (edge / mp / mu / sigma / running_min) are kept
+                # as the FIRST-entry snapshot — settlement records read them
+                # as `running_min_at_entry`. Hard-stop reads running_min from
+                # pos but falls back to live get_running_min when missing.
+                new_count = int(existing.get("count", 0)) + filled
+                new_cost = float(existing.get("cost", 0.0)) + actual_cost
+                existing["count"] = new_count
+                existing["cost"] = new_cost
+                existing["entry_price"] = (
+                    new_cost / new_count) if new_count > 0 else price
+                existing["_filled_count"] = new_count
+                existing["_n_orders"] = int(existing.get("_n_orders", 1)) + 1
+                existing["_last_addon_ts"] = trade_record["ts"]
+                existing["_last_addon_price"] = price
+                existing["_last_addon_count"] = filled
+                cumulative_count = new_count
+                cumulative_cost = new_cost
+        else:
+            # First entry: stamp _intended_count for future add-ons. Note
+            # `count` here is the pre-fill kelly target — the actual fill
+            # may be smaller (partial). Future scans use _intended_count to
+            # know the gap they're allowed to fill.
+            position_record = dict(trade_record)
+            position_record["_intended_count"] = count
+            position_record["_filled_count"] = filled
+            position_record["_n_orders"] = 1
+            _open_positions[ticker] = position_record
     _save_positions()
-    log(f"  ENTRY {opp['action']} {filled}x @ {price_cents}c on {ticker} "
-        f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
-        f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
-        f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
-    notify_discord_entry(record, opp)
+    if is_addon:
+        log(f"  ADDON {opp['action']} +{filled}x @ {price_cents}c on {ticker} "
+            f"| now {cumulative_count}/{addon_intended} contracts "
+            f"| +${actual_cost:.2f} cum ${cumulative_cost:.2f} "
+            f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
+            f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
+            f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
+        discord_send(
+            f"➕ **ADDON** {opp['action']} +{filled}x @ {price_cents}c "
+            f"on `{ticker}` ({opp['label']})\n"
+            f"now {cumulative_count}/{addon_intended}  edge {edge:.0%}  "
+            f"mp {opp['model_prob']:.0%}  μ {opp['mu']:.1f}°F  σ {opp['sigma']:.1f}°F  "
+            f"rm {opp['running_min']}  +${actual_cost:.2f} (cum ${cumulative_cost:.2f})"
+        )
+    else:
+        log(f"  ENTRY {opp['action']} {filled}x @ {price_cents}c on {ticker} "
+            f"| edge={edge:.1%} mp={opp['model_prob']:.0%} mu={opp['mu']:.1f}°F "
+            f"σ={opp['sigma']:.1f}°F rm={opp['running_min']} "
+            f"| day=${_today_exposure_usd:.2f}/${DAILY_EXPOSURE_CAP_USD:.2f}")
+        notify_discord_entry(trade_record, opp)
     return True
 
 

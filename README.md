@@ -115,16 +115,51 @@ placement still routes through REST. Disable with `USE_KALSHI_WS = False`.
 2. `find_opportunities()` filters per-market: skips if obs-pipeline already
    has CLI for `(station, climate-day)`, or `date_str < today` for the city's
    TZ. Computes `mu`, `sigma`, `running_min`, `model_prob`, `edge`.
-3. `execute_opportunity()` runs the safety gate stack (below), dedupes per
-   ticker, checks cycle / daily / per-event budgets, sizes via Kelly.
+3. `execute_opportunity()` runs the safety gate stack (below), checks
+   per-ticker eligibility (NEW: add-on path), checks cycle / daily /
+   per-event budgets, sizes via Kelly.
 4. `place_kalshi_order()` POSTs a limit buy at the ask price.
 5. `wait_for_fill()` polls the `kalshi_ws` fill cache for up to 5 s, falls
    back to REST `/portfolio/orders/{id}` (authoritative).
 6. Partial / no-fill: cancel any resting remainder. Record actual `filled`
    count to today's `data/trades_YYYY-MM-DD.jsonl` and emit a Discord
-   notification.
+   notification. The position is left **addon-eligible** — the gap
+   `_intended_count − count` will be retried on subsequent scans.
 7. `check_settlements()` walks open positions; on CLI publish, computes P&L
    and emits a Discord settlement notification.
+
+### Add-on path (2026-04-30 PM)
+
+V2-style. Once a position partial-fills, the bot retries on each subsequent
+scan to fill the remaining gap up to the original Kelly-determined intended
+count, capped by remaining `MAX_BET_USD` budget. The full gate stack runs
+again on each retry — if model edge has eroded the add-on is suppressed.
+
+State on each open position:
+- `_intended_count` — Kelly target captured at first entry.
+- `_filled_count` — cumulative filled count (= `count` field).
+- `_n_orders` — incremented per addon (1 = first entry only).
+- `entry_price` — weighted average across all fills (used by hard-stop loss%).
+
+Add-on is **blocked** when any of:
+- position settled, or `exited_ts` set (full hard-stop fill), or
+- `_partial_exit_count > 0` (don't average back into a stopped position), or
+- already at `_intended_count` (full target hit), or
+- already at `MAX_BET_USD` cost cap.
+
+Per-event cap and cycle-new-cap are bypassed for add-ons (the existing
+position already counts; an add-on doesn't open a new slot). Daily $ cap
+still applies — add-on dollars come from the same wallet.
+
+Each add-on writes a separate `entry`-kind record to `trades.jsonl` with
+`_is_addon=True`, while the in-memory position dict accumulates cumulative
+state. trades.jsonl remains a per-order audit log; the position dict
+represents current holdings.
+
+Trigger: pre-fix, `wait_for_fill` partial-fill (`filled < count`) cancelled
+the remainder and called the position done — capital under-deployed when
+liquidity is thin. AUS-26MAY01-T56 fired this pattern repeatedly (single-c
+fills against a 90-contract intent).
 
 ## Caps and gates
 
