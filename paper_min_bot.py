@@ -168,13 +168,27 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
                                     # 96% sub-$1 fills on 2026-04-25/26 (avg $0.45). Capped by
                                     # MAX_BET_USD downstream so the floor can't blow the ceiling.
 
-MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: skip if |mu − bracket_mid| < this many °F.
+MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: floor for |mu − bracket_mid|.
                                     # 1.0 → 1.5 (2026-04-27 AM) → reverted to 0.5 (2026-04-27 PM)
                                     # after Kalshi-truth audit on n=15: at 1.5°F we'd block 9
                                     # winners with `dist 0.5–1.5°F` (PHX-B65.5, LAX-B56.5,
                                     # SFO-B51.5, MIA-B69.5, CHI-B47.5 — all BUY_NO with mu *at the
                                     # bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu *inside*
                                     # bracket, the only real loser) is still caught at 0.5°F.
+                                    # 2026-04-30 PM: kept floor at 0.5 but added σ-relative
+                                    # tightening — see MIN_ABS_DISTANCE_SIGMA_K below.
+
+MIN_ABS_DISTANCE_SIGMA_K = 0.25     # σ-relative tightening on top of the 0.5°F floor.
+                                    # Effective threshold = max(0.5, 0.25 × σ). Wide-σ trades
+                                    # need proportionally more distance from bracket center.
+                                    # Audit 2026-04-30 PM (n=21 post-Apr-29 BUY_NO B-bracket
+                                    # entries with blocked_by=null): rule blocks 3 confirmed
+                                    # losers (DC-B52.5 σ=2.1 dist=0.5 → cli=52 LOSS;
+                                    # MIN-B36.5 σ=3.8 dist=0.5 → cli=36 LOSS; DEN-B38.5 σ=6.0
+                                    # dist=0.9 → cli=38 LOSS), keeps every winner including
+                                    # OKC-B48.5 σ=2.3 dist=0.6 (cli=51 WIN) and HOU-B68.5
+                                    # σ=2.8 dist=0.9 (cli=74 WIN). Net lift swing: +$18.79
+                                    # vs current. Zero false positives in available sample.
 
 # ─── Per-station σ multiplier (2026-04-29) ────────────────────────────────
 # σ multiplier applied to the bot's pre-mult σ in find_opportunities.
@@ -2790,10 +2804,15 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
             bracket_mid = None
         if bracket_mid is not None:
             mu_val = float(opp.get("mu", 0.0))
+            sigma_v = float(opp.get("sigma") or 0)
             abs_dist = abs(mu_val - bracket_mid)
-            if abs_dist < MIN_ABS_DISTANCE_F:
+            # σ-relative threshold (2026-04-30 PM): wider σ requires more
+            # distance from bracket center.
+            min_dist = max(MIN_ABS_DISTANCE_F, MIN_ABS_DISTANCE_SIGMA_K * sigma_v)
+            if abs_dist < min_dist:
                 return ("ABS_DIST",
-                        f"|μ-mid|={abs_dist:.1f}°F < {MIN_ABS_DISTANCE_F:.1f}°F")
+                        f"|μ-mid|={abs_dist:.1f}°F < {min_dist:.2f}°F "
+                        f"(floor=0.5, σ-rel={MIN_ABS_DISTANCE_SIGMA_K}×{sigma_v:.1f})")
     f2a = _check_f2a_gate(opp)
     if f2a:
         return ("F2A", f2a)
@@ -2980,11 +2999,16 @@ def execute_opportunity(opp: dict) -> bool:
                 bracket_mid = None
             if bracket_mid is not None:
                 mu_val = float(opp.get("mu", 0.0))
+                sigma_v = float(opp.get("sigma") or 0)
                 abs_dist = abs(mu_val - bracket_mid)
-                if abs_dist < MIN_ABS_DISTANCE_F:
+                # σ-relative threshold (2026-04-30 PM)
+                min_dist = max(MIN_ABS_DISTANCE_F,
+                               MIN_ABS_DISTANCE_SIGMA_K * sigma_v)
+                if abs_dist < min_dist:
                     _log_skip(ticker,
                         f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
-                        f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F (min {MIN_ABS_DISTANCE_F:.1f}°F)")
+                        f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F "
+                        f"(min {min_dist:.2f}°F = max(0.5, {MIN_ABS_DISTANCE_SIGMA_K}×σ={sigma_v:.1f}))")
                     return False
         # F2A asymmetry gate (V2 port, BUY_NO only).
         f2a_block = _check_f2a_gate(opp)

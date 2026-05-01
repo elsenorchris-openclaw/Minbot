@@ -941,9 +941,11 @@ class TestAbsDistanceGate(unittest.TestCase):
         pb.execute_opportunity(self._opp("BUY_NO", mu=43.5, floor=44.0, cap=45.0))
         self.assertEqual(len(self._order_calls), 1)
 
-    def test_buy_no_passes_at_threshold(self):
-        """mu exactly 0.5°F from midpoint passes (strict less-than)."""
-        pb.execute_opportunity(self._opp("BUY_NO", mu=44.0, floor=44.0, cap=45.0))
+    def test_buy_no_passes_at_floor_with_narrow_sigma(self):
+        """mu exactly 0.5°F from midpoint passes when σ is narrow enough that
+        the floor governs (max(0.5, 0.25×σ) = 0.5 when σ ≤ 2.0). Strict <."""
+        # σ=2.0 → threshold = max(0.5, 0.5) = 0.5°F. abs_dist=0.5 not <0.5 → passes.
+        pb.execute_opportunity(self._opp("BUY_NO", mu=44.0, floor=44.0, cap=45.0, sigma=2.0))
         self.assertEqual(len(self._order_calls), 1)
 
     def test_buy_no_passes_well_above_threshold(self):
@@ -3790,6 +3792,108 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
         market_quotes = {ticker: {"yes_bid": 95, "yes_ask": 97, "no_bid": 3, "no_ask": 5}}
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 1, "BUY_NO B-bracket must still hard-stop")
+
+
+class TestAbsDistanceSigmaRelative(unittest.TestCase):
+    """σ-relative tightening on MIN_ABS_DISTANCE_F (2026-04-30 PM): the
+    BUY_NO B-bracket gate now uses `max(0.5°F, 0.25 × σ)`. Wider σ requires
+    proportionally more distance from bracket center.
+
+    Audit n=21 BUY_NO B-bracket entries with blocked_by=null since 2026-04-29:
+    rule blocks 3 confirmed losers (DC σ=2.1 d=0.5, MIN σ=3.8 d=0.5, DEN σ=6.0
+    d=0.9), keeps every winner including OKC σ=2.3 d=0.6 and HOU σ=2.8 d=0.9."""
+
+    def setUp(self):
+        pb._cached_bankroll = 100.0
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._calls: list[tuple] = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._calls.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+
+    def _opp(self, mu, sigma, floor=45.0, cap=46.0, **overrides):
+        base = {
+            "market_ticker": "KXLOWTNYC-26APR30-B45.5",
+            "event_ticker": "KXLOWTNYC-26APR30",
+            "action": "BUY_NO", "model_prob": 0.10, "edge": 0.30,
+            "entry_price": 0.55,
+            "yes_bid": 47, "yes_ask": 50,
+            "no_bid": 48, "no_ask": 50,
+            "mu": mu, "sigma": sigma, "mu_source": "nbp",
+            "running_min": None, "post_sunrise_lock": False,
+            "disagreement": 1.0,
+            "floor": floor, "cap": cap,
+            "station": "KNYC", "date_str": "2026-04-30", "label": "NYC",
+            "series": "KXLOWTNYC",
+        }
+        base.update(overrides)
+        return base
+
+    # B-bracket [45, 46] → mid=45.5
+    # threshold = max(0.5, 0.25 × σ)
+
+    def test_narrow_sigma_floor_governs(self):
+        # σ=2.0 → threshold = max(0.5, 0.5) = 0.5°F (floor). abs_dist=0.6 > 0.5 → passes.
+        opp = self._opp(mu=46.1, sigma=2.0)  # abs_dist = |46.1 - 45.5| = 0.6
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(blocked, "ABS_DIST")
+
+    def test_narrow_sigma_below_floor_blocks(self):
+        # σ=2.0, abs_dist=0.4 < 0.5°F floor → blocks
+        opp = self._opp(mu=45.9, sigma=2.0)  # abs_dist = 0.4
+        blocked, reason = pb._evaluate_gates(opp)
+        self.assertEqual(blocked, "ABS_DIST")
+        self.assertIn("0.4", reason)
+
+    def test_wide_sigma_tightens_threshold(self):
+        # σ=6.0 → threshold = max(0.5, 0.25*6.0) = 1.5°F. abs_dist=0.9 < 1.5 → blocks.
+        # (DEN-26APR30-B38.5 case)
+        opp = self._opp(mu=46.4, sigma=6.0)  # abs_dist = 0.9
+        blocked, reason = pb._evaluate_gates(opp)
+        self.assertEqual(blocked, "ABS_DIST")
+        self.assertIn("1.50", reason)  # threshold
+
+    def test_wide_sigma_with_enough_distance_passes(self):
+        # σ=6.0, abs_dist=2.0 > 1.5°F threshold → passes
+        opp = self._opp(mu=47.5, sigma=6.0)  # abs_dist = 2.0
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(blocked, "ABS_DIST")
+
+    def test_okc_class_winner_passes(self):
+        # OKC σ=2.3, abs_dist=0.6. threshold = max(0.5, 0.575) = 0.575. 0.6 > 0.575 → passes.
+        opp = self._opp(mu=46.1, sigma=2.3)  # abs_dist = 0.6
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(blocked, "ABS_DIST",
+                            "OKC-class (narrow σ, dist just above floor) must pass")
+
+    def test_dc_class_loser_blocks(self):
+        # DC σ=2.1, abs_dist=0.5. threshold = max(0.5, 0.525) = 0.525. 0.5 < 0.525 → blocks.
+        opp = self._opp(mu=46.0, sigma=2.1)  # abs_dist = 0.5
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertEqual(blocked, "ABS_DIST")
+
+    def test_min_class_loser_blocks(self):
+        # MIN σ=3.8, abs_dist=0.5. threshold = max(0.5, 0.95) = 0.95. 0.5 < 0.95 → blocks.
+        opp = self._opp(mu=46.0, sigma=3.8)  # abs_dist = 0.5
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertEqual(blocked, "ABS_DIST")
+
+    def test_buy_yes_not_gated(self):
+        # ABS_DIST gate is BUY_NO only — BUY_YES should not be affected.
+        opp = self._opp(mu=45.5, sigma=6.0, action="BUY_YES",
+                        model_prob=0.65, edge=0.30, entry_price=0.30)  # abs_dist = 0
+        blocked, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(blocked, "ABS_DIST")
 
 
 if __name__ == "__main__":
