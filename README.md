@@ -3,6 +3,43 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## Latest change (2026-05-01 night) — entry-awareness fields on settlements
+
+Added V2-parity entry-time context to every trade + settlement record so
+filter audits (catching-knife, late-day, per-station bias) can run against
+min_bot's settled pool. Without these fields, the V2 mirror filters cannot
+be backtested — the per-trade context is missing.
+
+**New fields** (additive only — every existing field still present):
+
+| Field | Source | Purpose |
+|---|---|---|
+| `entry_local_hour` | computed at entry from station tz | local hour 0-23 (catching-knife filter requires this) |
+| `entry_local_dow` | computed | local day-of-week (Mon/Tue/...) |
+| `entry_local_ts` | computed | full local ISO timestamp (grep-friendly) |
+| `entry_hours_to_sunrise` | `_hours_to_sunrise(tz, lat, lon)` | hours to next sunrise — analog of V2's `peak_hour` for min temps |
+| `entry_tz` | from opp dict | station timezone string |
+| `entry_yes_bid_cents` / `_ask_cents` | from market quote at entry | raw market bid/ask (for catching-knife: market's view at entry) |
+| `entry_no_bid_cents` / `_ask_cents` | from market quote | NO side raw quotes |
+| `entry_spread_cents` | computed: yes_ask − yes_bid | liquidity proxy |
+| `entry_volume` | from market quote | 24h volume at entry |
+| `mu_nbp_at_entry`, `sigma_nbp_at_entry` | from forecast cluster | NBP forecast detail (the d-1+ default source) |
+| `mu_nbm_om_at_entry`, `mu_hrrr_at_entry` | from forecast cluster | other ensemble members at entry |
+| `disagreement_at_entry` | from opp | max pairwise disagreement (forecast cluster spread) |
+| `post_sunrise_lock_at_entry` | from opp | whether sigma was collapsed at entry |
+| `is_today_at_entry` | from opp | d-0 vs d-1 marker |
+| `yes_ask_frac_at_entry` / `no_ask_frac_at_entry` | from opp | edge breakdown components |
+| `edge` | from opp | bot's computed edge (was already in trade_record, now also in settlement) |
+
+**Why this was needed:** the V2 catching-knife audit on min_bot's settled pool produced a "0 fires" or "wrong direction" verdict because we couldn't compute `local_hour - peak_hour` proximity — min_bot's settlements lacked the time-of-day field. Adding these closes the gap so future filter proposals can be validated against real settled outcomes.
+
+**Backward compatibility:** all existing fields remain. Backtest tools and downstream readers continue to work unchanged. New fields populate on entries written 2026-05-01 evening onwards; older settlements have these as `null` / `None`.
+
+Tests: `tests/test_entry_awareness.py` (7) — verify trade_record + both settlement paths (kalshi-fallback + obs-pipeline-CLI) include all 20 new fields, that `ZoneInfo` is used to compute local_hour, and that no original fields were removed. Full min_bot suite: **337 passed (330 baseline + 7 new), no regressions**.
+
+---
+
+
 **Live since 2026-04-25 on the V1 Kalshi wallet** (key from `~/.env`
 `KALSHI_KEY_ID`, PEM `~/kalshi_key.pem` — same wallet V1's max bot uses).
 Current caps (2026-04-29 evening): **$30 per entry, 3 entries per cycle,

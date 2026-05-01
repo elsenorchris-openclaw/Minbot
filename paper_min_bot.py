@@ -3247,6 +3247,30 @@ def execute_opportunity(opp: dict) -> bool:
                    is_addon=is_addon)
     # Per-order trade record (always reflects THIS order, not cumulative
     # position state — keeps trades.jsonl as a clean per-order audit log).
+    # 2026-05-01: entry-context enrichment (V2-parity). The settlement record
+    # needs everything required to retro-evaluate filter ideas (catching-knife,
+    # late-day, per-station bias, etc.). All fields below are captured at
+    # ENTRY time and flow through pos → settlement record unchanged.
+    _entry_tz_name = opp.get("tz")
+    _entry_local_hour = None
+    _entry_local_dow = None
+    _entry_local_ts = None
+    _entry_hours_to_sunrise = None
+    if _entry_tz_name:
+        try:
+            _now_local = datetime.now(ZoneInfo(_entry_tz_name))
+            _entry_local_hour = _now_local.hour
+            _entry_local_dow = _now_local.strftime("%a")
+            _entry_local_ts = _now_local.isoformat(timespec="seconds")
+        except Exception:
+            pass
+        try:
+            _lat = opp.get("lat"); _lon = opp.get("lon")
+            if _lat is not None and _lon is not None:
+                _entry_hours_to_sunrise = round(_hours_to_sunrise(
+                    _entry_tz_name, float(_lat), float(_lon)), 2)
+        except Exception:
+            pass
     trade_record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "entry",
@@ -3258,6 +3282,33 @@ def execute_opportunity(opp: dict) -> bool:
         "running_min": opp["running_min"],
         "floor": opp.get("floor"), "cap": opp.get("cap"),
         "station": opp["station"], "date_str": opp["date_str"], "label": opp["label"],
+        # ─── ENTRY AWARENESS (2026-05-01) ───
+        "entry_local_hour": _entry_local_hour,
+        "entry_local_dow": _entry_local_dow,
+        "entry_local_ts": _entry_local_ts,
+        "entry_hours_to_sunrise": _entry_hours_to_sunrise,
+        "entry_tz": _entry_tz_name,
+        # Market quotes at entry (cents, 0-100). yes_ask/no_ask are the prices
+        # we'd pay; yes_bid/no_bid are the resting bids (counterparty side).
+        "entry_yes_bid_cents": opp.get("yes_bid"),
+        "entry_yes_ask_cents": opp.get("yes_ask"),
+        "entry_no_bid_cents":  opp.get("no_bid"),
+        "entry_no_ask_cents":  opp.get("no_ask"),
+        "entry_volume":        opp.get("volume"),
+        "entry_spread_cents":  ((opp.get("yes_ask") or 0) - (opp.get("yes_bid") or 0))
+                               if (opp.get("yes_ask") is not None and opp.get("yes_bid") is not None)
+                               else None,
+        # Forecast cluster detail (V2-equivalent ens_*, gfs_*, ecmwf_* etc.)
+        "mu_nbp_at_entry":     opp.get("mu_nbp"),
+        "sigma_nbp_at_entry":  opp.get("sigma_nbp"),
+        "mu_nbm_om_at_entry":  opp.get("mu_nbm_om"),
+        "mu_hrrr_at_entry":    opp.get("mu_hrrr"),
+        "disagreement_at_entry": opp.get("disagreement"),
+        "post_sunrise_lock_at_entry": opp.get("post_sunrise_lock"),
+        "is_today_at_entry":   opp.get("is_today"),
+        # Edge breakdown (mirrors V2's edge / edge_vs_mid)
+        "yes_ask_frac_at_entry": opp.get("yes_ask_frac"),
+        "no_ask_frac_at_entry":  opp.get("no_ask_frac"),
         "_is_addon": is_addon,
     }
     _append_jsonl(_trades_file_today(), trade_record)
@@ -3659,6 +3710,28 @@ def _settle_from_kalshi(pos: dict) -> Optional[dict]:
         "running_min_at_entry": pos.get("running_min"),
         "station": pos.get("station"), "date_str": pos.get("date_str"),
         "label": pos.get("label"),
+        # ─── Entry awareness (V2-parity, 2026-05-01) ───
+        "entry_local_hour":           pos.get("entry_local_hour"),
+        "entry_local_dow":            pos.get("entry_local_dow"),
+        "entry_local_ts":             pos.get("entry_local_ts"),
+        "entry_hours_to_sunrise":     pos.get("entry_hours_to_sunrise"),
+        "entry_tz":                   pos.get("entry_tz"),
+        "entry_yes_bid_cents":        pos.get("entry_yes_bid_cents"),
+        "entry_yes_ask_cents":        pos.get("entry_yes_ask_cents"),
+        "entry_no_bid_cents":         pos.get("entry_no_bid_cents"),
+        "entry_no_ask_cents":         pos.get("entry_no_ask_cents"),
+        "entry_volume":               pos.get("entry_volume"),
+        "entry_spread_cents":         pos.get("entry_spread_cents"),
+        "mu_nbp_at_entry":            pos.get("mu_nbp_at_entry"),
+        "sigma_nbp_at_entry":         pos.get("sigma_nbp_at_entry"),
+        "mu_nbm_om_at_entry":         pos.get("mu_nbm_om_at_entry"),
+        "mu_hrrr_at_entry":           pos.get("mu_hrrr_at_entry"),
+        "disagreement_at_entry":      pos.get("disagreement_at_entry"),
+        "post_sunrise_lock_at_entry": pos.get("post_sunrise_lock_at_entry"),
+        "is_today_at_entry":          pos.get("is_today_at_entry"),
+        "yes_ask_frac_at_entry":      pos.get("yes_ask_frac_at_entry"),
+        "no_ask_frac_at_entry":       pos.get("no_ask_frac_at_entry"),
+        "edge":                       pos.get("edge"),
         "source": "kalshi",
         "kalshi_settled_time": ks.get("settled_time"),
     }
@@ -3770,6 +3843,28 @@ def check_settlements() -> int:
                 "running_min_at_entry": pos.get("running_min"),
                 "station": station, "date_str": date_str,
                 "label": pos.get("label"),
+                # ─── Entry awareness (V2-parity, 2026-05-01) ───
+                "entry_local_hour":           pos.get("entry_local_hour"),
+                "entry_local_dow":            pos.get("entry_local_dow"),
+                "entry_local_ts":             pos.get("entry_local_ts"),
+                "entry_hours_to_sunrise":     pos.get("entry_hours_to_sunrise"),
+                "entry_tz":                   pos.get("entry_tz"),
+                "entry_yes_bid_cents":        pos.get("entry_yes_bid_cents"),
+                "entry_yes_ask_cents":        pos.get("entry_yes_ask_cents"),
+                "entry_no_bid_cents":         pos.get("entry_no_bid_cents"),
+                "entry_no_ask_cents":         pos.get("entry_no_ask_cents"),
+                "entry_volume":               pos.get("entry_volume"),
+                "entry_spread_cents":         pos.get("entry_spread_cents"),
+                "mu_nbp_at_entry":            pos.get("mu_nbp_at_entry"),
+                "sigma_nbp_at_entry":         pos.get("sigma_nbp_at_entry"),
+                "mu_nbm_om_at_entry":         pos.get("mu_nbm_om_at_entry"),
+                "mu_hrrr_at_entry":           pos.get("mu_hrrr_at_entry"),
+                "disagreement_at_entry":      pos.get("disagreement_at_entry"),
+                "post_sunrise_lock_at_entry": pos.get("post_sunrise_lock_at_entry"),
+                "is_today_at_entry":          pos.get("is_today_at_entry"),
+                "yes_ask_frac_at_entry":      pos.get("yes_ask_frac_at_entry"),
+                "no_ask_frac_at_entry":       pos.get("no_ask_frac_at_entry"),
+                "edge":                       pos.get("edge"),
                 "source": "obs_pipeline",
             }
             log_cli = f"{cli_low}°F"
