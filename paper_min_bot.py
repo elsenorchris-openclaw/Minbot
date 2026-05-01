@@ -140,6 +140,15 @@ MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
 DIRECTIONAL_BUY_NO_MAX_MP = 0.20    # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night)
 DIRECTIONAL_BUY_YES_MIN_MP = 0.60   # unchanged (asymmetric; only BUY_NO tightened)
 
+# 2026-05-01: BUY_YES tail margin gate. Live-pool loser pattern:
+# losers had margin median = -0.50°F (μ on wrong side / barely across the
+# threshold), winners had margin = +0.90°F. DC-T46 today (μ=47, floor=46.5,
+# margin +0.5°F → -$24 stuck) fits the loser pattern exactly. Skip BUY_YES
+# tail when |μ - threshold| < 1.0°F into the YES region. Defense-in-depth
+# beyond DIRECTIONAL_BUY_YES_MIN_MP=0.60 — that gate misses cases like
+# DC-T46 where mp=62% just barely passes.
+YES_TAIL_MIN_MARGIN_F = 1.0
+
 # Hard safety gates (HIGH-impact: prevent the patterns that lost money on the
 # 04:09 UTC live cycle and that V1/V2 had to fix in production).
 MAX_DISAGREEMENT_F = 5.0            # skip if HRRR vs NBP / NBP vs NBM disagree > this
@@ -154,6 +163,15 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
 
 # Kelly sizing
 MAX_BET_USD = 30.00                 # $30 cap per entry. $1 (live launch) → $3 (2026-04-26)
+                                    # → ... → $30 (2026-04-29 evening). Default cap.
+
+# 2026-05-01: BUY_YES tail entries (T-high or T-low) get a tighter $5 cap.
+# Asymmetric blast-radius limit. Historical wins on these were ALL ≤ $4.90
+# cost (max KSAT-T73 win at $4.90), so the cap doesn't change wins. DC-T46
+# today (cost $24, currently -$24 stuck unrealized) shows the loss potential
+# when uncapped — same forecast wrong by 2.5°F = full position loss. Capping
+# at $5 limits single-trade max loss to ~$5 with no historical win sacrificed.
+MAX_BET_BUY_YES_TAIL_USD = 5.00
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
                                     # (2026-04-28) → $20 (2026-04-28 night, paired with bankroll
                                     # add to ~$279) → $30 (2026-04-29 evening, per Chris). Kelly
@@ -2845,6 +2863,24 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         return ("NO_THIGH",
                 f"BUY_NO on T-high market blocked (structurally fights "
                 f"nighttime cooling; backtest 6L:1W on n=7)")
+    # BUY_YES tail margin gate (2026-05-01). Live-pool losers had margin
+    # ≤ +0.5°F into YES region; winners ≥ +0.9°F. Skip when < 1.0°F.
+    # Triggered by today's DC-T46 stuck loss (μ=47.0, floor=46.5,
+    # margin +0.5°F → -$24 unrealized).
+    if action == "BUY_YES":
+        _yt_fl = opp.get("floor"); _yt_cp = opp.get("cap")
+        _yt_mu = opp.get("mu")
+        # tail = exactly one of (floor, cap) is set
+        _yt_is_tail = (_yt_fl is not None) ^ (_yt_cp is not None)
+        if _yt_is_tail and _yt_mu is not None:
+            if _yt_fl is not None:
+                _yt_margin = float(_yt_mu) - float(_yt_fl)  # T-high: μ above floor
+            else:
+                _yt_margin = float(_yt_cp) - float(_yt_mu)  # T-low: μ below cap
+            if _yt_margin < YES_TAIL_MIN_MARGIN_F:
+                return ("YES_TAIL_MARGIN",
+                        f"BUY_YES tail margin {_yt_margin:+.1f}°F < "
+                        f"{YES_TAIL_MIN_MARGIN_F}°F into YES region")
     if action == "BUY_NO":
         fl = opp.get("floor"); cp = opp.get("cap")
         if fl is not None and cp is not None:
@@ -3014,22 +3050,34 @@ def execute_opportunity(opp: dict) -> bool:
             f"  skip {ticker}: no verified bankroll yet "
             f"(get_kalshi_balance returned None); refusing trade")
         return False
+    # 2026-05-01: per-action MAX_BET cap. BUY_YES tail entries (T-high or
+    # T-low) capped at $5; everything else uses MAX_BET_USD ($30). Limits
+    # blast radius on the asymmetric loss profile of cheap BUY_YES tails
+    # (small wins, occasional full-cost losses like DC-T46).
+    _bet_action = opp.get("action")
+    _bet_fl = opp.get("floor"); _bet_cp = opp.get("cap")
+    _bet_is_tail = (_bet_fl is not None) ^ (_bet_cp is not None)
+    if _bet_action == "BUY_YES" and _bet_is_tail:
+        _effective_max_bet = MAX_BET_BUY_YES_TAIL_USD
+    else:
+        _effective_max_bet = MAX_BET_USD
+
     if is_addon:
         # Add-on path: skip fresh Kelly recompute. Fill the gap up to the
-        # original intended count, capped by remaining MAX_BET_USD budget.
-        # If price moved up since first entry, max_count_by_budget shrinks
-        # naturally — we never spend more than MAX_BET_USD per ticker.
+        # original intended count, capped by remaining budget (per-action
+        # cap). If price moved up since first entry, max_count_by_budget
+        # shrinks naturally — we never spend more than the cap per ticker.
         remaining_to_intended = max(0, addon_intended - addon_filled)
-        remaining_budget_usd = max(0.0, MAX_BET_USD - addon_existing_cost)
+        remaining_budget_usd = max(0.0, _effective_max_bet - addon_existing_cost)
         max_count_by_budget = int(remaining_budget_usd / price) if price > 0 else 0
         count = min(remaining_to_intended, max_count_by_budget)
         if count < 1:
             return False  # nothing to add
     else:
-        bet_usd = min(MAX_BET_USD, max(MIN_BET_USD, kelly * bankroll))
+        bet_usd = min(_effective_max_bet, max(MIN_BET_USD, kelly * bankroll))
         count = max(1, int(bet_usd / price))
         count = max(count, math.ceil(MIN_COST_USD / price))
-        count = min(count, max(1, int(MAX_BET_USD / price)))
+        count = min(count, max(1, int(_effective_max_bet / price)))
     intended_cost = count * price
     action = opp["action"]
     mp = float(opp.get("model_prob", 0.0))
@@ -3080,6 +3128,22 @@ def execute_opportunity(opp: dict) -> bool:
                 f"  skip {ticker}: NO_THIGH — BUY_NO on T-high market blocked "
                 f"(structurally fights nighttime cooling; backtest 6L:1W on n=7)")
             return False
+        # BUY_YES tail margin gate (2026-05-01). See _evaluate_gates twin.
+        if action == "BUY_YES":
+            _yt_fl = opp.get("floor"); _yt_cp = opp.get("cap")
+            _yt_mu = opp.get("mu")
+            _yt_is_tail = (_yt_fl is not None) ^ (_yt_cp is not None)
+            if _yt_is_tail and _yt_mu is not None:
+                if _yt_fl is not None:
+                    _yt_margin = float(_yt_mu) - float(_yt_fl)
+                else:
+                    _yt_margin = float(_yt_cp) - float(_yt_mu)
+                if _yt_margin < YES_TAIL_MIN_MARGIN_F:
+                    _log_skip(ticker,
+                        f"  skip {ticker}: YES_TAIL_MARGIN — margin "
+                        f"{_yt_margin:+.1f}°F < {YES_TAIL_MIN_MARGIN_F}°F "
+                        f"into YES region (DC-T46-class boundary risk)")
+                    return False
         # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
         if action == "BUY_NO":
             fl = opp.get("floor"); cp = opp.get("cap")

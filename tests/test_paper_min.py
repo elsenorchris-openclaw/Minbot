@@ -4504,5 +4504,304 @@ class TestLowSummaryThrottle(unittest.TestCase):
         self.assertEqual(pb.SUMMARY_INTERVAL_SEC, 6 * 3600)
 
 
+class TestYesTailMarginGate(unittest.TestCase):
+    """BUY_YES tail trades (T-high or T-low) require margin ≥ 1.0°F into the
+    YES region. Mechanism: live-pool losers all sit ≤ 0.5°F into YES (or on
+    the wrong side); winners are decisively past the threshold (median
+    +0.9°F). Filter prevents 'cheap BUY_YES at the boundary' losses like
+    today's DC-T46 (μ=47.0, floor=46.5, margin=+0.5°F → −$24 stuck).
+
+    Margin definition:
+      T-high (floor only): margin = μ - floor  (must be ≥ 1.0)
+      T-low  (cap only):   margin = cap - μ    (must be ≥ 1.0)
+    Negative margin = μ on wrong side of threshold (already caught by
+    DIRECTIONAL_BUY_YES_MIN_MP=0.60 in most cases, but defense-in-depth)."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        pb._cached_bankroll = 25.0
+        pb._bankroll_cache_ts = 9999999999
+        with pb._skip_log_lock:
+            pb._skip_log_state.clear()
+        self._captured: list = []
+        self._orig_place = pb.place_kalshi_order
+        pb.place_kalshi_order = lambda *a, **kw: (
+            self._captured.append((a, kw)) or None
+        )
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+        pb._cached_bankroll = 0.0
+
+    def _yes_thigh(self, **overrides):
+        """BUY_YES T-high opp. mp=0.65 (passes DIRECTIONAL_BUY_YES_MIN_MP=0.60),
+        edge=0.30, μ=47.0 / floor=46.5 → margin +0.5°F (DC-T46-like)."""
+        base = {
+            "market_ticker": "KXLOWTDC-26MAY01-T46",
+            "event_ticker": "KXLOWTDC-26MAY01",
+            "action": "BUY_YES", "model_prob": 0.65, "edge": 0.30,
+            "entry_price": 0.30, "yes_bid": 28, "yes_ask": 32,
+            "no_bid": 68, "no_ask": 72, "mu": 47.0, "sigma": 1.6,
+            "mu_source": "nbp",
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 1.0,
+            "floor": 46.5, "cap": None,
+            "station": "KDCA", "date_str": "2026-05-01", "label": "Washington DC",
+            "series": "KXLOWTDC",
+        }
+        base.update(overrides)
+        return base
+
+    def _yes_tlow(self, **overrides):
+        """BUY_YES T-low opp. cap=70, μ varies for margin tests."""
+        base = {
+            "market_ticker": "KXLOWTOKC-26MAY01-T70",
+            "event_ticker": "KXLOWTOKC-26MAY01",
+            "action": "BUY_YES", "model_prob": 0.65, "edge": 0.30,
+            "entry_price": 0.30, "yes_bid": 28, "yes_ask": 32,
+            "no_bid": 68, "no_ask": 72, "mu": 68.0, "sigma": 1.6,
+            "mu_source": "nbp",
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 1.0,
+            "floor": None, "cap": 70.5,
+            "station": "KOKC", "date_str": "2026-05-01", "label": "Oklahoma City",
+            "series": "KXLOWTOKC",
+        }
+        base.update(overrides)
+        return base
+
+    # ── _evaluate_gates returns YES_TAIL_MARGIN ──
+
+    def test_dc_t46_case_blocked(self):
+        """The exact DC-T46 case: μ=47.0, floor=46.5, margin=+0.5°F → BLOCK."""
+        gate, reason = pb._evaluate_gates(self._yes_thigh())
+        self.assertEqual(gate, "YES_TAIL_MARGIN")
+        self.assertIn("0.5", reason or "")
+
+    def test_yes_thigh_margin_at_threshold_passes(self):
+        """μ - floor = exactly 1.0°F → passes (gate is strict <, not <=)."""
+        # μ=47.5, floor=46.5 → margin = 1.0
+        opp = self._yes_thigh(mu=47.5)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN",
+                            "margin = 1.0°F (boundary) must pass")
+
+    def test_yes_thigh_margin_above_threshold_passes(self):
+        """μ - floor = 1.5°F → passes."""
+        opp = self._yes_thigh(mu=48.0)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN")
+
+    def test_yes_thigh_margin_below_threshold_blocked(self):
+        """μ - floor = 0.9°F → blocked."""
+        opp = self._yes_thigh(mu=47.4)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertEqual(gate, "YES_TAIL_MARGIN")
+
+    def test_yes_thigh_negative_margin_blocked(self):
+        """μ < floor (model says low won't reach floor, bet YES anyway).
+        Already caught by DIRECTIONAL_BUY_YES if mp < 0.60 — this is
+        defense-in-depth for the rare obs_alive bypass case."""
+        # μ=46.0, floor=46.5 → margin = -0.5°F. Need mp > 0.60 to bypass directional first.
+        opp = self._yes_thigh(mu=46.0, model_prob=0.65)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertEqual(gate, "YES_TAIL_MARGIN")
+
+    def test_yes_tlow_margin_at_threshold_passes(self):
+        """T-low: cap - μ = 1.0°F → passes."""
+        opp = self._yes_tlow(mu=69.5, cap=70.5)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN")
+
+    def test_yes_tlow_margin_below_threshold_blocked(self):
+        """T-low: cap - μ = 0.5°F → blocked."""
+        opp = self._yes_tlow(mu=70.0, cap=70.5)
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertEqual(gate, "YES_TAIL_MARGIN")
+
+    # ── execute_opportunity refuses to place orders ──
+
+    def test_dc_t46_blocked_in_execute(self):
+        pb.execute_opportunity(self._yes_thigh())  # margin +0.5 → block
+        self.assertEqual(self._captured, [],
+                         "DC-T46 case must not place an order")
+
+    def test_yes_thigh_with_margin_passes_in_execute(self):
+        opp = self._yes_thigh(mu=48.5)  # margin = 2.0°F
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1,
+                         "BUY_YES T-high with margin ≥ 1°F must pass")
+
+    # ── Negative tests: filter precisely scoped ──
+
+    def test_buy_yes_b_bracket_unaffected(self):
+        """B-bracket BUY_YES not a tail — gate doesn't apply."""
+        opp = self._yes_thigh(
+            floor=46.0, cap=47.0,  # B-bracket
+            mu=46.5,  # μ at center of B-bracket
+            model_prob=0.65,
+        )
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN",
+                            "B-bracket BUY_YES is not a tail; gate must not fire")
+
+    def test_buy_no_t_high_unaffected(self):
+        """BUY_NO T-high already blocked by NO_THIGH; YES_TAIL_MARGIN doesn't fire on BUY_NO."""
+        opp = self._yes_thigh(action="BUY_NO", model_prob=0.18, mu=46.5)
+        gate, _ = pb._evaluate_gates(opp)
+        # NO_THIGH fires first; YES_TAIL_MARGIN should never be the cause
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN",
+                            "BUY_NO T-high blocked by NO_THIGH, not YES_TAIL_MARGIN")
+
+    def test_buy_no_b_bracket_unaffected(self):
+        """BUY_NO B-bracket — gate doesn't apply."""
+        opp = self._yes_thigh(
+            action="BUY_NO", model_prob=0.18,
+            floor=46.0, cap=47.0, mu=44.0,
+        )
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "YES_TAIL_MARGIN")
+
+    def test_constant_is_one_degree(self):
+        """The threshold must be exactly 1.0°F per the loser-pattern audit."""
+        self.assertEqual(pb.YES_TAIL_MIN_MARGIN_F, 1.0)
+
+
+class TestYesTailMaxBetCap(unittest.TestCase):
+    """BUY_YES tail entries (T-high or T-low) capped at MAX_BET_BUY_YES_TAIL=$5.
+
+    Asymmetric blast-radius limit: BUY_YES tail wins are typically small
+    ($0.50-$5 range) but losses can be the full position cost. Capping
+    bets at $5 keeps single-trade max loss bounded without affecting the
+    typical win path. Historical impact: $0 (all 19 historical wins were
+    already ≤ $5). Forward impact: DC-T46 (today, n=1) would have been
+    $5 instead of $24 — saved ~$19."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        pb._cached_bankroll = 1000.0  # large bankroll so Kelly doesn't cap
+        pb._bankroll_cache_ts = pb.time.time()
+        with pb._skip_log_lock:
+            pb._skip_log_state.clear()
+        self._captured: list = []
+        self._orig_place = pb.place_kalshi_order
+        self._orig_wait = pb.wait_for_fill
+        pb.place_kalshi_order = lambda t, s, c, p: (
+            self._captured.append((t, s, c, p)) or "test-oid"
+        )
+        pb.wait_for_fill = lambda oid, expected, timeout_sec=5.0: ("executed", expected)
+        self._orig_delete = pb.kalshi_delete
+        self._orig_append = pb._append_jsonl
+        self._orig_save = pb._save_positions
+        self._orig_discord = pb.discord_send
+        self._orig_notify = pb.notify_discord_entry
+        pb.kalshi_delete = lambda p: {}
+        pb._append_jsonl = lambda p, r: None
+        pb._save_positions = lambda: None
+        pb.discord_send = lambda m: None
+        pb.notify_discord_entry = lambda r, o: None
+
+    def tearDown(self):
+        pb.place_kalshi_order = self._orig_place
+        pb.wait_for_fill = self._orig_wait
+        pb.kalshi_delete = self._orig_delete
+        pb._append_jsonl = self._orig_append
+        pb._save_positions = self._orig_save
+        pb.discord_send = self._orig_discord
+        pb.notify_discord_entry = self._orig_notify
+        pb._cached_bankroll = 0.0
+        with pb._positions_lock:
+            pb._open_positions.clear()
+
+    def _opp(self, **overrides):
+        # Strong winner setup so Kelly wants a big bet (no other gates fire).
+        base = {
+            "market_ticker": "KXLOWTOKC-26MAY01-T56",
+            "event_ticker": "KXLOWTOKC-26MAY01",
+            "action": "BUY_YES", "model_prob": 0.85, "edge": 0.40,
+            "entry_price": 0.30, "yes_bid": 28, "yes_ask": 32,
+            "no_bid": 68, "no_ask": 72,
+            "mu": 60.0, "sigma": 2.0,  # T-high: μ - floor = 4°F (passes margin gate)
+            "mu_source": "nbp",
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 1.0,
+            "floor": 56.0, "cap": None,
+            "station": "KOKC", "date_str": "2026-05-01", "label": "Oklahoma City",
+            "series": "KXLOWTOKC",
+        }
+        base.update(overrides)
+        return base
+
+    def test_buy_yes_thigh_capped_at_5_dollars(self):
+        """BUY_YES T-high bet should not exceed $5 cost."""
+        pb.execute_opportunity(self._opp())
+        self.assertEqual(len(self._captured), 1, "should place an order")
+        ticker, side, count, price_cents = self._captured[0]
+        cost = count * price_cents / 100.0
+        self.assertLessEqual(cost, 5.00 + 0.01,
+                             f"BUY_YES T-high cost ${cost:.2f} exceeds $5 cap")
+
+    def test_buy_yes_tlow_capped_at_5_dollars(self):
+        """BUY_YES T-low same cap."""
+        opp = self._opp(
+            market_ticker="KXLOWTPHIL-26MAY01-T46",
+            station="KPHL", series="KXLOWTPHIL",
+            floor=None, cap=46.5,
+            mu=43.0,  # margin = 3.5°F (passes margin gate)
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1)
+        ticker, side, count, price_cents = self._captured[0]
+        cost = count * price_cents / 100.0
+        self.assertLessEqual(cost, 5.00 + 0.01,
+                             f"BUY_YES T-low cost ${cost:.2f} exceeds $5 cap")
+
+    def test_buy_yes_b_bracket_uses_full_max_bet(self):
+        """B-bracket BUY_YES NOT capped at $5 — it's not a tail."""
+        opp = self._opp(
+            floor=55.0, cap=57.0,  # B-bracket
+            mu=56.0,  # at center
+            model_prob=0.85, edge=0.40,
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1)
+        ticker, side, count, price_cents = self._captured[0]
+        cost = count * price_cents / 100.0
+        # With $1000 bankroll, Kelly wants > $5 — should hit MAX_BET_USD=$30
+        self.assertGreater(cost, 5.00 + 0.01,
+                           f"BUY_YES B-bracket cost ${cost:.2f} should NOT be $5-capped")
+
+    def test_buy_no_t_low_uses_full_max_bet(self):
+        """BUY_NO tails NOT capped at $5 — only BUY_YES."""
+        opp = self._opp(
+            action="BUY_NO", model_prob=0.10, edge=0.30,
+            entry_price=0.65, yes_bid=33, yes_ask=37,
+            no_bid=63, no_ask=67,
+            floor=None, cap=70.0,
+            mu=72.0,
+        )
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1)
+        ticker, side, count, price_cents = self._captured[0]
+        cost = count * price_cents / 100.0
+        self.assertGreater(cost, 5.00 + 0.01,
+                           f"BUY_NO T-low cost ${cost:.2f} should NOT be $5-capped")
+
+    def test_constant_is_5_dollars(self):
+        self.assertEqual(pb.MAX_BET_BUY_YES_TAIL_USD, 5.00)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
