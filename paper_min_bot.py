@@ -260,9 +260,27 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
 # "hrrr_d1_override"; "nbp_d0_override" added to that tuple below). NBP
 # cycles every 6h so d-0 NBP can be 4-6h stale on late-evening entries.
 PER_SERIES_D0_PRIMARY: dict[str, str] = {
-    "KXLOWTNYC": "nbp",
-    "KXLOWTDC":  "nbp",
-    "KXLOWTBOS": "nbp",
+    # 2026-04-29 evening (memory project_min_bot_d0_nbp_override_20260429.md)
+    "KXLOWTNYC": "nbp",   # gap +19% on n=46-58k cycles, HRRR -3.30°F
+    "KXLOWTDC":  "nbp",   # gap +30%, HRRR -1.65°F
+    "KXLOWTBOS": "nbp",   # gap +71% (memory had +54% original; widened with more data), HRRR -2.97°F
+    # 2026-05-01 (audit on n=6-7 climate days × ~31k cycles per cell —
+    # /tmp/all_cities_audit.py; triggered by MIA-26MAY01-B71.5 -$23.82
+    # hard-stop where HRRR 69.6°F vs actual 71.6°F vs NBP 72.0°F).
+    # Pacific/coastal HRRR cool-bias mirrors V2's documented Open-Meteo
+    # bilinear coastal warm-bias (project_open_meteo_audit_20260429.md),
+    # opposite sign at night.
+    "KXLOWTLAS": "nbp",   # gap +58%, HRRR -2.80°F, NBP MAE 1.19 vs HRRR 2.80
+    "KXLOWTLAX": "nbp",   # gap +34%, HRRR -3.53°F, NBP 2.34 vs HRRR 3.53
+    "KXLOWTMIA": "nbp",   # gap +31%, HRRR -1.30°F, NBP 0.91 vs HRRR 1.32
+    "KXLOWTPHIL": "nbp",  # gap +63%, HRRR -1.78°F, NBP 0.84 vs HRRR 2.24
+    "KXLOWTPHX": "nbp",   # gap +55%, HRRR -3.08°F, NBP 1.41 vs HRRR 3.15
+    "KXLOWTSEA": "nbp",   # gap +62%, HRRR -1.07°F, NBP 0.62 vs HRRR 1.62
+    "KXLOWTSFO": "nbp",   # gap +50%, HRRR -3.32°F, NBP 1.68 vs HRRR 3.32
+    # Re-audit at n>=10 days (~2026-05-11) to validate. Borderline candidates
+    # to revisit: KMSY (+23%), KMIA (only +31% — at threshold). Tie zone:
+    # ATL, DEN, HOU, SAT. Stayed on HRRR (HRRR materially better):
+    # AUS -69%, DFW -87%, MDW -69%, MSP -117%, OKC -111%.
 }
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
