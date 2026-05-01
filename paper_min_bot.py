@@ -219,7 +219,16 @@ PER_SERIES_SIGMA_MULT: dict[str, float] = {
 # on KLAX in this regime, so betting "low won't reach X" is structurally
 # the wrong direction at any threshold inside KLAX's 54-60°F observed range.
 # B-bracket BUY_NO at LAX is unaffected (n=5 wr=60% there) — only T-high.
-BUY_NO_T_HIGH_BLOCK_SERIES: set[str] = {"KXLOWTLAX"}
+#
+# 2026-05-01: BUY_NO_T_HIGH_BLOCK_SERIES set REMOVED — block now applies
+# globally (any station). Backtest n=82 settlements: 7 historical T-high
+# BUY_NO entries → 6 losses prevented, 1 win forfeited (helps:hurts 6:1,
+# net lift +$2.93, LOO-robust +$1.74). Mechanism is universal across
+# stations: BUY_NO on T-high bets the daily low will drop below floor —
+# fights the dominant nighttime-cooling pattern that Kalshi's bracket
+# heuristics already account for. Forward audit via candidate logs:
+# blocked_by="NO_THIGH" entries can be cross-referenced with subsequent
+# CLI lows to verify we are not killing an emerging winner regime.
 
 # Per-city d-1+ primary source override (2026-04-29 source-MAE audit).
 # Default is NBP for d-1+ markets. When a city is mapped to "hrrr" here,
@@ -2827,13 +2836,15 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%}")
     if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
         return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%}")
-    # Per-station BUY_NO T-high block (2026-04-29 LAX audit, n=3 wr=0%,
-    # NBP cool-bias structural).
+    # Global BUY_NO T-high block (2026-05-01, was per-station LAX-only).
+    # Backtest helps:hurts 6:1, net +$2.93 across n=7 historical entries.
+    # Forward audit: candidate log records blocked_by="NO_THIGH" so future
+    # analysis can confirm filter isn't blocking an emerging winner.
     if (action == "BUY_NO"
-            and opp.get("series") in BUY_NO_T_HIGH_BLOCK_SERIES
             and opp.get("floor") is not None and opp.get("cap") is None):
-        return ("LAX_NO_THIGH",
-                f"BUY_NO T-high blocked at {opp.get('series')} (NBP cool-bias)")
+        return ("NO_THIGH",
+                f"BUY_NO on T-high market blocked (structurally fights "
+                f"nighttime cooling; backtest 6L:1W on n=7)")
     if action == "BUY_NO":
         fl = opp.get("floor"); cp = opp.get("cap")
         if fl is not None and cp is not None:
@@ -3062,13 +3073,12 @@ def execute_opportunity(opp: dict) -> bool:
         if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
             _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
             return False
-        # Per-station BUY_NO T-high block (2026-04-29 LAX audit).
+        # Global BUY_NO T-high block (2026-05-01, was LAX-only).
         if (action == "BUY_NO"
-                and opp.get("series") in BUY_NO_T_HIGH_BLOCK_SERIES
                 and opp.get("floor") is not None and opp.get("cap") is None):
             _log_skip(ticker,
-                f"  skip {ticker}: LAX_NO_THIGH — BUY_NO T-high blocked at "
-                f"{opp.get('series')} (NBP cool-bias, n=3 wr=0%)")
+                f"  skip {ticker}: NO_THIGH — BUY_NO on T-high market blocked "
+                f"(structurally fights nighttime cooling; backtest 6L:1W on n=7)")
             return False
         # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
         if action == "BUY_NO":
