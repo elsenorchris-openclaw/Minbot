@@ -314,7 +314,7 @@ PER_SERIES_D0_PRIMARY: dict[str, str] = {
 MAX_NEW_POSITIONS_PER_CYCLE = 3     # cycle scope (60s scan)
 DAILY_EXPOSURE_CAP_USD = 10000.00   # day scope (UTC midnight); $4 → $15 → $30 → $60 (2026-04-27)
                                     # → $120 (2026-04-28 night) → effectively unlimited (2026-04-29
-                                    # evening, per Chris). With ~$279 bankroll, MAX_BET_USD=$20,
+                                    # evening, per Chris). With ~$300 bankroll (BANKROLL_REF_USD), MAX_BET_USD=$30,
                                     # MAX_NEW_POSITIONS_PER_CYCLE=3, and BANKROLL_FLOOR_USD=$5, the
                                     # bankroll itself becomes the binding constraint (bot refuses to
                                     # place orders once balance < $5). The $10,000 value is a sentinel
@@ -406,6 +406,14 @@ HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery
 H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
+# 2026-05-01: documented bankroll reference for Kelly sizing & backtests.
+# This is the operational bankroll we currently target — it is NOT used to
+# override the live `_get_bankroll_cached()` value for sizing (Kelly still
+# uses actual Kalshi balance). It exists as the single source of truth for
+# the backtest-standardization memory (cap-then-Kelly simulation per
+# `feedback_backtest_standardization.md`). When Chris re-targets bankroll,
+# update this constant AND the memory file together.
+BANKROLL_REF_USD = 300.00
 
 # Auto-cleanup of position records whose climate day is more than this many
 # days in the past. Defends against positions that never settle (data error)
