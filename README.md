@@ -3,7 +3,43 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-01 late night) — `primary_outlier_diff_at_entry` shadow log
+## Latest change (2026-05-02) — BRACKET MATH FIX (V1/V2 port from 2026-04-22)
+
+Ported the 2026-04-22 bracket-math fix from V1 + V2 (already shipped there months ago). `calc_bracket_probability_min` now widens B-bracket integration limits by ±0.5°F to match Kalshi's integer-CLI settlement.
+
+**The math:** Kalshi settles on integer °F CLI. A B-bracket [floor, cap] wins YES when CLI ∈ {floor, …, cap}, which is continuous low ∈ [floor−0.5, cap+0.5]. The previous formula computed P(continuous ∈ [floor, cap]) — too narrow by 1°F (0.5°F on each side).
+
+**V1/V2 evidence:** Brier-score backtest on n=398 settled max-temp brackets showed 0.250 → 0.228 with this fix. min_bot was missing the port.
+
+**Why it was load-bearing:** at boundary forecasts (μ within 1°F of bracket edge with σ ≈ 2-3°F), the old formula produced mp ≈ 10-15%, which bypassed `MIN_MODEL_PROB` via the NBP-CLI consistency bypass and then sailed through `DIRECTIONAL_BUY_NO_MAX_MP=0.20` (because old mp was way below 20%). With corrected mp ≈ 22-30% in those same cases, the `DIRECTIONAL` gate catches them directly — bypass mechanism never invoked.
+
+**Impact on the 5 catastrophic May 1 losses + 4 in-sample winners** (verified against fresh code):
+
+| ticker | μ | σ | bracket | new mp | DIRECTIONAL gate | actual outcome |
+|---|---|---|---|---|---|---|
+| LAX-MAY01 | 57.0 | 3.00 | [58,59] | **23.1%** | **BLOCK** | $-29.16 hard-stop saved |
+| SFO-MAY01 | 53.0 | 2.40 | [54,55] | **26.9%** | **BLOCK** | $-24.50 hard-stop saved |
+| ATL-APR29 | 61.3 | 2.50 | [63,64] | **21.5%** | **BLOCK** | $-7.68 saved |
+| NYC-APR29 | 50.0 | 2.50 | [51,52] | **26.2%** | **BLOCK** | $-1.06 saved |
+| DEN-APR30 | 37.6 | 2.50 | [38,39] | **29.2%** | **BLOCK** | $-0.63 saved |
+| PHX-APR29 | 60.4 | 3.72 | [62,63] | 18.1% | allow | $+10.20 preserved |
+| AUS-APR30 | 66.0 | 3.30 | [64,65] | 21.5% | BLOCK | $+1.36 forfeit (lucky bet — forecast direction wrong) |
+| MIN-MAY01 | 37.0 | 3.06 | [37,38] | 25.3% | BLOCK | $+14.19 forfeit (μ INSIDE bracket — never should have fired) |
+| DEN-MAY01 | 32.0 | 6.00 | [33,34] | 12.8% | allow | $+2.97 preserved |
+
+In-sample lift on the 22-trade BUY_NO pool: **+$47.48** (saves $63.03, forfeits $15.55).
+
+**T-tails are unaffected** — `parse_market_bracket` already pre-buffers them (`cap=val−0.5` for T-low, `floor=val+0.5` for T-high). The fix detects B-brackets via `floor is not None and cap is not None` and skips the buffer for half-integer T-tail bounds (avoids double-buffering).
+
+**Blast radius:** entry-side only. `calc_bracket_probability_min` is called in exactly one place (`find_opportunities`), and the result is stored as `opp["model_prob"]` — never recomputed. Hard-stop, settlement, OBS_CONFIRMED logic uses `floor`/`cap`/`running_min` directly and is unaffected.
+
+Tests: `tests/test_bracket_math_fix.py` (18) — covers all 5 historical losses, B-bracket buffer monotonicity, T-tail no-double-buffer guards, regression guards. Three pre-existing tests in `test_paper_min.py` (`test_gaussian_without_truncation`, `test_post_sunrise_lock_collapses_to_rm`, `test_post_sunrise_sigma_widened_to_1F`) had hard-coded mp values from the old math; updated to reflect the new (correct) values.
+
+**To activate:** daemon must be restarted — Python doesn't hot-reload `.py`. Until restart, entries continue to use the buggy mp.
+
+---
+
+## Earlier 2026-05-01 late night — `primary_outlier_diff_at_entry` shadow log
 
 Added one diagnostic field to every entry log record. **No behavior change.** The bot still trades exactly as before — this is forward-data collection for a possible `SKIP_PRIMARY_OUTLIER` filter at ~2.0°F.
 

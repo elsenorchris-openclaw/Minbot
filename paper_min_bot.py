@@ -406,14 +406,16 @@ HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery
 H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
-# 2026-05-01: documented bankroll reference for Kelly sizing & backtests.
-# This is the operational bankroll we currently target — it is NOT used to
-# override the live `_get_bankroll_cached()` value for sizing (Kelly still
-# uses actual Kalshi balance). It exists as the single source of truth for
-# the backtest-standardization memory (cap-then-Kelly simulation per
-# `feedback_backtest_standardization.md`). When Chris re-targets bankroll,
-# update this constant AND the memory file together.
-BANKROLL_REF_USD = 300.00
+# 2026-05-02: BANKROLL_REF_USD now drives live Kelly sizing (was: documentation-
+# only). Chris bumped to $500 because actual Kalshi cash had drifted to ~$2-50
+# under heavy open exposure, leaving Kelly bet_usd = kelly × bankroll pinned at
+# the 1-contract floor (e.g. HOU-B52.5 sized at $0.43 even with edge=38.8%).
+# Pairs with `_get_bankroll_cached()` change below: once cold-start gate clears
+# (one successful Kalshi balance fetch confirming live connectivity), sizing
+# anchors on this constant, not the live `available` cash. Real-balance
+# insufficient_balance bounces are still self-correcting via the existing
+# retry path. Backtest-standardization memory should reflect this same number.
+BANKROLL_REF_USD = 500.00
 
 # Auto-cleanup of position records whose climate day is more than this many
 # days in the past. Defends against positions that never settle (data error)
@@ -1771,6 +1773,23 @@ def calc_bracket_probability_min(
     if sigma <= 0:
         sigma = 0.5
 
+    # 2026-05-02 BRACKET MATH FIX (port from V1/V2 2026-04-22; Brier
+    # backtest 0.250 → 0.228 on n=398 settled brackets). Kalshi settles
+    # on integer °F CLI lows. A B-bracket [floor, cap] wins YES when
+    # CLI ∈ {floor, …, cap} (integer set), corresponding to continuous
+    # low ∈ [floor − 0.5, cap + 0.5]. Without this buffer, mp at boundary
+    # forecasts is systematically too low (e.g. μ=57 vs bracket [58,59]
+    # was 12% pre-fix, true rounded probability is ~23% — that gap is
+    # exactly what produced LAX/SFO/ATL/NYC/DEN-APR30 catastrophic losses
+    # via bypass at directional 20% gate).
+    #
+    # parse_market_bracket pre-buffers T-tails (T-low cap=val−0.5,
+    # T-high floor=val+0.5), so only widen here when BOTH bounds are
+    # present (B-bracket case). T-tails would double-buffer otherwise.
+    is_b_bracket = floor is not None and cap is not None
+    floor_eff = (floor - 0.5) if is_b_bracket else floor
+    cap_eff   = (cap   + 0.5) if is_b_bracket else cap
+
     # Post-sunrise: collapse forecast to the observed running_min with tight
     # residual noise. Skip the truncation conditioning below — the Gaussian
     # centered on rm already captures the remaining uncertainty (ASOS vs CLI
@@ -1780,8 +1799,8 @@ def calc_bracket_probability_min(
     if post_sunrise_lock and running_min is not None:
         mu = running_min
         sigma = 1.0
-        lo_z = ((floor - mu) / sigma) if floor is not None else None
-        hi_z = ((cap - mu) / sigma) if cap is not None else None
+        lo_z = ((floor_eff - mu) / sigma) if floor_eff is not None else None
+        hi_z = ((cap_eff   - mu) / sigma) if cap_eff   is not None else None
         p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
         p_hi = _gauss_cdf(hi_z) if hi_z is not None else 1.0
         return max(0.0, min(1.0, p_hi - p_lo))
@@ -1796,14 +1815,14 @@ def calc_bracket_probability_min(
     # isn't ruled out — its true CLI low could still land inside.
     if running_min is not None:
         rm_buffered = running_min + 1.0
-        if floor is not None and floor > rm_buffered:
+        if floor_eff is not None and floor_eff > rm_buffered:
             return 0.0  # bracket entirely above rm even after +1°F buffer — impossible
-        effective_cap = cap if (cap is None or rm_buffered >= cap) else rm_buffered
+        effective_cap = cap_eff if (cap_eff is None or rm_buffered >= cap_eff) else rm_buffered
         norm_z = (rm_buffered - mu) / sigma
         norm_denom = _gauss_cdf(norm_z)
         if norm_denom <= 0:
             return 0.0
-        lo_z = ((floor - mu) / sigma) if floor is not None else None
+        lo_z = ((floor_eff - mu) / sigma) if floor_eff is not None else None
         hi_z = ((effective_cap - mu) / sigma) if effective_cap is not None else norm_z
         p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
         p_hi = _gauss_cdf(hi_z)
@@ -1811,8 +1830,8 @@ def calc_bracket_probability_min(
         return max(0.0, min(1.0, prob))
 
     # No running_min constraint — unconditional Gaussian.
-    lo_z = ((floor - mu) / sigma) if floor is not None else None
-    hi_z = ((cap - mu) / sigma) if cap is not None else None
+    lo_z = ((floor_eff - mu) / sigma) if floor_eff is not None else None
+    hi_z = ((cap_eff   - mu) / sigma) if cap_eff   is not None else None
     p_lo = _gauss_cdf(lo_z) if lo_z is not None else 0.0
     p_hi = _gauss_cdf(hi_z) if hi_z is not None else 1.0
     return max(0.0, min(1.0, p_hi - p_lo))
@@ -2085,15 +2104,19 @@ _bankroll_cache_ts: float = 0.0
 
 
 def _get_bankroll_cached() -> float:
-    """Return Kalshi bankroll, refreshed every BANKROLL_REFRESH_SEC.
+    """Return BANKROLL_REF_USD as the Kelly sizing anchor, gated on at least
+    one successful Kalshi balance fetch (the cold-start safety from 2026-04-30).
+    Live Kalshi cash is fetched and cached every BANKROLL_REFRESH_SEC purely as
+    a connectivity probe; once we've confirmed Kalshi is reachable, Kelly sizes
+    against BANKROLL_REF_USD, not the shrinking live cash that would otherwise
+    pin every trade at the 1-contract floor under heavy open exposure.
+
     Returns 0.0 if no real balance has ever been cached (cold start or
     persistent Kalshi-auth failure). Callers must treat 0.0 as 'unverified
     bankroll, refuse to size'.
 
-    2026-04-30: removed MAX_BET_USD fallback. Pre-fix, a cold start during
-    a Kalshi outage would size trades against a synthetic $30 bankroll and
-    happily place orders sized for that fictional balance. Now we refuse
-    to size until balance fetch succeeds at least once."""
+    2026-05-02: switched from returning live cash to BANKROLL_REF_USD. See
+    constant definition above for rationale."""
     global _cached_bankroll, _bankroll_cache_ts
     now = time.time()
     if now - _bankroll_cache_ts > BANKROLL_REFRESH_SEC:
@@ -2101,7 +2124,9 @@ def _get_bankroll_cached() -> float:
         if b is not None:
             _cached_bankroll = b
             _bankroll_cache_ts = now
-    return _cached_bankroll  # 0.0 when never successfully fetched
+    if _cached_bankroll <= 0:
+        return 0.0  # cold-start gate: no successful balance fetch yet
+    return BANKROLL_REF_USD
 
 
 # ─── Obs-confirmed-alive helpers (V2 port) ────────────────────────────────

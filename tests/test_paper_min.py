@@ -87,10 +87,12 @@ class TestBracketParse(unittest.TestCase):
 
 class TestBracketProbability(unittest.TestCase):
     def test_gaussian_without_truncation(self):
-        # N(65, 2) → P(64 < X < 66) should be ~38% (about ±0.5σ)
+        # N(65, 2), B-bracket [64, 66]. Post-2026-05-02 BRACKET MATH FIX:
+        # integration range widens to [63.5, 66.5] for CLI integer rounding.
+        # P = Φ(0.75) − Φ(−0.75) ≈ 0.547. Pre-fix was 0.383.
         p = pb.calc_bracket_probability_min(mu=65.0, sigma=2.0,
                                               floor=64.0, cap=66.0)
-        self.assertTrue(0.30 < p < 0.45)
+        self.assertTrue(0.50 < p < 0.60)
 
     def test_running_min_truncates_above(self):
         # Running min = 62 means the daily min can't exceed 62. The bracket
@@ -134,17 +136,17 @@ class TestBracketProbability(unittest.TestCase):
         self.assertAlmostEqual(p_rm, p_no_rm, places=3)
 
     def test_post_sunrise_lock_collapses_to_rm(self):
-        # Post-sunrise + rm=62 — sigma collapsed to 1.0°F to reflect ASOS-vs-CLI
-        # ±1°F uncertainty (was 0.5°F before 2026-04-25 buffer fix). A bracket
-        # straddling 62 should still take the bulk of probability; one far away
-        # should be ~0%.
+        # Post-sunrise + rm=62 — sigma collapsed to 1.0°F. A bracket
+        # straddling 62 should take the bulk of probability; one far away
+        # should be ~0%. Post-2026-05-02 BRACKET MATH FIX: integer B-bracket
+        # [62, 63] integration widens to [61.5, 63.5], so at μ=62 σ=1.0
+        # the bulk grows from ~0.38 to ~0.62.
         p_hit = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
-                                                 floor=61.5, cap=62.5,
+                                                 floor=62.0, cap=63.0,
                                                  running_min=62.0,
                                                  post_sunrise_lock=True)
-        # sigma=1.0, bracket ±0.5 from rm: P ≈ Φ(0.5)-Φ(-0.5) ≈ 0.38
-        self.assertGreater(p_hit, 0.30)
-        self.assertLess(p_hit, 0.50)
+        self.assertGreater(p_hit, 0.50)
+        self.assertLess(p_hit, 0.80)
         p_miss = pb.calc_bracket_probability_min(mu=68.0, sigma=3.0,
                                                   floor=68.0, cap=69.0,
                                                   running_min=62.0,
@@ -290,16 +292,18 @@ class TestObsCliBuffer(unittest.TestCase):
             "floor=70 vs running_min=68 (and +1 buffer=69) should be impossible")
 
     def test_post_sunrise_sigma_widened_to_1F(self):
-        # With running_min=70, bracket [68,69], post_sunrise_lock=True.
-        # Sigma=1.0 (vs old 0.5) gives more probability mass within ±1°F.
+        # With running_min=70, B-bracket [68,69], post_sunrise_lock=True.
+        # Sigma collapses to 1.0°F. Post-2026-05-02 BRACKET MATH FIX:
+        # integration range widens to [67.5, 69.5] for CLI integer rounding.
+        # P(X in [67.5, 69.5] | X ~ N(70, 1.0)) ≈ Φ(-0.5) - Φ(-2.5) ≈ 0.302.
+        # Pre-fix was 0.136.
         p = pb.calc_bracket_probability_min(
             mu=70.0, sigma=2.5,
             floor=68.0, cap=69.0,
             running_min=70.0, post_sunrise_lock=True,
         )
-        # P(X in [68,69] | X ~ N(70, 1.0)) ≈ Φ(-1) - Φ(-2) ≈ 0.1587 - 0.0228 ≈ 0.136
-        self.assertGreater(p, 0.10)
-        self.assertLess(p, 0.25)
+        self.assertGreater(p, 0.25)
+        self.assertLess(p, 0.40)
 
 
 class TestPerEventCascade(unittest.TestCase):
