@@ -3,7 +3,42 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-02 mid-day) — extend $5 BUY_YES cap to ALL BUY_YES (was tail-only)
+## Latest change (2026-05-02 afternoon) — close BUY_YES B-bracket "low locked above" gap
+
+Added a new branch in `_check_obs_confirmed_loser` for **BUY_YES + B-bracket + rm > cap + 1.0 + past local low-lock**. Previously the function only checked `rm < floor` for that combo; the symmetric `rm > cap` case slipped through.
+
+**Why:** PHIL-26MAY02-B49.5 BUY_YES this morning (μ=49, bracket [49,50]) entered at 6:45 AM EDT with rm=51.8 — low had already locked 1.8°F above cap=50, so BUY_YES was structurally guaranteed to lose. The bot didn't block because the obs-loser check for BUY_YES B-bracket only handled rm-below-floor. The $5 cap (shipped earlier today) limited the damage but the underlying bug let the trade through.
+
+**The fix:**
+```python
+elif action == "BUY_YES":
+    if floor is not None and cap is not None:
+        if rm_f < float(floor):
+            return True
+        # NEW: low locked above bracket → YES guaranteed loss
+        tz = opp_or_pos.get("tz", "America/New_York")
+        try:
+            _now_local = datetime.now(ZoneInfo(tz))
+            _past_low_lock = _now_local.hour >= 6
+        except Exception:
+            _past_low_lock = False
+        if rm_f > float(cap) + 1.0 and _past_low_lock:
+            return True
+```
+
+**Threshold rationale:**
+- **`rm > cap + 1.0`**: CLI integer rounding requires continuous rm ≥ cap+0.5 to round to cap+1 (definitively outside bracket); +1.0 adds half a degree for ASOS-vs-METAR obs noise. PHIL: rm=51.8 vs cap+1=51 → blocks.
+- **`hour >= 6`**: lows typically lock 30-60 min before sunrise (predawn radiative cooling). 6 AM is past low-lock across all US cities/seasons. Tighter than the existing `_is_post_sunrise` (hour ≥ 8 blanket) which would have missed PHIL at 6:45 AM EDT. False-positive cost is bounded by the $5 BUY_YES cap.
+
+**Tests:** 15 new in `tests/test_buy_yes_b_bracket_obs_loser.py` — covers PHIL exact pattern at 6:45 AM and 7:17 AM EDT, hour-cutoff sweep (3/5/6 AM), buffer boundary (cap+0.4 / cap+1.0 / cap+1.1), regression guards (rm-below-floor still fires, BUY_NO unaffected, T-high/T-low branches unchanged, rm=None handled).
+
+Suite: **404 passing**, 3 unrelated pre-existing failures.
+
+Daemon restart required.
+
+---
+
+## 2026-05-02 mid-day — extend $5 BUY_YES cap to ALL BUY_YES (was tail-only)
 
 `MAX_BET_BUY_YES_TAIL_USD` renamed to `MAX_BET_BUY_YES_USD` and the cap now applies to **all BUY_YES entries**, including B-brackets. Previously only T-high / T-low were capped at $5; B-bracket BUY_YES used `MAX_BET_USD = $30`.
 

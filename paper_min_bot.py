@@ -2208,8 +2208,11 @@ def _check_obs_confirmed_loser(opp_or_pos: dict) -> bool:
         threshold; daily low ≤ rm but already in YES territory now
       BUY_NO + T-low (cap=X+0.5, YES if cli ≤ X): rm ≤ cap−0.5 (i.e. cli ≤ X)
         → low has hit YES threshold; rm only goes down → YES wins, NO loses
-      BUY_YES + B-bracket: rm < floor → low went below bracket; daily low
-        ≤ rm < floor → YES (low in bracket) lost
+      BUY_YES + B-bracket:
+        - rm < floor → low went below bracket; YES (low in bracket) lost
+        - rm > cap + 1.0 AND past local low-lock → low locked above
+          bracket; YES (low in bracket) lost (added 2026-05-02 after
+          PHIL-26MAY02-B49.5 slipped through)
       BUY_YES + T-high: rm < floor → low went below threshold; YES lost
       BUY_YES + T-low: rm > cap AND post-sunrise → low never reached
         threshold and won't drop further; YES (low ≤ X) lost"""
@@ -2234,6 +2237,31 @@ def _check_obs_confirmed_loser(opp_or_pos: dict) -> bool:
     elif action == "BUY_YES":
         if floor is not None and cap is not None:
             if rm_f < float(floor):
+                return True
+            # 2026-05-02: low locked above bracket → YES can't win. Mirror
+            # of the BUY_YES T-low rm>cap+post-sunrise check, but for B-
+            # brackets. Triggered by PHIL-26MAY02-B49.5 BUY_YES at 6:45 AM
+            # EDT where rm=51.8 > cap=50 + buffer; low locked above bracket
+            # but bot didn't block (only rm<floor was checked, no symmetric
+            # rm>cap branch).
+            #
+            # Threshold rm > cap + 1.0: CLI integer rounding requires
+            # continuous rm >= cap+0.5 to round to cap+1 (definitively
+            # outside bracket). +1.0 adds half a degree for ASOS-vs-METAR
+            # obs noise.
+            #
+            # Post-low-lock check uses hour >= 6 local (tighter than
+            # _is_post_sunrise's hour >= 8 blanket). Lows typically lock
+            # 30-60 min before sunrise (predawn radiative cooling); 6 AM
+            # is past low-lock across all US cities/seasons. False-positive
+            # cost: at most $5 per BUY_YES (per MAX_BET_BUY_YES_USD cap).
+            tz = opp_or_pos.get("tz", "America/New_York")
+            try:
+                _now_local = datetime.now(ZoneInfo(tz))
+                _past_low_lock = _now_local.hour >= 6
+            except Exception:
+                _past_low_lock = False
+            if rm_f > float(cap) + 1.0 and _past_low_lock:
                 return True
         elif floor is not None and cap is None:
             if rm_f < float(floor):
