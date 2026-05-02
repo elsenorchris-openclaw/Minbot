@@ -165,13 +165,20 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
 MAX_BET_USD = 30.00                 # $30 cap per entry. $1 (live launch) → $3 (2026-04-26)
                                     # → ... → $30 (2026-04-29 evening). Default cap.
 
-# 2026-05-01: BUY_YES tail entries (T-high or T-low) get a tighter $5 cap.
+# 2026-05-01: BUY_YES entries get a tighter $5 cap (was tail-only originally).
 # Asymmetric blast-radius limit. Historical wins on these were ALL ≤ $4.90
 # cost (max KSAT-T73 win at $4.90), so the cap doesn't change wins. DC-T46
-# today (cost $24, currently -$24 stuck unrealized) shows the loss potential
-# when uncapped — same forecast wrong by 2.5°F = full position loss. Capping
-# at $5 limits single-trade max loss to ~$5 with no historical win sacrificed.
-MAX_BET_BUY_YES_TAIL_USD = 5.00
+# (cost $24, -$24 loss) showed the loss potential when uncapped — same
+# forecast wrong by 2.5°F = full position loss.
+#
+# 2026-05-02: extended from BUY_YES TAIL only to ALL BUY_YES (B-bracket
+# included). PHIL-26MAY02-B49.5 BUY_YES this morning was a B-bracket inside-
+# bracket trade made newly-viable by the bracket-math fix; market liquidity
+# happened to keep the actual fill tiny ($0.38) but Kelly wanted ~$30, so
+# the cap matters going forward. BUY_YES asymmetry holds across all
+# bracket types: small wins (price ≤ 50c → max payout 50c per dollar),
+# full-cost losses on forecast misses.
+MAX_BET_BUY_YES_USD = 5.00
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
                                     # (2026-04-28) → $20 (2026-04-28 night, paired with bankroll
                                     # add to ~$279) → $30 (2026-04-29 evening, per Chris). Kelly
@@ -3391,15 +3398,14 @@ def execute_opportunity(opp: dict) -> bool:
             f"  skip {ticker}: no verified bankroll yet "
             f"(get_kalshi_balance returned None); refusing trade")
         return False
-    # 2026-05-01: per-action MAX_BET cap. BUY_YES tail entries (T-high or
-    # T-low) capped at $5; everything else uses MAX_BET_USD ($30). Limits
-    # blast radius on the asymmetric loss profile of cheap BUY_YES tails
-    # (small wins, occasional full-cost losses like DC-T46).
+    # 2026-05-01: per-action MAX_BET cap. ALL BUY_YES entries capped at $5
+    # (was tail-only; extended 2026-05-02 to B-brackets too after PHIL B49.5
+    # BUY_YES became viable post-bracket-math-fix). BUY_NO uses MAX_BET_USD
+    # ($30). Limits blast radius on the asymmetric loss profile of BUY_YES
+    # (small wins, full-cost losses on forecast misses like DC-T46).
     _bet_action = opp.get("action")
-    _bet_fl = opp.get("floor"); _bet_cp = opp.get("cap")
-    _bet_is_tail = (_bet_fl is not None) ^ (_bet_cp is not None)
-    if _bet_action == "BUY_YES" and _bet_is_tail:
-        _effective_max_bet = MAX_BET_BUY_YES_TAIL_USD
+    if _bet_action == "BUY_YES":
+        _effective_max_bet = MAX_BET_BUY_YES_USD
     else:
         _effective_max_bet = MAX_BET_USD
 

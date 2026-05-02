@@ -3,7 +3,33 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-02) — BRACKET MATH FIX (V1/V2 port from 2026-04-22)
+## Latest change (2026-05-02 mid-day) — extend $5 BUY_YES cap to ALL BUY_YES (was tail-only)
+
+`MAX_BET_BUY_YES_TAIL_USD` renamed to `MAX_BET_BUY_YES_USD` and the cap now applies to **all BUY_YES entries**, including B-brackets. Previously only T-high / T-low were capped at $5; B-bracket BUY_YES used `MAX_BET_USD = $30`.
+
+**Why:** the bracket-math fix shipped earlier today made inside-bracket BUY_YES trades viable for the first time. PHIL-26MAY02-B49.5 fired this morning at μ=49 (NBP-d0, σ=1.0), bracket [49,50] — corrected mp = 62%, edge = +42%. Kelly wanted ~$30 worth (≈150 contracts at 20¢); only got 2 contracts ($0.38 total) due to no liquidity, but the next time a similar setup hits a liquid market the cap is the only thing standing between a small bet and a $30 position on a forecast that's 2-3°F off the actual locked low.
+
+**The asymmetry:** BUY_YES wins are bounded by `(1 − price) × count` — for a 20¢ entry, max payout is 80¢/contract. BUY_YES losses are the full position cost. Capping bets at $5 limits per-trade max loss to ~$5 across all bracket types.
+
+**Code change:**
+```python
+# Before (tail-only):
+_bet_is_tail = (floor is not None) ^ (cap is not None)
+if _bet_action == "BUY_YES" and _bet_is_tail:
+    _effective_max_bet = MAX_BET_BUY_YES_TAIL_USD
+
+# After (all BUY_YES):
+if _bet_action == "BUY_YES":
+    _effective_max_bet = MAX_BET_BUY_YES_USD
+```
+
+Tests: `TestYesTailMaxBetCap` updated — `test_buy_yes_b_bracket_uses_full_max_bet` was an explicit assertion of the OLD behavior (B-bracket NOT capped); flipped to `test_buy_yes_b_bracket_capped_at_5_dollars` to enforce the NEW cap. `test_constant_is_5_dollars` now checks the renamed constant + asserts the old name is gone (`hasattr` check). Suite: 389 pass, 3 unrelated pre-existing failures.
+
+Daemon restart required.
+
+---
+
+## 2026-05-02 — BRACKET MATH FIX (V1/V2 port from 2026-04-22)
 
 Ported the 2026-04-22 bracket-math fix from V1 + V2 (already shipped there months ago). `calc_bracket_probability_min` now widens B-bracket integration limits by ±0.5°F to match Kalshi's integer-CLI settlement.
 

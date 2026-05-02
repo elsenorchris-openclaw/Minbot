@@ -4678,14 +4678,14 @@ class TestYesTailMarginGate(unittest.TestCase):
 
 
 class TestYesTailMaxBetCap(unittest.TestCase):
-    """BUY_YES tail entries (T-high or T-low) capped at MAX_BET_BUY_YES_TAIL=$5.
+    """ALL BUY_YES entries capped at MAX_BET_BUY_YES_USD=$5 (was tail-only;
+    extended 2026-05-02 to include B-brackets after PHIL-MAY02-B49.5 BUY_YES
+    became viable post-bracket-math-fix).
 
-    Asymmetric blast-radius limit: BUY_YES tail wins are typically small
-    ($0.50-$5 range) but losses can be the full position cost. Capping
-    bets at $5 keeps single-trade max loss bounded without affecting the
-    typical win path. Historical impact: $0 (all 19 historical wins were
-    already ≤ $5). Forward impact: DC-T46 (today, n=1) would have been
-    $5 instead of $24 — saved ~$19."""
+    Asymmetric blast-radius limit: BUY_YES wins are typically small (price
+    ≤ 50c → max payout 50c per dollar) but losses can be the full position
+    cost. Capping bets at $5 keeps single-trade max loss bounded without
+    affecting the typical win path."""
 
     def setUp(self):
         with pb._positions_lock:
@@ -4772,8 +4772,9 @@ class TestYesTailMaxBetCap(unittest.TestCase):
         self.assertLessEqual(cost, 5.00 + 0.01,
                              f"BUY_YES T-low cost ${cost:.2f} exceeds $5 cap")
 
-    def test_buy_yes_b_bracket_uses_full_max_bet(self):
-        """B-bracket BUY_YES NOT capped at $5 — it's not a tail."""
+    def test_buy_yes_b_bracket_capped_at_5_dollars(self):
+        """B-bracket BUY_YES ALSO capped at $5 (extended 2026-05-02 from
+        tail-only to all BUY_YES). Triggered by PHIL-MAY02-B49.5 trade."""
         opp = self._opp(
             floor=55.0, cap=57.0,  # B-bracket
             mu=56.0,  # at center
@@ -4783,9 +4784,8 @@ class TestYesTailMaxBetCap(unittest.TestCase):
         self.assertEqual(len(self._captured), 1)
         ticker, side, count, price_cents = self._captured[0]
         cost = count * price_cents / 100.0
-        # With $1000 bankroll, Kelly wants > $5 — should hit MAX_BET_USD=$30
-        self.assertGreater(cost, 5.00 + 0.01,
-                           f"BUY_YES B-bracket cost ${cost:.2f} should NOT be $5-capped")
+        self.assertLessEqual(cost, 5.00 + 0.01,
+                             f"BUY_YES B-bracket cost ${cost:.2f} exceeds $5 cap")
 
     def test_buy_no_t_low_uses_full_max_bet(self):
         """BUY_NO tails NOT capped at $5 — only BUY_YES."""
@@ -4804,7 +4804,10 @@ class TestYesTailMaxBetCap(unittest.TestCase):
                            f"BUY_NO T-low cost ${cost:.2f} should NOT be $5-capped")
 
     def test_constant_is_5_dollars(self):
-        self.assertEqual(pb.MAX_BET_BUY_YES_TAIL_USD, 5.00)
+        self.assertEqual(pb.MAX_BET_BUY_YES_USD, 5.00)
+        # Old name should NOT exist (renamed 2026-05-02).
+        self.assertFalse(hasattr(pb, "MAX_BET_BUY_YES_TAIL_USD"),
+                         "MAX_BET_BUY_YES_TAIL_USD was renamed to MAX_BET_BUY_YES_USD")
 
 
 if __name__ == "__main__":
