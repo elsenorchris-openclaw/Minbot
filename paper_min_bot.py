@@ -2841,6 +2841,274 @@ def _save_positions() -> None:
     _atomic_write_json(POSITIONS_FILE, snap)
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# RICH POSITION TELEMETRY (2026-05-02)
+# ═══════════════════════════════════════════════════════════════════════
+# Per-cycle live snapshot of every open position, written to pos["live"].
+# Gives backtests a full state trajectory: market quotes, observed running_min,
+# re-resolved forecast (mu/sigma/source/disagreement), recomputed model_prob
+# and edge — all at the resolution of the bot's scan cycle. Plus per-position
+# high-water marks (peak_mtm_pct, trough_mtm_pct, peak_running_min etc.) for
+# fast queries without scanning the full telemetry log.
+#
+# Pure additive — does not change any decision logic. The fields are written
+# to positions.json under the `live` sub-dict so they persist across restarts
+# and cleanly separate from entry-time fields. JSONL telemetry log
+# (data/position_telemetry_YYYY-MM-DD.jsonl) gives append-only history for
+# replays.
+#
+# Trigger: V2's TSATX/LAX/MIA losses where post-hoc analysis was hampered by
+# missing forecast/market state at exit time — entry-only fields don't tell
+# you whether the bot's forecast drifted, market re-priced, etc. between
+# entry and exit. With telemetry, every exit has a reconstructable trajectory.
+def _resolve_live_min_forecast(series: str, station: str, date_str: str,
+                               is_today: bool) -> Optional[dict]:
+    """Re-resolve the forecast for an open position using the same priority
+    + sigma-inflation logic as scan_and_trade. Returns None when no forecast
+    source has data; otherwise a dict with mu, sigma, mu_source, components.
+
+    All reads are in-memory cache lookups (NBP, HRRR, NBM-OM, sigma table) —
+    cheap enough to call per-position per-scan-cycle.
+
+    Mirror of the priority logic at scan_and_trade ~L2360. Keep in sync.
+    """
+    nbp = get_nbp_forecast(series, date_str)
+    nbm = get_nbm_om_min(series, date_str)
+    hrrr = get_hrrr_min(series, date_str)
+    mu = sigma = None
+    mu_source = ""
+    if (is_today
+            and PER_SERIES_D0_PRIMARY.get(series) == "nbp"
+            and nbp):
+        mu, sigma, mu_source = nbp["mu"], nbp["sigma"], "nbp_d0_override"
+    elif is_today and hrrr is not None:
+        mu, sigma, mu_source = hrrr, (nbp["sigma"] if nbp else 2.5), "hrrr"
+    elif (not is_today
+          and PER_SERIES_D1_PRIMARY.get(series) == "hrrr"
+          and hrrr is not None):
+        mu, sigma, mu_source = hrrr, (nbp["sigma"] if nbp else 2.5), "hrrr_d1_override"
+    elif nbp:
+        mu, sigma, mu_source = nbp["mu"], nbp["sigma"], "nbp"
+    elif nbm is not None:
+        mu, sigma, mu_source = nbm, 2.5, "nbm_om"
+    if mu is None:
+        return None
+    # Disagreement-based sigma inflation (mirrors scan_and_trade)
+    disagreement = 0.0
+    if hrrr is not None and nbp is not None:
+        disagreement = max(disagreement, abs(hrrr - nbp["mu"]))
+    if hrrr is not None and nbm is not None:
+        disagreement = max(disagreement, abs(hrrr - nbm))
+    if nbp is not None and nbm is not None:
+        disagreement = max(disagreement, abs(nbp["mu"] - nbm))
+    if disagreement > 2.0:
+        sigma = sigma * min(1.5, 1.0 + (disagreement - 2.0) * 0.15)
+    # NBP staleness inflation
+    if mu_source in ("nbp", "hrrr_d1_override", "nbp_d0_override"):
+        with _nbp_cache_lock:
+            _ts = _nbp_cache_ts
+        if _ts > 0:
+            age_h = (time.time() - _ts) / 3600.0
+            if age_h > 1.0:
+                sigma = sigma * min(1.30, 1.0 + 0.05 * (age_h - 1.0))
+    # Per-station sigma multiplier
+    sigma = sigma * PER_SERIES_SIGMA_MULT.get(series, 1.0)
+    return {
+        "mu": mu, "sigma": sigma, "mu_source": mu_source,
+        "disagreement": disagreement,
+        "nbp_mu": nbp["mu"] if nbp else None,
+        "nbp_sigma": nbp["sigma"] if nbp else None,
+        "hrrr": hrrr, "nbm_om": nbm,
+    }
+
+
+def _compute_position_telemetry(pos: dict, mkt: Optional[dict]) -> dict:
+    """Build a `live` snapshot dict for one open position. Pure read —
+    does not mutate `pos`. Caller merges return value into pos["live"]
+    and updates running peaks. Always returns a dict (possibly minimal)
+    so the position has a uniform schema even when forecast/obs unavailable.
+    """
+    series = pos.get("series")
+    station = pos.get("station")
+    date_str = pos.get("date_str")
+    floor = pos.get("floor")
+    cap = pos.get("cap")
+    action = pos.get("action")
+    now = time.time()
+    snap: dict = {
+        "ts": now,
+        "ts_iso": datetime.now(timezone.utc).isoformat(),
+    }
+    # Market state
+    if mkt is not None:
+        snap["yes_bid_c"] = mkt.get("yes_bid")
+        snap["yes_ask_c"] = mkt.get("yes_ask")
+        snap["no_bid_c"] = mkt.get("no_bid")
+        snap["no_ask_c"] = mkt.get("no_ask")
+        snap["spread_c"] = (
+            (mkt["yes_ask"] - mkt["yes_bid"]) if (
+                mkt.get("yes_bid") is not None and mkt.get("yes_ask") is not None)
+            else None)
+        if action == "BUY_YES":
+            cb = mkt.get("yes_bid")
+            snap["current_bid_side_c"] = cb
+        elif action == "BUY_NO":
+            cb = mkt.get("no_bid")
+            snap["current_bid_side_c"] = cb
+        else:
+            cb = None
+        if cb is not None:
+            snap["current_price"] = cb / 100.0
+            entry_price = float(pos.get("entry_price", 0) or 0)
+            if entry_price > 0:
+                # MTM PnL %: positive = winning, negative = losing
+                snap["current_mtm_pct"] = (snap["current_price"] - entry_price) / entry_price
+    # Obs state
+    if station and date_str:
+        try:
+            rm = get_running_min(station, date_str)
+        except Exception:
+            rm = None
+        if rm is not None:
+            snap["running_min"] = float(rm)
+    # Forecast re-resolution
+    if series and station and date_str:
+        try:
+            tz_name = config.STATIONS.get(station, {}).get("tz")
+            today_cd = _climate_date_nws(tz_name) if tz_name else None
+        except Exception:
+            today_cd = None
+        is_today = (today_cd is not None and date_str == today_cd)
+        try:
+            fc = _resolve_live_min_forecast(series, station, date_str, is_today)
+        except Exception:
+            fc = None
+        if fc is not None:
+            snap["mu"] = fc["mu"]
+            snap["sigma"] = fc["sigma"]
+            snap["mu_source"] = fc["mu_source"]
+            snap["disagreement"] = fc["disagreement"]
+            snap["nbp_mu"] = fc["nbp_mu"]
+            snap["nbp_sigma"] = fc["nbp_sigma"]
+            snap["hrrr"] = fc["hrrr"]
+            snap["nbm_om"] = fc["nbm_om"]
+            # Recompute model_prob using current obs + forecast
+            try:
+                live_mp = calc_bracket_probability_min(
+                    mu=fc["mu"], sigma=fc["sigma"],
+                    floor=floor, cap=cap,
+                    running_min=snap.get("running_min"),
+                    post_sunrise_lock=False,  # mirrors scan_and_trade default
+                )
+                snap["model_prob"] = float(live_mp) if live_mp is not None else None
+            except Exception:
+                snap["model_prob"] = None
+            # Recompute edge using live model_prob and live market quote
+            mp = snap.get("model_prob")
+            if mp is not None and mkt is not None:
+                if action == "BUY_NO":
+                    yb = mkt.get("yes_bid")
+                    if yb is not None:
+                        snap["edge"] = yb / 100.0 - mp
+                elif action == "BUY_YES":
+                    ya = mkt.get("yes_ask")
+                    if ya is not None:
+                        snap["edge"] = mp - ya / 100.0
+    # Local hour for daypart-bucketed analysis
+    if station:
+        try:
+            tz_name = config.STATIONS.get(station, {}).get("tz")
+            if tz_name:
+                snap["local_hour"] = datetime.now(ZoneInfo(tz_name)).hour
+        except Exception:
+            pass
+    return snap
+
+
+def _telemetry_log_path() -> Path:
+    today_utc = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return DATA_DIR / f"position_telemetry_{today_utc}.jsonl"
+
+
+def _update_open_positions_telemetry(market_quotes: dict) -> None:
+    """Walk all open positions and write a `live` snapshot per position.
+    Pure additive — no decision logic changes. Updates pos["live"] in place
+    AND appends one JSONL row per open position to today's telemetry log
+    for backtest replay.
+
+    Should be called once per scan cycle, after market_quotes is built.
+    """
+    with _positions_lock:
+        ticker_list = [t for t, p in _open_positions.items() if not p.get("settled")]
+    if not ticker_list:
+        return
+    log_path = _telemetry_log_path()
+    log_rows: list[dict] = []
+    for ticker in ticker_list:
+        with _positions_lock:
+            pos = _open_positions.get(ticker)
+            if pos is None or pos.get("settled"):
+                continue
+            mkt = market_quotes.get(ticker)
+            try:
+                snap = _compute_position_telemetry(pos, mkt)
+            except Exception as e:
+                # Don't let telemetry break the scan cycle; log and skip.
+                log(f"  telemetry compute {ticker} failed: {type(e).__name__}: {e}", "warn")
+                continue
+            # Merge into pos["live"], updating high-water marks.
+            live = pos.get("live") or {}
+            cycles = int(live.get("cycles", 0)) + 1
+            live.update(snap)
+            live["cycles"] = cycles
+            # MTM peak/trough
+            mtm = snap.get("current_mtm_pct")
+            if mtm is not None:
+                if "peak_mtm_pct" not in live or mtm > live["peak_mtm_pct"]:
+                    live["peak_mtm_pct"] = mtm
+                if "trough_mtm_pct" not in live or mtm < live["trough_mtm_pct"]:
+                    live["trough_mtm_pct"] = mtm
+            # running_min lowest-wins (for min-temp brackets)
+            rm = snap.get("running_min")
+            if rm is not None:
+                if "peak_running_min" not in live or rm < live["peak_running_min"]:
+                    live["peak_running_min"] = rm
+            # market peak: best bid we've seen on the side we hold
+            cb = snap.get("current_bid_side_c")
+            if cb is not None:
+                if "peak_bid_side_c" not in live or cb > live["peak_bid_side_c"]:
+                    live["peak_bid_side_c"] = cb
+                if "trough_bid_side_c" not in live or cb < live["trough_bid_side_c"]:
+                    live["trough_bid_side_c"] = cb
+            pos["live"] = live
+            # Build telemetry log row (full per-cycle snapshot, NOT
+            # high-water-mark — those live in pos.live).
+            row = dict(snap)
+            row["market_ticker"] = ticker
+            row["station"] = pos.get("station")
+            row["series"] = pos.get("series")
+            row["date_str"] = pos.get("date_str")
+            row["action"] = pos.get("action")
+            row["floor"] = pos.get("floor")
+            row["cap"] = pos.get("cap")
+            row["count"] = pos.get("count")
+            row["entry_price"] = pos.get("entry_price")
+            row["entry_model_prob"] = pos.get("model_prob")
+            row["entry_mu"] = pos.get("mu")
+            row["entry_sigma"] = pos.get("sigma")
+            row["entry_mu_source"] = pos.get("mu_source")
+            row["cycles_since_entry"] = cycles
+            log_rows.append(row)
+    if log_rows:
+        try:
+            with open(log_path, "a") as f:
+                for r in log_rows:
+                    f.write(json.dumps(r, default=str) + "\n")
+        except Exception as e:
+            log(f"  telemetry log write failed: {type(e).__name__}: {e}", "warn")
+    _save_positions()
+
+
 def _compute_primary_outlier_diff(opp: dict) -> Optional[float]:
     """Shadow-log diagnostic: |primary_mu - mean(other available source mus)|.
 
@@ -4054,6 +4322,14 @@ def scan_cycle() -> dict:
     # override). Runs BEFORE find_opportunities so freed-up budget can fund
     # new entries the same cycle.
     mkt_by_ticker = {m["market_ticker"]: m for m in markets if m.get("market_ticker")}
+    # 2026-05-02 RICH POSITION TELEMETRY: capture per-cycle live state for
+    # every open position before exit logic runs (so the exit decision and
+    # the telemetry both see the same market+obs+forecast snapshot).
+    # Pure additive — does not change any decision.
+    try:
+        _update_open_positions_telemetry(mkt_by_ticker)
+    except Exception as e:
+        log(f"  telemetry update failed: {type(e).__name__}: {e}", "warn")
     try:
         stats["exited"] = check_open_positions_for_exit(mkt_by_ticker)
     except Exception as e:
