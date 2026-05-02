@@ -2929,6 +2929,12 @@ def _compute_position_telemetry(pos: dict, mkt: Optional[dict]) -> dict:
     so the position has a uniform schema even when forecast/obs unavailable.
     """
     series = pos.get("series")
+    if not series:
+        # Older position records (pre-2026-04-30 entry-awareness fields) may
+        # lack `series`. Derive from market_ticker: "KXLOWT<series>-<date>-<bracket>".
+        mt = pos.get("market_ticker", "") or ""
+        parts = mt.split("-")
+        series = parts[0] if parts and parts[0].startswith("KXLOWT") else None
     station = pos.get("station")
     date_str = pos.get("date_str")
     floor = pos.get("floor")
