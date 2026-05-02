@@ -3,7 +3,43 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-02 afternoon) — close BUY_YES B-bracket "low locked above" gap
+## Latest change (2026-05-02 late afternoon) — disable mp-range bypass on coastal stations
+
+Replays of every historical bypass-fired entry (n=23, 19 settled) showed the `_nbp_consistent_with_recent_cli` mp-range bypass is **net negative overall** (−$51.42, 10W:9L) and the loss concentrates entirely on coastal/marine-layer stations:
+
+| Cohort | W:L | Net PnL | Win rate |
+|---|---|---|---|
+| **Coastal** (KLAX, KSFO, KSEA, KMIA, KHOU, KMSY, KNYC, KPHL, KBOS) | 3 : 6 | **−$91.87** | 33% |
+| Inland (everything else) | 7 : 3 | **+$40.45** | 70% |
+
+Per-station scoreboard:
+
+```
+0W / 2L  -$53.16  KLAX   ← worst offender; 2 consecutive B58.5 hard-stops
+0W / 1L  -$29.44  KHOU
+0W / 1L  -$24.50  KSFO
+0W / 1L  -$ 7.68  KATL
+0W / 1L  -$ 1.38  KMIA
+0W / 1L  -$ 1.06  KNYC
+1W / 2L  +$ 0.18  KDEN  (basically flat)
+1W / 0L  +$ 0.39  KSEA
+2W / 0L  +$15.64  KPHX
+2W / 0L  +$16.76  KDFW
+2W / 0L  +$17.28  KPHL
+... (all-winner inland tail)
+```
+
+**Mechanism**: the bypass condition `NBP μ within ±2°F of last-7d CLI range` is meaningless on stations whose CLI range spans 8-12°F. The buffer expands the consistency window to 12-16°F — virtually any forecast lands inside it, turning the gate into a no-op rubber stamp. Inland stations with tight 4-6°F ranges retain a meaningful test.
+
+**Fix**: new `COASTAL_NO_MPBYPASS_STATIONS` constant (the 9 stations above). `_nbp_consistent_with_recent_cli` returns `False` early when station ∈ that set; inland stations keep the bypass as-is. The original 2026-04-29 backtest justification (3/3 historical wins) was an n=3 sample that didn't extrapolate.
+
+Counterfactual on the 19-trade sample: removing bypass on coastal would skip the 9 coastal trades (avoid −$91.87 in losses, give up +$17.67 in wins) → **+$74 net improvement** without affecting inland's +$40.
+
+Tests: 4 new (`test_coastal_constant_membership`, `test_coastal_station_bypass_disabled_KLAX`, `test_coastal_station_bypass_disabled_full_set`, `test_inland_station_bypass_still_active`); 320/323 pass on python3.12 (3 remaining are pre-existing unrelated bankroll/sigma_wider failures).
+
+See `memory/project_min_bot_mp_range_bypass_coastal_skip_20260502.md`.
+
+## Earlier 2026-05-02 afternoon — close BUY_YES B-bracket "low locked above" gap
 
 Added a new branch in `_check_obs_confirmed_loser` for **BUY_YES + B-bracket + rm > cap + 1.0 + past local low-lock**. Previously the function only checked `rm < floor` for that combo; the symmetric `rm > cap` case slipped through.
 

@@ -2262,6 +2262,42 @@ class TestNbpConsistencyBypass(unittest.TestCase):
         opp = {"mu": None, "station": "KSAT", "date_str": "2026-04-29"}
         self.assertFalse(pb._nbp_consistent_with_recent_cli(opp))
 
+    def test_coastal_station_bypass_disabled_KLAX(self):
+        """2026-05-02: bypass disabled on coastal stations.
+        KLAX μ=57 within [53, 60] would normally bypass; now must return False."""
+        pb.get_recent_cli_range = lambda *a, **kw: (53.0, 60.0)
+        opp = {"mu": 57.0, "station": "KLAX", "date_str": "2026-05-02"}
+        self.assertFalse(pb._nbp_consistent_with_recent_cli(opp))
+
+    def test_coastal_station_bypass_disabled_full_set(self):
+        """All 9 coastal stations should return False even when otherwise consistent."""
+        pb.get_recent_cli_range = lambda *a, **kw: (50.0, 60.0)
+        for station in ("KLAX", "KSFO", "KSEA", "KMIA", "KHOU",
+                        "KMSY", "KNYC", "KPHL", "KBOS"):
+            opp = {"mu": 55.0, "station": station, "date_str": "2026-05-02"}
+            self.assertFalse(
+                pb._nbp_consistent_with_recent_cli(opp),
+                f"{station} (coastal) bypass should be disabled",
+            )
+
+    def test_inland_station_bypass_still_active(self):
+        """Inland stations not in COASTAL_NO_MPBYPASS_STATIONS must still bypass
+        when the consistency check passes — preserves the +$40 inland net."""
+        pb.get_recent_cli_range = lambda *a, **kw: (50.0, 60.0)
+        for station in ("KDFW", "KAUS", "KSAT", "KOKC", "KMSP", "KMDW",
+                        "KPHX", "KLAS", "KDEN", "KATL"):
+            opp = {"mu": 55.0, "station": station, "date_str": "2026-05-02"}
+            self.assertTrue(
+                pb._nbp_consistent_with_recent_cli(opp),
+                f"{station} (inland) bypass should still fire",
+            )
+
+    def test_coastal_constant_membership(self):
+        """Sanity-check the constant lists the 9 stations from the audit."""
+        expected = {"KLAX", "KSFO", "KSEA", "KMIA", "KHOU",
+                    "KMSY", "KNYC", "KPHL", "KBOS"}
+        self.assertEqual(pb.COASTAL_NO_MPBYPASS_STATIONS, expected)
+
 
 class TestMpRangeBypassEnd2End(unittest.TestCase):
     """End-to-end: extreme-mp opp (mp < MIN_MODEL_PROB or > MAX_MODEL_PROB)
@@ -2377,9 +2413,14 @@ class TestEvaluateGates(unittest.TestCase):
 
     def _opp(self, **overrides):
         # A clean BUY_NO B-bracket that passes everything.
+        # 2026-05-02: switched default station KBOS → KDFW. KBOS is in
+        # COASTAL_NO_MPBYPASS_STATIONS so the mp-range bypass is now
+        # disabled there. These tests exercise general gate semantics,
+        # not coastal-bypass behavior — KDFW (inland) keeps the bypass
+        # active so the original test logic maps.
         base = {
-            "market_ticker": "KXLOWTBOS-26APR28-B45.5",
-            "event_ticker": "KXLOWTBOS-26APR28",
+            "market_ticker": "KXLOWTDFW-26APR28-B45.5",
+            "event_ticker": "KXLOWTDFW-26APR28",
             "action": "BUY_NO", "model_prob": 0.20, "edge": 0.30,
             "entry_price": 0.50, "yes_bid": 18, "yes_ask": 22,
             "no_bid": 48, "no_ask": 52, "mu": 41.0, "sigma": 2.5,
@@ -2388,8 +2429,8 @@ class TestEvaluateGates(unittest.TestCase):
             "running_min": None, "post_sunrise_lock": False,
             "is_today": True, "disagreement": 0.5,
             "floor": 45.0, "cap": 46.0,
-            "station": "KBOS", "date_str": "2026-04-28",
-            "series": "KXLOWTBOS",
+            "station": "KDFW", "date_str": "2026-04-28",
+            "series": "KXLOWTDFW",
         }
         base.update(overrides)
         return base
@@ -3550,9 +3591,14 @@ class TestSigmaAwareSizing(unittest.TestCase):
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, sigma, **overrides):
+        # 2026-05-02: KNYC → KMSP. KNYC is coastal; mp-range bypass disabled
+        # there. These tests target σ-Kelly shrink, not bypass behavior.
+        # KMSP picked over KDFW because KMSP's recent CLI range covers
+        # μ=41 (Minneapolis April-May lows hit the 35-50°F band) so the
+        # bypass fires and mp=0.10 doesn't get caught by MP_RANGE first.
         base = {
-            "market_ticker": "KXLOWTNYC-26MAY01-B45.5",
-            "event_ticker": "KXLOWTNYC-26MAY01",
+            "market_ticker": "KXLOWTMSP-26MAY01-B45.5",
+            "event_ticker": "KXLOWTMSP-26MAY01",
             "action": "BUY_NO",
             "model_prob": 0.10,
             "edge": 0.30,
@@ -3563,8 +3609,8 @@ class TestSigmaAwareSizing(unittest.TestCase):
             "running_min": None, "post_sunrise_lock": False,
             "disagreement": 1.0,
             "floor": 45.0, "cap": 46.0,
-            "station": "KNYC", "date_str": "2026-05-01", "label": "NYC",
-            "series": "KXLOWTNYC",
+            "station": "KMSP", "date_str": "2026-05-01", "label": "Minneapolis",
+            "series": "KXLOWTMSP",
         }
         base.update(overrides)
         return base
@@ -3961,9 +4007,13 @@ class TestAbsDistanceSigmaRelative(unittest.TestCase):
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, mu, sigma, floor=45.0, cap=46.0, **overrides):
+        # 2026-05-02: KNYC → KMSP. KNYC is coastal; mp-range bypass disabled
+        # there. KMSP picked because its recent CLI range covers μ=41 (test
+        # default), keeping the bypass active so MP_RANGE doesn't fire
+        # before the ABS_DIST gate we're actually testing.
         base = {
-            "market_ticker": "KXLOWTNYC-26APR30-B45.5",
-            "event_ticker": "KXLOWTNYC-26APR30",
+            "market_ticker": "KXLOWTMSP-26APR30-B45.5",
+            "event_ticker": "KXLOWTMSP-26APR30",
             "action": "BUY_NO", "model_prob": 0.10, "edge": 0.30,
             "entry_price": 0.55,
             "yes_bid": 47, "yes_ask": 50,
@@ -3972,8 +4022,8 @@ class TestAbsDistanceSigmaRelative(unittest.TestCase):
             "running_min": None, "post_sunrise_lock": False,
             "disagreement": 1.0,
             "floor": floor, "cap": cap,
-            "station": "KNYC", "date_str": "2026-04-30", "label": "NYC",
-            "series": "KXLOWTNYC",
+            "station": "KMSP", "date_str": "2026-04-30", "label": "Minneapolis",
+            "series": "KXLOWTMSP",
         }
         base.update(overrides)
         return base

@@ -1063,6 +1063,38 @@ RECENT_CLI_DAYS = 7
 RECENT_CLI_MIN_SAMPLES = 3
 NBP_CONSISTENCY_BUFFER_F = 2.0
 
+# 2026-05-02: stations where the mp-range bypass is DISABLED. Backtest of
+# every historical bypass-fired entry (n=23, 19 settled) showed the bypass
+# is net loser overall (-$51.42, 10W:9L) and the loss concentrates entirely
+# on coastal / marine-layer stations:
+#
+#   COASTAL: 3W : 6L, net -$91.87 (incl. 4 of the bot's biggest hard_stops:
+#            KLAX-26MAY01 -$29, KHOU-26APR30 -$29, KSFO-26MAY01 -$24,
+#            KLAX-26MAY02 -$24)
+#   INLAND:  7W : 3L, net +$40.45
+#
+# Mechanism: the bypass condition "NBP μ within ±2°F of last-7d CLI range"
+# is meaningless on high-variance stations whose CLI range spans 8-12°F.
+# The buffer expands the "consistency window" to 12-16°F — virtually any
+# forecast lands inside it, turning the gate into a no-op rubber stamp.
+# Inland stations with tight 4-6°F ranges have a meaningful test.
+#
+# Removing the bypass for these 9 stations preserves +$40 inland net while
+# eliminating the -$92 coastal drain. The list maps to the same 9 stations
+# called out in min_bot σ-mult / NBP-d0-override discussions of marine-layer
+# microclimates. See project_min_bot_mp_range_bypass_coastal_skip_20260502.md.
+COASTAL_NO_MPBYPASS_STATIONS = frozenset({
+    "KLAX",   # downtown LA marine layer
+    "KSFO",   # San Francisco Bay
+    "KSEA",   # Seattle Sound
+    "KMIA",   # Miami coastal
+    "KHOU",   # Houston Gulf
+    "KMSY",   # New Orleans Gulf
+    "KNYC",   # NYC coastal
+    "KPHL",   # Philadelphia coastal-ish
+    "KBOS",   # Boston coastal
+})
+
 
 def get_recent_cli_range(station: str, days: int = RECENT_CLI_DAYS,
                           before_date: Optional[str] = None) -> Optional[tuple[float, float]]:
@@ -1118,10 +1150,19 @@ def _nbp_consistent_with_recent_cli(opp: dict,
 
     Excludes the position's own climate_date from the lookback so back-test
     scenarios don't leak. Returns False on insufficient history (< 3 days),
-    keeping MAX_EDGE active in that case."""
+    keeping MAX_EDGE active in that case.
+
+    2026-05-02: returns False (bypass disabled) for stations in
+    COASTAL_NO_MPBYPASS_STATIONS — see constant docstring for the 19-trade
+    backtest showing the bypass was net-negative on coastal/marine-layer
+    stations whose recent-CLI range spans 8-12°F (range × ±2°F buffer makes
+    the consistency test trivially true). Inland stations with tight 4-6°F
+    ranges still get the bypass."""
     mu = opp.get("mu")
     station = opp.get("station")
     if mu is None or not station:
+        return False
+    if station in COASTAL_NO_MPBYPASS_STATIONS:
         return False
     rng = get_recent_cli_range(station, before_date=opp.get("date_str"))
     if rng is None:
