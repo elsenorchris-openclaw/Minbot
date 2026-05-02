@@ -46,6 +46,17 @@ WS_BBO_FRESH_SEC = 10.0
 _RECONNECT_INITIAL_S = 1.0
 _RECONNECT_MAX_S = 30.0
 
+# 2026-04-25: L2 book resync — fix for stale-state inversions.
+# Per-ticker WS L2 books drift from reality when deltas are dropped. Symptom:
+# yes_bid_c > yes_ask_c (impossible in a healthy book). Today V2 rejected 1789
+# brackets on inverted quotes that REST showed normal — bot's local cache was
+# wrong, not the market. Fix: trigger fresh orderbook_snapshot via re-subscribe
+# (a) on inversion detection, (b) periodically per-ticker.
+_RESYNC_AGE_SEC = 300.0           # periodic: resync any ticker whose snapshot is older than this
+_RESYNC_PER_TICKER_RATE_SEC = 30.0 # don't resync the same ticker more than once per 30s
+_RESYNC_BATCH_MAX = 20            # per worker tick, cap throughput
+_RESYNC_INTERVAL_SEC = 10.0       # worker tick cadence
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Module state (single connection per process)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -60,6 +71,12 @@ _yes_bids: dict[str, dict[int, int]] = {}  # ticker -> {price_cents: total_size}
 _no_bids: dict[str, dict[int, int]] = {}
 _bbo_cache: dict[str, dict[str, Any]] = {}  # ticker -> {yes_bid, yes_ask, ts}
 _cache_lock = threading.Lock()
+
+# 2026-04-25: L2 book resync state. Tracks snapshot freshness + drift detection.
+_last_snapshot_ts: dict[str, float] = {}     # ticker -> ts of last orderbook_snapshot
+_pending_resync: set[str] = set()            # tickers awaiting next resync send
+_last_resync_ts: dict[str, float] = {}       # ticker -> ts of last resync request
+_resync_state_lock = threading.Lock()
 
 # 2026-04-11: fill channel (private). Subscribed once at startup, no per-ticker
 # subscription needed. Each fill event populates _fills_by_order so the bot's
@@ -89,6 +106,12 @@ _stats = {
     "fill_cache_hits": 0,
     "fill_cache_misses": 0,
     "fill_subs": 0,
+    # NEW 2026-04-25: L2 resync telemetry
+    "inversions_detected": 0,   # yes_bid_c > yes_ask_c at compute-time
+    "resyncs_scheduled_drift": 0,    # queued by drift detection
+    "resyncs_scheduled_age": 0,      # queued by periodic age check
+    "resyncs_sent": 0,               # actually sent to Kalshi
+    "resyncs_rate_limited": 0,       # dropped by per-ticker rate limit
 }
 _stats_lock = threading.Lock()
 
@@ -130,6 +153,11 @@ def _recompute_bbo(ticker: str) -> None:
             "ts": time.time(),
         }
     _bump("bbo_updates")
+    # 2026-04-25: drift detection. yes_bid > yes_ask means the L2 book has
+    # gone stale (typically a missed delta). Schedule a fresh snapshot.
+    if yes_bid_c > 0 and yes_ask_c > 0 and yes_bid_c > yes_ask_c:
+        _bump("inversions_detected")
+        _schedule_resync(ticker, source="drift")
 
 
 def _dollars_to_cents(s) -> int:
@@ -175,6 +203,10 @@ def _apply_snapshot(msg: dict) -> None:
                 nb[p] = size
     _yes_bids[ticker] = yb
     _no_bids[ticker] = nb
+    # 2026-04-25: track snapshot freshness for periodic resync. Set BEFORE
+    # _recompute_bbo so a freshly-snapshotted ticker isn't immediately re-flagged
+    # by the age-based check on its first compute.
+    _last_snapshot_ts[ticker] = time.time()
     _recompute_bbo(ticker)
     _bump("snapshots")
 
@@ -210,6 +242,32 @@ def _apply_delta(msg: dict) -> None:
         level[p] = new_size
     _recompute_bbo(ticker)
     _bump("deltas")
+
+
+def _schedule_resync(ticker: str, source: str = "drift") -> None:
+    """Mark `ticker` for a fresh orderbook_snapshot. Rate-limited per ticker.
+
+    `source`: 'drift' (inversion detected) or 'age' (periodic). Affects only
+    telemetry — the rate limit and queue are shared.
+
+    Idempotent: if the ticker is already pending or was resynced within
+    `_RESYNC_PER_TICKER_RATE_SEC`, this is a no-op (counts as rate_limited)."""
+    if not ticker:
+        return
+    now = time.time()
+    with _resync_state_lock:
+        last = _last_resync_ts.get(ticker, 0.0)
+        if now - last < _RESYNC_PER_TICKER_RATE_SEC:
+            _bump("resyncs_rate_limited")
+            return
+        _pending_resync.add(ticker)
+        # Note: don't set _last_resync_ts here. That happens when the resync
+        # is actually sent (in _resync_worker), so a queued-but-not-sent entry
+        # doesn't block a fresh attempt if the worker is delayed.
+    if source == "drift":
+        _bump("resyncs_scheduled_drift")
+    else:
+        _bump("resyncs_scheduled_age")
 
 
 def _record_fill(msg: dict) -> None:
@@ -376,6 +434,68 @@ async def _send_subscribe_fill() -> None:
         _log_fn(f"kalshi_ws: fill subscribe failed: {e}")
 
 
+async def _resync_worker():
+    """Background task: re-subscribe stale or drift-detected tickers to force a
+    fresh `orderbook_snapshot` from Kalshi. Runs concurrently with the message
+    loop in `_ws_main`. Cancelled when the WS connection drops; restarted on
+    reconnect.
+
+    Each tick:
+      1. Add age-based candidates (snapshot older than _RESYNC_AGE_SEC).
+      2. Drain `_pending_resync` (drift-triggered + age-triggered).
+      3. Send `subscribe` for up to _RESYNC_BATCH_MAX tickers; Kalshi replies
+         with a fresh snapshot which `_apply_snapshot` writes over the stale
+         book.
+      4. Stamp `_last_resync_ts` to enforce per-ticker rate limit.
+
+    Resyncs do NOT remove the ticker from `_subscribed_tickers` — we keep
+    receiving deltas from the existing subscription throughout the resync.
+    Once the new snapshot arrives, the book is overwritten atomically (full
+    book replacement in `_apply_snapshot`)."""
+    while True:
+        try:
+            await asyncio.sleep(_RESYNC_INTERVAL_SEC)
+            if _ws is None:
+                continue
+            now = time.time()
+            batch: list[str] = []
+            with _resync_state_lock:
+                # Age-based candidates: subscribed tickers with old/missing snapshot
+                for tk in list(_subscribed_tickers):
+                    age = now - _last_snapshot_ts.get(tk, 0.0)
+                    last_resync = _last_resync_ts.get(tk, 0.0)
+                    if age > _RESYNC_AGE_SEC and (now - last_resync) >= _RESYNC_PER_TICKER_RATE_SEC:
+                        if tk not in _pending_resync:
+                            _pending_resync.add(tk)
+                            _bump("resyncs_scheduled_age")
+                # Drain pending → batch (sorted for determinism in tests)
+                for tk in sorted(_pending_resync):
+                    if len(batch) >= _RESYNC_BATCH_MAX:
+                        break
+                    last_resync = _last_resync_ts.get(tk, 0.0)
+                    if (now - last_resync) < _RESYNC_PER_TICKER_RATE_SEC:
+                        # Got rate-limited between schedule and send; skip this tick
+                        continue
+                    batch.append(tk)
+                # Mark sent + clear queue entries
+                for tk in batch:
+                    _pending_resync.discard(tk)
+                    _last_resync_ts[tk] = now
+            if not batch:
+                continue
+            # Send re-subscribe to trigger fresh snapshots
+            await _send_subscribe(batch)
+            _bump("resyncs_sent", len(batch))
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            _bump("errors")
+            try:
+                _log_fn(f"kalshi_ws: resync worker error: {e}")
+            except Exception:
+                pass
+
+
 async def _ws_main():
     global _ws
     import websockets
@@ -423,27 +543,37 @@ async def _ws_main():
                     pending = list(_subscribed_tickers)
                     for i in range(0, len(pending), 200):
                         await _send_subscribe(pending[i:i + 200])
-                async for raw in ws:
+                # 2026-04-25: spawn L2 resync worker concurrent with message loop.
+                # Cancelled below when the connection drops; restarted on reconnect.
+                resync_task = asyncio.create_task(_resync_worker())
+                try:
+                    async for raw in ws:
+                        try:
+                            msg = json.loads(raw)
+                        except Exception:
+                            continue
+                        mtype = msg.get("type", "")
+                        body = msg.get("msg") or {}
+                        if mtype == "orderbook_snapshot":
+                            _apply_snapshot(body)
+                        elif mtype == "orderbook_delta":
+                            _apply_delta(body)
+                        elif mtype == "fill":
+                            # 2026-04-11: private fill channel — push fast-path for
+                            # bot's check_order_fill(). Cached by order_id.
+                            _record_fill(body)
+                        elif mtype == "subscribed":
+                            # Optional: log first time only to avoid spam
+                            pass
+                        elif mtype == "error":
+                            _log_fn(f"kalshi_ws: server error: {msg}")
+                            _bump("errors")
+                finally:
+                    resync_task.cancel()
                     try:
-                        msg = json.loads(raw)
-                    except Exception:
-                        continue
-                    mtype = msg.get("type", "")
-                    body = msg.get("msg") or {}
-                    if mtype == "orderbook_snapshot":
-                        _apply_snapshot(body)
-                    elif mtype == "orderbook_delta":
-                        _apply_delta(body)
-                    elif mtype == "fill":
-                        # 2026-04-11: private fill channel — push fast-path for
-                        # bot's check_order_fill(). Cached by order_id.
-                        _record_fill(body)
-                    elif mtype == "subscribed":
-                        # Optional: log first time only to avoid spam
+                        await resync_task
+                    except (asyncio.CancelledError, Exception):
                         pass
-                    elif mtype == "error":
-                        _log_fn(f"kalshi_ws: server error: {msg}")
-                        _bump("errors")
         except Exception as e:
             _bump("reconnects")
             _log_fn(f"kalshi_ws: connection ended: {e}; reconnect in {backoff:.1f}s")
@@ -502,7 +632,13 @@ def start(sign_fn: Callable[[str, str], dict[str, str]],
                     f"bbo_updates={s['bbo_updates']} reconnects={s['reconnects']} "
                     f"errors={s['errors']} | fills={fs['fills_received']} "
                     f"cached_orders={fs['cached_orders']} hits={fs['cache_hits']} "
-                    f"misses={fs['cache_misses']}"
+                    f"misses={fs['cache_misses']} | "
+                    f"inv={s.get('inversions_detected',0)} "
+                    f"resync_drift={s.get('resyncs_scheduled_drift',0)} "
+                    f"resync_age={s.get('resyncs_scheduled_age',0)} "
+                    f"resync_sent={s.get('resyncs_sent',0)} "
+                    f"resync_rl={s.get('resyncs_rate_limited',0)} "
+                    f"pending={s.get('resync_pending',0)}"
                 )
             except Exception:
                 pass
@@ -547,4 +683,6 @@ def get_stats() -> dict[str, Any]:
     out["connected"] = _ws is not None
     out["subscribed"] = len(_subscribed_tickers)
     out["cached"] = n_cached
+    with _resync_state_lock:
+        out["resync_pending"] = len(_pending_resync)
     return out

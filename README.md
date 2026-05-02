@@ -3,7 +3,38 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-01 night) — entry-awareness fields on settlements
+## Latest change (2026-05-01 late night) — `primary_outlier_diff_at_entry` shadow log
+
+Added one diagnostic field to every entry log record. **No behavior change.** The bot still trades exactly as before — this is forward-data collection for a possible `SKIP_PRIMARY_OUTLIER` filter at ~2.0°F.
+
+**The field:**
+
+| Field | Source | Purpose |
+|---|---|---|
+| `primary_outlier_diff_at_entry` | `_compute_primary_outlier_diff(opp)` | `\|mu_primary − mean(other available source mus)\|`, in °F. High = bot's chosen forecast disagrees with the cluster. |
+
+**Why this was added:** Two of today's three big losses (HOU 26APR30-B68.5 = $-29.44, MIA 26MAY01-B71.5 = $-23.82) shared a "primary source 2-3°F off the cluster" signature. The Apr 29 - May 1 backtest (n=30 BUY_NO entries) showed:
+
+| ticker | primary | others | diff |
+|---|---|---|---|
+| HOU-B68.5 | HRRR=69.4 | NBP=74.0, NBM=69.5 | **2.35°F** → loss |
+| MIA-B71.5 | NBP=72.0 | HRRR=69.6, NBM=69.6 | **2.40°F** → loss |
+| PHX-APR29-B62.5 | NBP=64.0 | HRRR=60.4, NBM=60.4 | **3.60°F** → +$10.20 win (false positive) |
+| SFO-MAY01-B54.5 | NBP=53.0 | HRRR=51.3, NBM=52.1 | 1.30°F (not caught) |
+
+A 2.0°F threshold catches HOU + MIA but forfeits PHX. Helps:hurts is **1:1 settled** with one structural false-positive class (sources disagree but both directions independently support BUY_NO). Insufficient to deploy as a gate — only 2 settled saves to fit against. Shadow-log first, re-evaluate at ~60 BUY_NO trades (~mid-May 2026).
+
+**Reference scripts** (kept in `/tmp/` on EC2 for the next backtest run):
+- `/tmp/conf_kelly_backtest.py` — earlier confidence-Kelly framework (rejected: −$11 lift)
+- `/tmp/primary_outlier_backtest.py` — this filter's threshold sweep
+
+Tests: `tests/test_primary_outlier_diff.py` (15) — 3 source-grep + 12 unit tests covering each `mu_source` label and edge cases (missing sources, unknown source, rounding). Full suite: **352 passed (337 baseline + 15 new), no regressions**.
+
+**To activate:** the daemon must be restarted — Python doesn't hot-reload `.py` edits. Until restart, entries are still being written without the field.
+
+---
+
+## Earlier 2026-05-01 — entry-awareness fields on settlements
 
 Added V2-parity entry-time context to every trade + settlement record so
 filter audits (catching-knife, late-day, per-station bias) can run against

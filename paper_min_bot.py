@@ -2816,6 +2816,40 @@ def _save_positions() -> None:
     _atomic_write_json(POSITIONS_FILE, snap)
 
 
+def _compute_primary_outlier_diff(opp: dict) -> Optional[float]:
+    """Shadow-log diagnostic: |primary_mu - mean(other available source mus)|.
+
+    Flags trades where the bot's chosen forecast source disagrees with the
+    rest of the cluster — a candidate boundary-rounding-loss signal. Logged
+    on every entry but NOT yet used as a gate. Validate forward on ~60+
+    BUY_NO trades before considering a SKIP_PRIMARY_OUTLIER filter at e.g.
+    2.0°F. Reference: HOU 26APR30-B68.5 had primary HRRR=69.4 vs NBP=74 /
+    NBM=69.5 → diff=2.35°F → settled $-29.44 (n=2 settled saves so far,
+    insufficient to deploy as gate)."""
+    src = opp.get("mu_source") or ""
+    if "nbp" in src:
+        primary_key = "mu_nbp"
+    elif "hrrr" in src:
+        primary_key = "mu_hrrr"
+    elif src == "nbm_om":
+        primary_key = "mu_nbm_om"
+    else:
+        return None
+    primary = opp.get(primary_key)
+    if primary is None:
+        return None
+    others = []
+    for key in ("mu_nbp", "mu_hrrr", "mu_nbm_om"):
+        if key == primary_key:
+            continue
+        v = opp.get(key)
+        if v is not None:
+            others.append(float(v))
+    if not others:
+        return None
+    return round(abs(float(primary) - sum(others) / len(others)), 3)
+
+
 def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     """Replay all entry gates in `execute_opportunity` order against `opp` and
     return `(blocked_by, reason)` for the FIRST gate that blocks. Returns
@@ -3312,6 +3346,7 @@ def execute_opportunity(opp: dict) -> bool:
         "mu_nbm_om_at_entry":  opp.get("mu_nbm_om"),
         "mu_hrrr_at_entry":    opp.get("mu_hrrr"),
         "disagreement_at_entry": opp.get("disagreement"),
+        "primary_outlier_diff_at_entry": _compute_primary_outlier_diff(opp),
         "post_sunrise_lock_at_entry": opp.get("post_sunrise_lock"),
         "is_today_at_entry":   opp.get("is_today"),
         # Edge breakdown (mirrors V2's edge / edge_vs_mid)
