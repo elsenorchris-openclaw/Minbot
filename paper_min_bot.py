@@ -3205,7 +3205,9 @@ def _compute_position_telemetry(pos: dict, mkt: Optional[dict]) -> dict:
     # Forecast re-resolution
     if series and station and date_str:
         try:
-            tz_name = config.STATIONS.get(station, {}).get("tz")
+            # 2026-05-03: was `config.STATIONS.get(station, ...)` — but min_bot
+            # has no `config` import. CITIES is keyed by series → metadata.
+            tz_name = CITIES.get(series, {}).get("tz")
             today_cd = _climate_date_nws(tz_name) if tz_name else None
         except Exception:
             today_cd = None
@@ -3248,7 +3250,8 @@ def _compute_position_telemetry(pos: dict, mkt: Optional[dict]) -> dict:
     # Local hour for daypart-bucketed analysis
     if station:
         try:
-            tz_name = config.STATIONS.get(station, {}).get("tz")
+            # 2026-05-03: was `config.STATIONS.get(station, ...)` — see note above.
+            tz_name = CITIES.get(series, {}).get("tz") if series else None
             if tz_name:
                 snap["local_hour"] = datetime.now(ZoneInfo(tz_name)).hour
         except Exception:
