@@ -2582,13 +2582,14 @@ class TestCoastalTightFloorGate(unittest.TestCase):
         self.assertIsNone(gate)
 
     def test_sfo_blocks_at_gap_2f(self):
-        # SFO BUY_NO B54.5 with mu=52 → gap = 2.0°F (NOT strictly < 2.0) → pass
-        # Strict < 2.0 means gap=2.0 passes; gap=1.9 blocks.
+        # SFO BUY_NO B54.5 with mu=52 → gap = 2.0°F < 2.1 threshold → BLOCK
+        # (threshold bumped 2.0 → 2.1 on forward audit to catch borderline
+        # gap=2.0 trades that historically lost via CLI integer rounding).
         gate, _ = pb._evaluate_gates(self._opp("KSFO", mu=52.0, floor=54.0))
-        self.assertIsNone(gate)
-        # gap=1.9 → block
-        gate, _ = pb._evaluate_gates(self._opp("KSFO", mu=52.1, floor=54.0))
         self.assertEqual(gate, "COASTAL_TIGHT_FLOOR")
+        # gap=2.5 → pass
+        gate, _ = pb._evaluate_gates(self._opp("KSFO", mu=51.5, floor=54.0))
+        self.assertIsNone(gate)
 
     def test_hou_blocks_at_negative_gap(self):
         # KHOU-APR30-style: floor=68 cap=69 mu=69.4 → mu ABOVE floor by 1.4°F.

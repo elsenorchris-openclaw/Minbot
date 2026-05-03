@@ -1112,7 +1112,13 @@ COASTAL_NO_MPBYPASS_STATIONS = frozenset({
 # Narrower than COASTAL_NO_MPBYPASS_STATIONS (which is 10 stations) — only
 # the 4 here showed consistent coastal cold-bias on d-0/d-1 BUY_NO.
 COASTAL_TIGHT_FLOOR_STATIONS = frozenset({"KLAX", "KSFO", "KMIA", "KHOU"})
-COASTAL_TIGHT_FLOOR_MIN_GAP_F = 2.0
+COASTAL_TIGHT_FLOOR_MIN_GAP_F = 2.1  # 2026-05-03: bumped 2.0 → 2.1 to include
+                                       # gap=2.0 borderline cases. Re-audit on
+                                       # forward sample showed 2.1 lifts +$10
+                                       # vs 2.0 by catching the 2 open MAY03
+                                       # trades (LAX/SFO both projected losers
+                                       # via CLI integer rounding) at the cost
+                                       # of 1 settled winner (SFO-MAY02 +$15.30).
 
 
 def get_recent_cli_range(station: str, days: int = RECENT_CLI_DAYS,
