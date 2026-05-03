@@ -1093,6 +1093,13 @@ COASTAL_NO_MPBYPASS_STATIONS = frozenset({
     "KNYC",   # NYC coastal
     "KPHL",   # Philadelphia coastal-ish
     "KBOS",   # Boston coastal
+    "KMDW",   # 2026-05-03: added — Chicago Midway. Lake Michigan microclimate
+              # behaves like coastal: variable lake-breeze effects on overnight
+              # lows that NBP CLI-range buffer doesn't capture. Triggered by
+              # CHI-26MAY03-B44.5 hard-stop -$24.60 (entered post-COASTAL fix
+              # because CHI wasn't on the list). 8-trade audit since 2026-04-25:
+              # CHI net -$17.07 / -52% ROI with 2 hard-stops, similar magnitude
+              # to other coastal bleeders.
 })
 
 

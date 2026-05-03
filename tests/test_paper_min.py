@@ -2282,9 +2282,10 @@ class TestNbpConsistencyBypass(unittest.TestCase):
 
     def test_inland_station_bypass_still_active(self):
         """Inland stations not in COASTAL_NO_MPBYPASS_STATIONS must still bypass
-        when the consistency check passes — preserves the +$40 inland net."""
+        when the consistency check passes — preserves the +$40 inland net.
+        2026-05-03: KMDW moved from inland to coastal (lake-effect microclimate)."""
         pb.get_recent_cli_range = lambda *a, **kw: (50.0, 60.0)
-        for station in ("KDFW", "KAUS", "KSAT", "KOKC", "KMSP", "KMDW",
+        for station in ("KDFW", "KAUS", "KSAT", "KOKC", "KMSP",
                         "KPHX", "KLAS", "KDEN", "KATL"):
             opp = {"mu": 55.0, "station": station, "date_str": "2026-05-02"}
             self.assertTrue(
@@ -2293,9 +2294,11 @@ class TestNbpConsistencyBypass(unittest.TestCase):
             )
 
     def test_coastal_constant_membership(self):
-        """Sanity-check the constant lists the 9 stations from the audit."""
+        """Sanity-check the constant lists the stations from the coastal/lake audit.
+        2026-05-03: KMDW (Chicago) added — Lake Michigan microclimate behaves
+        like coastal, triggered by CHI-26MAY03-B44.5 hard-stop -$24.60."""
         expected = {"KLAX", "KSFO", "KSEA", "KMIA", "KHOU",
-                    "KMSY", "KNYC", "KPHL", "KBOS"}
+                    "KMSY", "KNYC", "KPHL", "KBOS", "KMDW"}
         self.assertEqual(pb.COASTAL_NO_MPBYPASS_STATIONS, expected)
 
 
