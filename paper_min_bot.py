@@ -1102,6 +1102,18 @@ COASTAL_NO_MPBYPASS_STATIONS = frozenset({
               # to other coastal bleeders.
 })
 
+# 2026-05-03: floor-mu cushion gate for known marine-cold-bias cities.
+# Audit n=9 BUY_NO B-bracket d-0+d-1 trades since 2026-04-25 on these 4 stations:
+# every single one had floor-mu gap ≤ 2°F; 6 of 9 lost (-$117 net). Lift
+# from filter at threshold 2.0°F: +$117.16 / robust +$39.68 / helps:hurts 3:0.
+# Mechanism-validated by control: same filter on non-coastal HURTS by -$82,
+# confirming this is coastal-specific (NBP under-predicts overnight lows
+# 1-2°F when marine layer / Gulf moisture moderates the airmass).
+# Narrower than COASTAL_NO_MPBYPASS_STATIONS (which is 10 stations) — only
+# the 4 here showed consistent coastal cold-bias on d-0/d-1 BUY_NO.
+COASTAL_TIGHT_FLOOR_STATIONS = frozenset({"KLAX", "KSFO", "KMIA", "KHOU"})
+COASTAL_TIGHT_FLOOR_MIN_GAP_F = 2.0
+
 
 def get_recent_cli_range(station: str, days: int = RECENT_CLI_DAYS,
                           before_date: Optional[str] = None) -> Optional[tuple[float, float]]:
@@ -3374,6 +3386,22 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     f2a = _check_f2a_gate(opp)
     if f2a:
         return ("F2A", f2a)
+    # 2026-05-03 COASTAL_TIGHT_FLOOR: known marine-cold-bias cities require a
+    # 2°F cushion between bracket floor and bot's mu before BUY_NO B-bracket.
+    # See COASTAL_TIGHT_FLOOR_STATIONS docstring for backtest evidence.
+    if action == "BUY_NO":
+        _ctf_station = opp.get("station")
+        _ctf_floor = opp.get("floor")
+        _ctf_cap = opp.get("cap")
+        _ctf_mu = opp.get("mu")
+        if (_ctf_station in COASTAL_TIGHT_FLOOR_STATIONS
+                and _ctf_floor is not None and _ctf_cap is not None  # B-bracket only
+                and _ctf_mu is not None):
+            _ctf_gap = float(_ctf_floor) - float(_ctf_mu)
+            if _ctf_gap < COASTAL_TIGHT_FLOOR_MIN_GAP_F:
+                return ("COASTAL_TIGHT_FLOOR",
+                        f"floor-mu gap {_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
+                        f"(station={_ctf_station} marine cold-bias)")
     msg_block = _check_msg_gate(opp)
     if msg_block:
         return ("MSG", msg_block)

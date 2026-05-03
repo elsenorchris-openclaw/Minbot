@@ -2537,6 +2537,96 @@ class TestEvaluateGates(unittest.TestCase):
         self.assertEqual(gate, "OBS_CONFIRMED_LOSER")
 
 
+class TestCoastalTightFloorGate(unittest.TestCase):
+    """2026-05-03 COASTAL_TIGHT_FLOOR gate: LAX/SFO/MIA/HOU BUY_NO B-brackets
+    require >= 2.0°F gap between floor and mu — guards against marine cold-bias
+    that under-predicted overnight lows on these stations by 1-2°F (n=9 audit:
+    every entry had gap <= 2°F, 6 of 9 lost). Mechanism is coastal-specific:
+    same gate on inland stations HURT in audit, so we narrow to 4 stations."""
+
+    def setUp(self):
+        self._orig_recent = pb.get_recent_cli_range
+        pb.get_recent_cli_range = lambda *a, **kw: None
+
+    def tearDown(self):
+        pb.get_recent_cli_range = self._orig_recent
+
+    def _opp(self, station, mu, floor, **overrides):
+        cap = floor + 1.0
+        base = {
+            "market_ticker": f"KXLOWT{station[1:]}-26MAY03-B{floor + 0.5}",
+            "event_ticker": f"KXLOWT{station[1:]}-26MAY03",
+            "action": "BUY_NO", "model_prob": 0.20, "edge": 0.30,
+            "entry_price": 0.50, "yes_bid": 18, "yes_ask": 22,
+            "no_bid": 48, "no_ask": 52, "mu": mu, "sigma": 2.5,
+            "mu_source": "nbp",
+            "mu_nbp": mu, "mu_hrrr": mu, "mu_nbm_om": mu,
+            "running_min": None, "post_sunrise_lock": False,
+            "is_today": True, "disagreement": 0.5,
+            "floor": float(floor), "cap": float(cap),
+            "station": station, "date_str": "2026-05-03",
+            "series": f"KXLOWT{station[1:]}",
+        }
+        base.update(overrides)
+        return base
+
+    def test_lax_blocks_at_gap_1f(self):
+        # LAX BUY_NO B59.5 with mu=58 → floor-mu = 1.0°F < 2.0°F → block
+        gate, reason = pb._evaluate_gates(self._opp("KLAX", mu=58.0, floor=59.0))
+        self.assertEqual(gate, "COASTAL_TIGHT_FLOOR")
+        self.assertIn("KLAX", reason)
+
+    def test_lax_passes_at_gap_3f(self):
+        # LAX BUY_NO B59.5 with mu=56 → gap = 3.0°F >= 2.0°F → pass
+        gate, _ = pb._evaluate_gates(self._opp("KLAX", mu=56.0, floor=59.0))
+        self.assertIsNone(gate)
+
+    def test_sfo_blocks_at_gap_2f(self):
+        # SFO BUY_NO B54.5 with mu=52 → gap = 2.0°F (NOT strictly < 2.0) → pass
+        # Strict < 2.0 means gap=2.0 passes; gap=1.9 blocks.
+        gate, _ = pb._evaluate_gates(self._opp("KSFO", mu=52.0, floor=54.0))
+        self.assertIsNone(gate)
+        # gap=1.9 → block
+        gate, _ = pb._evaluate_gates(self._opp("KSFO", mu=52.1, floor=54.0))
+        self.assertEqual(gate, "COASTAL_TIGHT_FLOOR")
+
+    def test_hou_blocks_at_negative_gap(self):
+        # KHOU-APR30-style: floor=68 cap=69 mu=69.4 → mu ABOVE floor by 1.4°F.
+        # ABS_DIST passes (|mu-mid|=0.9 > 0.625 default min), but COASTAL_TIGHT_FLOOR
+        # blocks because gap = floor-mu = -1.4 < 2.0. This was a real loser
+        # (-$29.44) in the audit pool.
+        gate, _ = pb._evaluate_gates(self._opp("KHOU", mu=69.4, floor=68.0))
+        self.assertEqual(gate, "COASTAL_TIGHT_FLOOR")
+
+    def test_inland_station_not_affected(self):
+        # KDFW (inland, not in COASTAL_TIGHT_FLOOR_STATIONS) at gap=1.0
+        # → must NOT trigger this gate — mechanism check
+        gate, _ = pb._evaluate_gates(self._opp("KDFW", mu=44.0, floor=45.0))
+        # KDFW with gap=1°F should hit ABS_DIST instead (|mu-mid|=1.5 < min)
+        # OR pass — either way, NOT COASTAL_TIGHT_FLOOR
+        self.assertNotEqual(gate, "COASTAL_TIGHT_FLOOR")
+
+    def test_buy_yes_not_affected(self):
+        # BUY_YES on LAX with same setup → not blocked (gate is BUY_NO only)
+        gate, _ = pb._evaluate_gates(self._opp("KLAX", mu=58.0, floor=59.0,
+                                               action="BUY_YES",
+                                               model_prob=0.40, edge=0.30,
+                                               entry_price=0.40))
+        self.assertNotEqual(gate, "COASTAL_TIGHT_FLOOR")
+
+    def test_t_bracket_not_affected(self):
+        # T-bracket (cap=None or floor=None) → not blocked, this gate is B-only
+        opp = self._opp("KLAX", mu=58.0, floor=59.0)
+        opp["cap"] = None  # T-floor only
+        gate, _ = pb._evaluate_gates(opp)
+        self.assertNotEqual(gate, "COASTAL_TIGHT_FLOOR")
+
+    def test_constant_membership(self):
+        """Sanity-check: COASTAL_TIGHT_FLOOR_STATIONS contains the 4 audited stations."""
+        self.assertEqual(pb.COASTAL_TIGHT_FLOOR_STATIONS,
+                         {"KLAX", "KSFO", "KMIA", "KHOU"})
+
+
 class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
     """`record_candidate` enriches every record with `blocked_by` so downstream
     analysis can see which gate would have blocked or `null` for would-enter."""
