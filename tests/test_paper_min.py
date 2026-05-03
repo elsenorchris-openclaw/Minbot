@@ -3460,6 +3460,100 @@ class TestBankrollColdStart(unittest.TestCase):
         self.assertEqual(pb._get_bankroll_cached(), 0.0)
 
 
+class TestForecastAgeAndDaysOutHelpers(unittest.TestCase):
+    """2026-05-02 entry-record enrichment: per-source forecast freshness
+    (`*_age_min`) + integer `days_out`. Pure additive logging; no behavior
+    change. These tests cover the helper functions directly."""
+
+    def setUp(self):
+        # Snapshot caches so we can mutate them safely
+        self._snap_nbp = dict(pb._nbp_cache)
+        self._snap_hrrr = dict(pb._hrrr_cache)
+        self._snap_nbm = dict(pb._nbm_om_cache)
+        with pb._nbp_cache_lock:
+            pb._nbp_cache.clear()
+        with pb._hrrr_cache_lock:
+            pb._hrrr_cache.clear()
+        with pb._nbm_om_cache_lock:
+            pb._nbm_om_cache.clear()
+
+    def tearDown(self):
+        with pb._nbp_cache_lock:
+            pb._nbp_cache.clear(); pb._nbp_cache.update(self._snap_nbp)
+        with pb._hrrr_cache_lock:
+            pb._hrrr_cache.clear(); pb._hrrr_cache.update(self._snap_hrrr)
+        with pb._nbm_om_cache_lock:
+            pb._nbm_om_cache.clear(); pb._nbm_om_cache.update(self._snap_nbm)
+
+    def test_cache_entry_age_min_returns_None_when_missing(self):
+        self.assertIsNone(pb._cache_entry_age_min(
+            pb._nbp_cache, pb._nbp_cache_lock, "KLAX", "2026-05-02"))
+        self.assertIsNone(pb._cache_entry_age_min(
+            pb._hrrr_cache, pb._hrrr_cache_lock, "KXLOWTLAX", "2026-05-02"))
+
+    def test_cache_entry_age_min_handles_None_keys(self):
+        self.assertIsNone(pb._cache_entry_age_min(
+            pb._nbp_cache, pb._nbp_cache_lock, None, "2026-05-02"))
+        self.assertIsNone(pb._cache_entry_age_min(
+            pb._nbp_cache, pb._nbp_cache_lock, "KLAX", None))
+
+    def test_cache_entry_age_min_computes_minutes_correctly(self):
+        # Seed an entry "fetched 5 minutes ago"
+        with pb._nbp_cache_lock:
+            pb._nbp_cache["KLAX"] = {"2026-05-02": {
+                "mu": 57.0, "sigma": 1.0, "fetched": pb.time.time() - 300.0,
+            }}
+        age = pb._cache_entry_age_min(
+            pb._nbp_cache, pb._nbp_cache_lock, "KLAX", "2026-05-02")
+        # Should be ~5.0 (allow 0.1 min tolerance for test-execution time)
+        self.assertIsNotNone(age)
+        self.assertAlmostEqual(age, 5.0, delta=0.1)
+
+    def test_cache_entry_age_min_returns_None_on_no_fetched_field(self):
+        # Defensive: entry exists but lacks 'fetched' key
+        with pb._nbp_cache_lock:
+            pb._nbp_cache["KLAX"] = {"2026-05-02": {"mu": 57.0, "sigma": 1.0}}
+        self.assertIsNone(pb._cache_entry_age_min(
+            pb._nbp_cache, pb._nbp_cache_lock, "KLAX", "2026-05-02"))
+
+    def test_days_out_int_today_returns_0(self):
+        # Bracket date is today's NWS climate day for the station
+        from datetime import datetime, timezone
+        tz_name = "America/Los_Angeles"
+        today = pb._climate_date_nws(tz_name)
+        self.assertEqual(
+            pb._days_out_int({"tz": tz_name, "date_str": today}), 0)
+
+    def test_days_out_int_tomorrow_returns_1(self):
+        from datetime import datetime, timezone, timedelta
+        tz_name = "America/Los_Angeles"
+        today = pb._climate_date_nws(tz_name)
+        today_d = datetime.strptime(today, "%Y-%m-%d").date()
+        tomorrow = (today_d + timedelta(days=1)).strftime("%Y-%m-%d")
+        self.assertEqual(
+            pb._days_out_int({"tz": tz_name, "date_str": tomorrow}), 1)
+
+    def test_days_out_int_three_days_ahead(self):
+        from datetime import datetime, timezone, timedelta
+        tz_name = "America/Chicago"
+        today = pb._climate_date_nws(tz_name)
+        today_d = datetime.strptime(today, "%Y-%m-%d").date()
+        plus3 = (today_d + timedelta(days=3)).strftime("%Y-%m-%d")
+        self.assertEqual(
+            pb._days_out_int({"tz": tz_name, "date_str": plus3}), 3)
+
+    def test_days_out_int_invalid_date_returns_None(self):
+        self.assertIsNone(pb._days_out_int({"tz": "America/New_York",
+                                            "date_str": "not-a-date"}))
+
+    def test_days_out_int_missing_tz_falls_back_to_eastern(self):
+        # tz default = America/New_York per helper docstring
+        from datetime import datetime, timezone
+        today = pb._climate_date_nws("America/New_York")
+        result = pb._days_out_int({"date_str": today})
+        self.assertEqual(result, 0)
+
+
 class TestSettleTailFloorCapNoneGuard(unittest.TestCase):
     """`check_settlements` must skip positions with floor=None AND cap=None
     rather than silently mis-settle (April 27 phantom-bug class)."""

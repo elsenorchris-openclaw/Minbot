@@ -1728,6 +1728,51 @@ def get_hrrr_min(series: str, date_str: str) -> Optional[float]:
     return float(entry["min_f"])
 
 
+# ─── Forecast-cache age helpers (2026-05-02) ─────────────────────────────
+# Used purely to enrich entry trade records — captures forecast freshness
+# at the moment of trade execution so future bias-correction can attribute
+# errors to "stale forecast" patterns (e.g. HRRR stuck on an old run when
+# NBP/NBM/obs were already showing a different regime). No behavior change.
+
+
+def _cache_entry_age_min(cache, lock, key1, date_str):
+    """Minutes since per-(key1, date_str) cached forecast was fetched.
+    Returns None when no entry exists or no 'fetched' field present.
+
+    Cache shape: `{key1: {date_str: {..., 'fetched': epoch_seconds}}}`.
+    `key1` is `station` for NBP cache, `series` for HRRR / NBM-OM caches.
+    """
+    if not key1 or not date_str:
+        return None
+    try:
+        with lock:
+            per_date = cache.get(key1, {})
+            entry = per_date.get(date_str) if isinstance(per_date, dict) else None
+        if entry and isinstance(entry, dict) and 'fetched' in entry:
+            return round((time.time() - float(entry['fetched'])) / 60.0, 1)
+    except Exception:
+        pass
+    return None
+
+
+def _days_out_int(opp):
+    """Integer days from today's NWS climate-day to opp.date_str (per opp.tz).
+    0 = today (d-0), 1 = tomorrow (d-1), 2 = day after (d-2), etc.
+    Returns None on parse failure.
+
+    Companion to existing `is_today_at_entry` boolean — preserves the d-1
+    vs d-2 vs d-3 distinction that the boolean throws away.
+    """
+    try:
+        tz_name = opp.get('tz', 'America/New_York')
+        today_str = _climate_date_nws(tz_name)
+        today_d = datetime.strptime(today_str, '%Y-%m-%d').date()
+        target_d = datetime.strptime(opp['date_str'], '%Y-%m-%d').date()
+        return (target_d - today_d).days
+    except Exception:
+        return None
+
+
 # ─── Stale-cache fallback alerting ────────────────────────────────────────
 # When a forecast cache TTL has expired but we're still inside the fallback
 # window (data is served, not blocked), fire a Discord alert so a degraded
@@ -3723,6 +3768,17 @@ def execute_opportunity(opp: dict) -> bool:
         "primary_outlier_diff_at_entry": _compute_primary_outlier_diff(opp),
         "post_sunrise_lock_at_entry": opp.get("post_sunrise_lock"),
         "is_today_at_entry":   opp.get("is_today"),
+        # 2026-05-02 data-capture additions: integer days_out (companion to
+        # is_today_at_entry boolean which collapses d-1/d-2/d-3 together)
+        # and per-source forecast freshness ages in minutes (captures
+        # stale-forecast patterns at entry time for future bias studies).
+        "days_out":            _days_out_int(opp),
+        "nbp_age_min":         _cache_entry_age_min(_nbp_cache, _nbp_cache_lock,
+                                                    opp.get("station"), opp.get("date_str")),
+        "hrrr_age_min":        _cache_entry_age_min(_hrrr_cache, _hrrr_cache_lock,
+                                                    opp.get("series"), opp.get("date_str")),
+        "nbm_om_age_min":      _cache_entry_age_min(_nbm_om_cache, _nbm_om_cache_lock,
+                                                    opp.get("series"), opp.get("date_str")),
         # Edge breakdown (mirrors V2's edge / edge_vs_mid)
         "yes_ask_frac_at_entry": opp.get("yes_ask_frac"),
         "no_ask_frac_at_entry":  opp.get("no_ask_frac"),
