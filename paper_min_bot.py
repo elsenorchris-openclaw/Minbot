@@ -1538,7 +1538,29 @@ def get_nbp_forecast(series: str, date_str: str) -> Optional[dict]:
 
 _nbm_om_cache: dict[str, dict] = {}
 _nbm_om_cache_lock = threading.Lock()
-NBM_OM_TTL_SEC = 3600      # refresh hourly (best_match doesn't have a tight pub window)
+
+# 2026-05-03: NBM-OM cache TTL realigned to V2's dynamic pattern.
+# Previous 3600s static TTL had two issues:
+#   1. Detection latency 0-60min for new NBM cycles (V2 detects in <30s)
+#   2. False-positive stale-cache Discord alerts every hour at TTL boundary
+# V2 has been running 30s/5s dynamic TTL since 2026-04-29 without rate-limit
+# issues on Open-Meteo's free endpoint. Same pattern matches HRRR's
+# _hrrr_dynamic_ttl logic 20 lines below.
+NBM_OM_TTL_SEC = 30                   # refresh cadence outside the publish window
+NBM_OM_TTL_SEC_NEW_RUN_WINDOW = 5     # tighter TTL during HH:35-50 UTC pub window
+NBM_OM_STALE_ALERT_SEC = 1800         # 30 min — alert (real refresh failure, not normal latency)
+NBM_OM_BLOCK_SEC = 7200               # 2 h — refuse to serve cache beyond this
+
+
+def _nbm_om_dynamic_ttl() -> int:
+    """Current NBM-OM cache TTL based on UTC clock. NBM-OM new cycles land
+    in Open-Meteo HH:35-50 UTC each hour; tighter TTL inside that window
+    catches new runs within ~5s. Outside the window, 30s catches upstream
+    refresh promptly without unnecessary load."""
+    minute = datetime.now(timezone.utc).minute
+    if 35 <= minute <= 50:
+        return NBM_OM_TTL_SEC_NEW_RUN_WINDOW
+    return NBM_OM_TTL_SEC
 
 _hrrr_cache: dict[str, dict] = {}
 _hrrr_cache_lock = threading.Lock()
@@ -1718,15 +1740,15 @@ def get_nbm_om_min(series: str, date_str: str) -> Optional[float]:
     if not entry:
         return None
     age_s = time.time() - entry.get("fetched", 0)
-    if age_s > NBM_OM_TTL_SEC * 2:
-        return None  # stale (blocked)
-    # 2026-04-29: stale-but-served Discord alert. NBM_OM TTL is 1h; the
-    # *2 fallback window means we silently serve up to 2h-old data when
-    # refresh fails. Alert per-series 30-min throttle so a degraded
-    # endpoint surfaces visibly without flooding Discord.
-    if age_s > NBM_OM_TTL_SEC:
-        _stale_cache_alert("NBM-OM", series, age_s, NBM_OM_TTL_SEC,
-                            NBM_OM_TTL_SEC * 2)
+    if age_s > NBM_OM_BLOCK_SEC:
+        return None  # too stale — refuse to serve
+    # 2026-05-03: alert threshold separated from cache TTL. With dynamic TTL
+    # of 5-30s, the prior "alert at age > TTL" pattern fired every refresh
+    # cycle. STALE_ALERT_SEC (30 min) catches genuine refresh failures
+    # without flagging normal sub-minute refresh latency.
+    if age_s > NBM_OM_STALE_ALERT_SEC:
+        _stale_cache_alert("NBM-OM", series, age_s, NBM_OM_STALE_ALERT_SEC,
+                            NBM_OM_BLOCK_SEC)
     return float(entry["min_f"])
 
 
@@ -4450,10 +4472,12 @@ def scan_cycle() -> dict:
         except Exception as e:
             log(f"  NBP refresh failed: {e}", "warn")
 
-    # NBM-OM refresh (check cached per-series freshness)
+    # NBM-OM refresh — dynamic TTL (30s general / 5s during HH:35-50 pub window).
+    # 2026-05-03: aligned with V2's pattern (running since 2026-04-29). Catches
+    # new NBM cycles within ~5s of Open-Meteo publishing them.
     try:
-        # Simple: refresh once per cycle if any entry is older than 1h
         need_refresh = False
+        _nbm_om_ttl_now = _nbm_om_dynamic_ttl()
         with _nbm_om_cache_lock:
             for series in CITIES:
                 entries = _nbm_om_cache.get(series, {})
@@ -4461,7 +4485,7 @@ def scan_cycle() -> dict:
                     need_refresh = True
                     break
                 newest = max((e.get("fetched", 0) for e in entries.values()), default=0)
-                if time.time() - newest > NBM_OM_TTL_SEC:
+                if time.time() - newest > _nbm_om_ttl_now:
                     need_refresh = True
                     break
         if need_refresh:

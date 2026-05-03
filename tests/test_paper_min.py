@@ -2628,6 +2628,148 @@ class TestCoastalTightFloorGate(unittest.TestCase):
                          {"KLAX", "KSFO", "KMIA", "KHOU"})
 
 
+class TestNbmOmDynamicTTL(unittest.TestCase):
+    """2026-05-03: NBM-OM cache TTL realigned to V2's dynamic pattern.
+       - Normal:    30s   (was: 3600s static)
+       - Pub window (HH:35-50 UTC): 5s
+       - Stale alert: 30 min (real failure, not refresh latency)
+       - Block:     2 h    (refuse to serve cache beyond)
+
+    Catches new NBM cycles in ~5s instead of 0-60min, and silences the
+    false-positive stale-cache alerts that fired every hour at TTL boundary."""
+
+    def test_constants_match_design(self):
+        self.assertEqual(pb.NBM_OM_TTL_SEC, 30)
+        self.assertEqual(pb.NBM_OM_TTL_SEC_NEW_RUN_WINDOW, 5)
+        self.assertEqual(pb.NBM_OM_STALE_ALERT_SEC, 1800)
+        self.assertEqual(pb.NBM_OM_BLOCK_SEC, 7200)
+        # Sanity: alert threshold must be far above normal cycle TTL
+        self.assertGreater(pb.NBM_OM_STALE_ALERT_SEC, pb.NBM_OM_TTL_SEC * 30)
+        # Sanity: block must be larger than alert (else alert never fires)
+        self.assertGreater(pb.NBM_OM_BLOCK_SEC, pb.NBM_OM_STALE_ALERT_SEC)
+
+    def test_dynamic_ttl_returns_one_of_two_values(self):
+        """Smoke: dynamic TTL always returns one of the two configured constants."""
+        ttl = pb._nbm_om_dynamic_ttl()
+        self.assertIn(ttl, (pb.NBM_OM_TTL_SEC, pb.NBM_OM_TTL_SEC_NEW_RUN_WINDOW))
+
+    def _patched_minute(self, minute):
+        """Helper: context manager that makes datetime.now(...).minute return `minute`.
+        Patches `paper_min_bot.datetime` (the imported class)."""
+        from unittest.mock import patch
+        real_dt = pb.datetime
+        class FakeDateTime:
+            @staticmethod
+            def now(tz=None):
+                return real_dt.now(tz=tz).replace(minute=minute)
+        return patch.object(pb, "datetime", FakeDateTime)
+
+    def test_inside_pub_window_returns_short_ttl(self):
+        # Several minutes inside the 35-50 window
+        for m in (35, 40, 45, 50):
+            with self._patched_minute(m):
+                self.assertEqual(pb._nbm_om_dynamic_ttl(),
+                                 pb.NBM_OM_TTL_SEC_NEW_RUN_WINDOW,
+                                 f"minute={m} should be inside pub window")
+
+    def test_outside_pub_window_returns_normal_ttl(self):
+        for m in (0, 10, 20, 34, 51, 59):
+            with self._patched_minute(m):
+                self.assertEqual(pb._nbm_om_dynamic_ttl(),
+                                 pb.NBM_OM_TTL_SEC,
+                                 f"minute={m} should be outside pub window")
+
+
+class TestNbmOmStaleAlertThreshold(unittest.TestCase):
+    """2026-05-03: stale-cache alert separated from cache TTL. With dynamic
+    refresh (5-30s), alerting on `age > TTL` would fire every cycle.
+    STALE_ALERT_SEC (30 min) catches genuine refresh failures only."""
+
+    def setUp(self):
+        # Snapshot + clear cache and alert-throttle state to keep tests isolated.
+        with pb._nbm_om_cache_lock:
+            self._snap_cache = dict(pb._nbm_om_cache)
+            pb._nbm_om_cache.clear()
+        self._snap_alerts = dict(pb._stale_alert_last_ts)
+        pb._stale_alert_last_ts.clear()
+        # Capture discord_send so tests can assert on alert behavior.
+        self._orig_discord = pb.discord_send
+        self._discord_calls = []
+        pb.discord_send = lambda msg: self._discord_calls.append(msg)
+
+    def tearDown(self):
+        with pb._nbm_om_cache_lock:
+            pb._nbm_om_cache.clear()
+            pb._nbm_om_cache.update(self._snap_cache)
+        pb._stale_alert_last_ts.clear()
+        pb._stale_alert_last_ts.update(self._snap_alerts)
+        pb.discord_send = self._orig_discord
+
+    def _seed(self, series, date_str, value, age_s):
+        with pb._nbm_om_cache_lock:
+            pb._nbm_om_cache.setdefault(series, {})[date_str] = {
+                "min_f": float(value), "fetched": pb.time.time() - age_s,
+            }
+
+    def test_serves_fresh_cache(self):
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=10)
+        v = pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertEqual(v, 45.0)
+        self.assertEqual(self._discord_calls, [])
+
+    def test_no_alert_below_alert_threshold(self):
+        """Cache age 25 min — past TTL, well under STALE_ALERT_SEC (30 min).
+        Cache should be served, NO alert fired (this is the false-alarm
+        regression — must not return).
+        """
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=1500)  # 25 min
+        v = pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertEqual(v, 45.0)
+        self.assertEqual(self._discord_calls, [],
+                         "Must NOT alert at 25 min staleness — that's normal cycle behavior")
+
+    def test_alert_above_alert_threshold(self):
+        """Cache age 33 min — past STALE_ALERT_SEC (30 min). Cache served
+        AND alert fired (real refresh failure)."""
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=2000)  # 33 min
+        v = pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertEqual(v, 45.0, "Should still serve within block window")
+        self.assertEqual(len(self._discord_calls), 1)
+        msg = self._discord_calls[0]
+        self.assertIn("NBM-OM", msg)
+        self.assertIn("KXLOWTNYC", msg)
+        self.assertIn("STALE CACHE FALLBACK", msg)
+
+    def test_block_above_block_threshold(self):
+        """Cache age 2.03 hours — past BLOCK_SEC (2h). Cache refused (None)."""
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=7300)  # 2.03 hr
+        v = pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertIsNone(v, "Cache must be refused beyond BLOCK_SEC")
+
+    def test_no_entry_returns_none_no_alert(self):
+        v = pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertIsNone(v)
+        self.assertEqual(self._discord_calls, [])
+
+    def test_alert_throttle_30min(self):
+        """Alert function has per-series 30-min throttle. Two stale reads
+        in quick succession should result in only 1 Discord message."""
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=2000)
+        pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        self.assertEqual(len(self._discord_calls), 1,
+                         "Throttle should suppress repeat alerts within 30 min")
+
+    def test_alert_per_series_independent(self):
+        """Throttle is per-series — different series can both alert."""
+        self._seed("KXLOWTNYC", "2026-05-04", 45.0, age_s=2000)
+        self._seed("KXLOWTLAX", "2026-05-04", 55.0, age_s=2000)
+        pb.get_nbm_om_min("KXLOWTNYC", "2026-05-04")
+        pb.get_nbm_om_min("KXLOWTLAX", "2026-05-04")
+        self.assertEqual(len(self._discord_calls), 2)
+
+
 class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
     """`record_candidate` enriches every record with `blocked_by` so downstream
     analysis can see which gate would have blocked or `null` for would-enter."""

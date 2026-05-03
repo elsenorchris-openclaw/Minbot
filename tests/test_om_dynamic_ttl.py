@@ -5,8 +5,12 @@ Plan C (2026-04-30): min_bot's HRRR refresh switched to a single batched
 refresh). Cache-trigger TTL also swapped from a static 600s to a dynamic
 helper that drops to 5s during HH:43-55 UTC pub window.
 
-NBM stayed at 3600s general TTL (best_match doesn't have a tight pub window),
-but was also moved to batched fetching.
+2026-05-03: NBM-OM also moved to dynamic TTL (matching V2's pattern since
+2026-04-29). Was 3600s static — now 30s general / 5s during HH:35-50 UTC
+pub window. Stale-alert and block thresholds split into separate constants
+(`NBM_OM_STALE_ALERT_SEC`, `NBM_OM_BLOCK_SEC`) so per-cycle refresh
+latency doesn't trigger Discord noise. See `TestNbmOmDynamicTTL` and
+`TestNbmOmStaleAlertThreshold` in test_paper_min.py for behavior tests.
 """
 from __future__ import annotations
 
@@ -40,8 +44,9 @@ def _import_helpers():
     tree = ast.parse(src)
     targets = {
         "HRRR_TTL_SEC", "HRRR_TTL_SEC_NEW_RUN_WINDOW",
-        "NBM_OM_TTL_SEC",
-        "_hrrr_dynamic_ttl",
+        "NBM_OM_TTL_SEC", "NBM_OM_TTL_SEC_NEW_RUN_WINDOW",
+        "NBM_OM_STALE_ALERT_SEC", "NBM_OM_BLOCK_SEC",
+        "_hrrr_dynamic_ttl", "_nbm_om_dynamic_ttl",
     }
     nodes = []
     for node in ast.walk(tree):
@@ -64,6 +69,16 @@ def _ttl_at(ns: dict, hour: int, minute: int) -> int:
     ns["datetime"] = _FrozenClock(frozen)
     try:
         return ns["_hrrr_dynamic_ttl"]()
+    finally:
+        ns["datetime"] = real_dt
+
+
+def _nbm_ttl_at(ns: dict, hour: int, minute: int) -> int:
+    frozen = datetime(2026, 4, 30, hour, minute, 0, tzinfo=timezone.utc)
+    real_dt = ns["datetime"]
+    ns["datetime"] = _FrozenClock(frozen)
+    try:
+        return ns["_nbm_om_dynamic_ttl"]()
     finally:
         ns["datetime"] = real_dt
 
@@ -92,10 +107,61 @@ class HrrrDynamicTtlTests(unittest.TestCase):
         self.assertEqual(self.ns["HRRR_TTL_SEC"], 60)
         self.assertEqual(self.ns["HRRR_TTL_SEC_NEW_RUN_WINDOW"], 5)
 
-    def test_nbm_ttl_unchanged_at_3600(self):
-        # min_bot uses best_match for "NBM" cache (free-tier model). No tight
-        # pub window applies, so we kept 3600s and just batched the fetches.
-        self.assertEqual(self.ns["NBM_OM_TTL_SEC"], 3600)
+    def test_nbm_ttl_aligned_with_v2_dynamic_pattern_20260503(self):
+        """2026-05-03: NBM-OM moved from 3600s static to V2's dynamic pattern.
+        New design has 4 separate constants — refresh interval, pub-window
+        interval, stale-alert threshold, and block threshold."""
+        self.assertEqual(self.ns["NBM_OM_TTL_SEC"], 30,
+                         "Was 3600 static; now 30s refresh cadence (V2-aligned)")
+        self.assertEqual(self.ns["NBM_OM_TTL_SEC_NEW_RUN_WINDOW"], 5,
+                         "5s during HH:35-50 UTC pub window (catches new cycles fast)")
+        self.assertEqual(self.ns["NBM_OM_STALE_ALERT_SEC"], 1800,
+                         "Alert at 30 min — real refresh failure, not normal latency")
+        self.assertEqual(self.ns["NBM_OM_BLOCK_SEC"], 7200,
+                         "Block (refuse cache) at 2h — same as old TTL × 2 = 7200")
+        # Sanity: thresholds in correct order
+        self.assertLess(self.ns["NBM_OM_TTL_SEC_NEW_RUN_WINDOW"],
+                        self.ns["NBM_OM_TTL_SEC"])
+        self.assertLess(self.ns["NBM_OM_TTL_SEC"],
+                        self.ns["NBM_OM_STALE_ALERT_SEC"])
+        self.assertLess(self.ns["NBM_OM_STALE_ALERT_SEC"],
+                        self.ns["NBM_OM_BLOCK_SEC"])
+
+
+class NbmOmDynamicTtlTests(unittest.TestCase):
+    """2026-05-03: NBM-OM publish window is HH:35-50 UTC. Mirrors HRRR
+    dynamic-TTL pattern. AST-based static check (no module init)."""
+
+    def setUp(self):
+        self.ns = _import_helpers()
+
+    def test_pub_window_lower_edge(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 35),
+                         self.ns["NBM_OM_TTL_SEC_NEW_RUN_WINDOW"])
+
+    def test_pub_window_upper_edge(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 50),
+                         self.ns["NBM_OM_TTL_SEC_NEW_RUN_WINDOW"])
+
+    def test_pub_window_middle(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 42),
+                         self.ns["NBM_OM_TTL_SEC_NEW_RUN_WINDOW"])
+
+    def test_outside_window_just_before(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 34),
+                         self.ns["NBM_OM_TTL_SEC"])
+
+    def test_outside_window_just_after(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 51),
+                         self.ns["NBM_OM_TTL_SEC"])
+
+    def test_outside_window_top_of_hour(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 0),
+                         self.ns["NBM_OM_TTL_SEC"])
+
+    def test_outside_window_end_of_hour(self):
+        self.assertEqual(_nbm_ttl_at(self.ns, 12, 59),
+                         self.ns["NBM_OM_TTL_SEC"])
 
 
 class BatchedFetchSignatureTests(unittest.TestCase):
