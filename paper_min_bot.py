@@ -2981,7 +2981,17 @@ def _reconcile_from_trades_log() -> int:
 def _load_positions() -> None:
     """Load positions.json, dropping any whose climate day is more than
     POSITION_TTL_DAYS in the past. Defends against orphaned positions that
-    never settle (data error) accumulating indefinitely."""
+    never settle (data error) accumulating indefinitely.
+
+    2026-05-03: also prune already-settled positions whose climate day is
+    in the past (see _prune_settled_past_positions). Without this, settled
+    records accumulate in positions.json for up to POSITION_TTL_DAYS even
+    though they no longer have any operational role — only the TTL drop
+    on the next cold restart removes them. Found 31 such records on
+    2026-05-03 (Apr 30 → May 2 dates, all settled=True). Bot was
+    filtering them correctly during scans but the file grew unbounded
+    until restart.
+    """
     global _open_positions
     try:
         if not POSITIONS_FILE.exists():
@@ -2998,9 +3008,56 @@ def _load_positions() -> None:
                 continue
             keep[tk] = pos
         _open_positions = keep
-        log(f"  loaded {len(_open_positions)} positions (dropped {dropped} > {POSITION_TTL_DAYS}d old)")
+        # 2026-05-03: prune settled positions for past climate-days BEFORE
+        # logging the count, so the load message reflects the post-prune
+        # count of operationally-active positions.
+        pruned_settled = _prune_settled_past_positions()
+        if pruned_settled > 0:
+            log(f"  loaded {len(_open_positions)} positions "
+                f"(dropped {dropped} > {POSITION_TTL_DAYS}d old, "
+                f"pruned {pruned_settled} settled-past)")
+        else:
+            log(f"  loaded {len(_open_positions)} positions (dropped {dropped} > {POSITION_TTL_DAYS}d old)")
     except Exception as e:
         log(f"  positions load failed: {e}", "warn")
+
+
+def _prune_settled_past_positions() -> int:
+    """Remove settled positions whose climate-day is in the past (UTC).
+
+    Conservative criteria — ALL of:
+      - pos.get("settled") truthy
+      - pos.get("date_str") non-empty
+      - date_str < today (UTC)
+
+    Skips:
+      - Today's settled positions (climate-day may not be over for all
+        timezones; bot may still want to read for late-day reporting)
+      - Past-date but unsettled positions (visibility for stuck records)
+      - Records without date_str (defensive — don't accidentally drop
+        partially-populated records)
+
+    Returns count removed. Persists via _save_positions if anything was
+    removed. Safe to call at startup (after _load_positions assigns
+    _open_positions) or at runtime — uses _positions_lock either way.
+
+    Found on 2026-05-03 with 31 stale records: Apr 30 → May 2 dates, all
+    settled=True. The TTL prune in _load_positions only fires after
+    POSITION_TTL_DAYS=3, so settled positions accumulate for up to 3
+    days. This complementary prune zeroes the lag.
+    """
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    removed: list[str] = []
+    with _positions_lock:
+        for tk in list(_open_positions.keys()):
+            pos = _open_positions[tk]
+            ds = pos.get("date_str") or ""
+            if pos.get("settled") and ds and ds < today:
+                del _open_positions[tk]
+                removed.append(tk)
+    if removed:
+        _save_positions()
+    return len(removed)
 
 
 def _save_positions() -> None:
