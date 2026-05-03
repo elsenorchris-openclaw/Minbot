@@ -3438,12 +3438,16 @@ class TestBankrollColdStart(unittest.TestCase):
         self.assertEqual(pb._cached_bankroll, 0.0)
 
     def test_returns_real_balance_when_fetch_succeeds(self):
+        """2026-05-02: live fetch is a connectivity probe — _cached_bankroll
+        stores the live value, but _get_bankroll_cached() returns the fixed
+        Kelly anchor BANKROLL_REF_USD once cold-start has cleared."""
         pb.get_kalshi_balance = lambda: 274.87
-        self.assertEqual(pb._get_bankroll_cached(), 274.87)
+        self.assertEqual(pb._get_bankroll_cached(), pb.BANKROLL_REF_USD)
         self.assertEqual(pb._cached_bankroll, 274.87)
 
     def test_returns_cached_when_within_refresh_interval(self):
-        # Seed a cached value, set ts=now, fetch should not re-call balance.
+        """Within refresh interval, no live re-fetch. Return value is
+        BANKROLL_REF_USD since cold-start has cleared (cached > 0)."""
         pb._cached_bankroll = 100.0
         pb._bankroll_cache_ts = pb.time.time()
         called = {"n": 0}
@@ -3451,7 +3455,7 @@ class TestBankrollColdStart(unittest.TestCase):
             called["n"] += 1
             return 999.0
         pb.get_kalshi_balance = watcher
-        self.assertEqual(pb._get_bankroll_cached(), 100.0)
+        self.assertEqual(pb._get_bankroll_cached(), pb.BANKROLL_REF_USD)
         self.assertEqual(called["n"], 0)
 
     def test_no_synthetic_max_bet_fallback(self):
@@ -3667,10 +3671,13 @@ class TestSigmaAwareSizing(unittest.TestCase):
     that should size down."""
 
     def setUp(self):
-        # Bankroll chosen so Kelly × bankroll lands BELOW MAX_BET_USD across
-        # the σ range we test — otherwise the cap masks the shrink.
-        # At σ=2.5, edge=0.30, price=0.50: kelly=0.15, bet=0.15*$50=$7.50, OK.
-        pb._cached_bankroll = 50.0
+        # 2026-05-02: BANKROLL_REF_USD became the Kelly anchor (was: live cash).
+        # For σ-shrink to be visible in `count`, anchor × Kelly fraction must
+        # land BELOW MAX_BET_USD — otherwise the cap masks the shrink.
+        # At σ=2.5, edge=0.30, price=0.50: kelly≈0.15, bet=0.15*$50=$7.50 < $30 cap.
+        self._saved_ref = pb.BANKROLL_REF_USD
+        pb.BANKROLL_REF_USD = 50.0
+        pb._cached_bankroll = 50.0  # clears cold-start gate
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -3685,6 +3692,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
         )
 
     def tearDown(self):
+        pb.BANKROLL_REF_USD = self._saved_ref
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, sigma, **overrides):
