@@ -3,6 +3,30 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## Latest change (2026-05-03 late evening) — persist `_last_rm_seen` across restarts
+
+`_check_new_low_alerts()` polls obs-pipeline's `running_min` once per scan and emits a Discord `❄️ NEW LOW` when any of the 20 stations' rm steps down. State was an in-memory dict only, so any restart wiped the baseline. The first cycle after a restart silently established a fresh baseline at whatever rm was current — including any corrupt upstream value. (The 2026-05-03 obs-pipeline `PK WND` false-match wrote 27.14°F to KMDW running_min; without persistence, a restart in that window would have absorbed 27.14 as the new baseline and never alerted on the regression.)
+
+**Fix:** `_last_rm_seen` persists to `data/last_rm_seen.json` (atomic temp-file replace) on every state mutation in `_check_new_low_alerts`. Loaded at module import via `_load_last_rm_seen()`; per-entry parse failures are skipped so one malformed row can't drop the rest. Soft cache — missing or corrupt file falls back to empty dict, never crashes the bot.
+
+
+
+### Tests
+
+6 new tests in `TestLastRmSeenPersistence` (`tests/test_paper_min.py`):
+
+- `test_load_returns_empty_when_file_missing` — fresh deploy
+- `test_save_then_load_roundtrip` — round-trip preservation of `(cd, rm)` tuples
+- `test_load_tolerates_corrupt_json` — truncated JSON returns `{}`, no crash
+- `test_load_skips_invalid_entries` — mixed valid/invalid file keeps the valid rows
+- `test_check_new_low_alerts_persists_baseline_on_first_sighting` — first-cycle write
+- `test_restart_simulation_persisted_baseline_blocks_silent_corruption` — explicit guard against the obs-pipeline `PK WND` regression class: pre-restart 44.6°F → restart → injected corrupt 27.14°F → alert MUST fire (regression of in-memory-only behavior would silently absorb 27.14 as the new baseline)
+
+The existing `TestNewLowDiscordAlerts.setUp` was extended to mock `_save_last_rm_seen` so the existing 6 tests don't write a stale cache file into the production data dir during test runs.
+
+Live verification post-deploy: `data/last_rm_seen.json` written on the first scan cycle, all 20 stations populated. Includes the corrected KMDW=44.6 / KPHX=77.0 / KOKC=46.0 baselines from the obs-pipeline running_min repair. `358 tests passing` (357 `test_paper_min.py` + 18 `test_om_dynamic_ttl.py` — full deselected count omitted).
+
+
 ## Latest change (2026-05-02 late afternoon) — disable mp-range bypass on coastal stations
 
 Replays of every historical bypass-fired entry (n=23, 19 settled) showed the `_nbp_consistent_with_recent_cli` mp-range bypass is **net negative overall** (−$51.42, 10W:9L) and the loss concentrates entirely on coastal/marine-layer stations:

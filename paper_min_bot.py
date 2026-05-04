@@ -447,6 +447,7 @@ TRADES_FILE = DATA_DIR / "trades.jsonl"
 SETTLEMENTS_FILE = DATA_DIR / "settlements.jsonl"
 STATS_FILE = DATA_DIR / "stats.json"
 NBP_CACHE_FILE = DATA_DIR / "nbp_cache.json"
+LAST_RM_SEEN_FILE = DATA_DIR / "last_rm_seen.json"
 ENV_FILE = Path("/home/ubuntu/.env")
 
 # Kalshi
@@ -876,8 +877,64 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
 # new day, not actually a low). Threshold 0.1°F filters float noise; the
 # integer-rounded `iem_currents` source rounds to whole °F so an actual new
 # low always crosses 0.1°F.
-_last_rm_seen: dict[str, tuple[str, float]] = {}
+#
+# Persistence (2026-05-03): state previously was in-memory only, so a restart
+# wiped the baseline and the first cycle silently absorbed the current rm
+# (which could be a corrupt value from an upstream bug). Now persisted to
+# `last_rm_seen.json` so a restart re-reads the prior baseline and a real
+# regression still triggers an alert.
 NEW_LOW_THRESHOLD_F = 0.1
+
+
+def _load_last_rm_seen() -> dict[str, tuple[str, float]]:
+    """Load persisted baseline from `last_rm_seen.json`. Returns {} on first
+    run, missing file, or any parse/IO error — file is a soft cache. Per-entry
+    failures are silently skipped so one malformed row can't drop the rest."""
+    try:
+        if not LAST_RM_SEEN_FILE.exists():
+            return {}
+        with open(LAST_RM_SEEN_FILE) as f:
+            raw = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    out: dict[str, tuple[str, float]] = {}
+    for st, value in raw.items():
+        if not isinstance(st, str):
+            continue
+        try:
+            cd, rm = value
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(cd, str):
+            continue
+        try:
+            out[st] = (cd, float(rm))
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _save_last_rm_seen() -> None:
+    """Persist `_last_rm_seen` atomically. Tuples → 2-element lists in JSON."""
+    try:
+        tmp = LAST_RM_SEEN_FILE.with_suffix(".json.tmp")
+        with open(tmp, "w") as f:
+            json.dump(
+                {st: [cd, rm] for st, (cd, rm) in _last_rm_seen.items()},
+                f, indent=2, sort_keys=True,
+            )
+        os.replace(tmp, LAST_RM_SEEN_FILE)
+    except OSError as e:
+        # Soft cache — log but don't crash the scan loop.
+        try:
+            log(f"  last_rm_seen save failed: {e}", "warn")
+        except Exception:
+            pass
+
+
+_last_rm_seen: dict[str, tuple[str, float]] = _load_last_rm_seen()
 
 # 6-hour rolling summary of running_min across all 20 stations. Fires once
 # at startup (so a fresh boot has immediate visibility) and then every 6h.
@@ -948,7 +1005,11 @@ def _maybe_send_low_summary() -> None:
 
 def _check_new_low_alerts() -> None:
     """Poll running_min for all 20 stations; Discord-alert on new daily lows.
-    Called from scan_cycle. State persists in module-global `_last_rm_seen`."""
+    Called from scan_cycle. State persists in module-global `_last_rm_seen`,
+    which is also written to `last_rm_seen.json` so the baseline survives
+    restarts (otherwise a bug-injected corrupt rm would be silently accepted
+    on the first cycle after a restart)."""
+    dirty = False
     for series, info in CITIES.items():
         station = info["station"]
         label = info["label"]
@@ -963,6 +1024,7 @@ def _check_new_low_alerts() -> None:
             # On cd rollover, the first obs of the new day is "the only obs so
             # far" and isn't really a "new low" against history.
             _last_rm_seen[station] = (cd, rm)
+            dirty = True
             continue
         prev_cd, prev_rm = prev
         if rm < prev_rm - NEW_LOW_THRESHOLD_F:
@@ -972,10 +1034,14 @@ def _check_new_low_alerts() -> None:
                 f"{prev_rm:.1f}°F → {rm:.1f}°F (Δ −{drop:.1f}°F)"
             )
             _last_rm_seen[station] = (cd, rm)
+            dirty = True
         elif rm != prev_rm:
             # rm shouldn't increase given lowest-wins semantics, but absorb
             # source-disagreement edge cases without alerting.
             _last_rm_seen[station] = (cd, rm)
+            dirty = True
+    if dirty:
+        _save_last_rm_seen()
 
 
 def get_latest_obs(station: str) -> Optional[dict]:

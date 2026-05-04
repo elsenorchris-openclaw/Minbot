@@ -3485,6 +3485,11 @@ class TestNewLowDiscordAlerts(unittest.TestCase):
         self._discord_msgs: list[str] = []
         self._orig_discord = pb.discord_send
         pb.discord_send = lambda msg: self._discord_msgs.append(msg)
+        # Mock _save_last_rm_seen so tests don't write the production cache
+        # file. Existing tests don't care; persistence-specific tests below
+        # override this back to the real implementation with a tmp path.
+        self._orig_save = pb._save_last_rm_seen
+        pb._save_last_rm_seen = lambda: None
 
     def tearDown(self):
         pb._last_rm_seen.clear()
@@ -3492,6 +3497,7 @@ class TestNewLowDiscordAlerts(unittest.TestCase):
         pb.get_running_min = self._orig_get_rm
         pb._climate_date_nws = self._orig_cd
         pb.discord_send = self._orig_discord
+        pb._save_last_rm_seen = self._orig_save
 
     def test_first_sighting_no_alert(self):
         # Fresh start, first rm seen — establish baseline, no Discord.
@@ -3581,6 +3587,118 @@ class TestNewLowDiscordAlerts(unittest.TestCase):
         pb._check_new_low_alerts()
         self.assertEqual(self._discord_msgs, [])
         self.assertEqual(pb._last_rm_seen["KSEA"], ("2026-04-30", 47.0))
+
+
+class TestLastRmSeenPersistence(unittest.TestCase):
+    """2026-05-03: `_last_rm_seen` now persists to `last_rm_seen.json` so
+    a restart re-reads the prior baseline. Without persistence, a corrupt
+    upstream rm (e.g. PK WND false-match writing 27.14°F to KMDW) would be
+    silently absorbed as the new baseline on the first cycle after a
+    restart — the alert system would never flag the regression."""
+
+    def setUp(self):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._tmp_path = pb.Path(self._tmpdir.name) / "last_rm_seen.json"
+        self._orig_path = pb.LAST_RM_SEEN_FILE
+        pb.LAST_RM_SEEN_FILE = self._tmp_path
+        self._saved_state = dict(pb._last_rm_seen)
+        pb._last_rm_seen.clear()
+
+    def tearDown(self):
+        pb.LAST_RM_SEEN_FILE = self._orig_path
+        pb._last_rm_seen.clear()
+        pb._last_rm_seen.update(self._saved_state)
+        self._tmpdir.cleanup()
+
+    def test_load_returns_empty_when_file_missing(self):
+        # Fresh deploy: no cache file exists yet.
+        self.assertFalse(self._tmp_path.exists())
+        self.assertEqual(pb._load_last_rm_seen(), {})
+
+    def test_save_then_load_roundtrip(self):
+        pb._last_rm_seen["KAUS"] = ("2026-05-03", 46.4)
+        pb._last_rm_seen["KLAX"] = ("2026-05-03", 59.0)
+        pb._save_last_rm_seen()
+        self.assertTrue(self._tmp_path.exists())
+        loaded = pb._load_last_rm_seen()
+        self.assertEqual(loaded["KAUS"], ("2026-05-03", 46.4))
+        self.assertEqual(loaded["KLAX"], ("2026-05-03", 59.0))
+
+    def test_load_tolerates_corrupt_json(self):
+        # Truncated/malformed JSON should NOT crash the bot — return {}.
+        self._tmp_path.write_text("{not valid json")
+        self.assertEqual(pb._load_last_rm_seen(), {})
+
+    def test_load_skips_invalid_entries(self):
+        # Mixed valid/invalid entries — keep what parses, drop the rest.
+        import json
+        bad = {
+            "KAUS": ["2026-05-03", 46.4],     # valid
+            "KLAX": [None, 59.0],             # cd is None — skip
+            123:    ["2026-05-03", 59.0],     # numeric key — JSON converts to str, OK
+            "KMSP": "not a list",             # not iterable as 2-tuple
+        }
+        self._tmp_path.write_text(json.dumps(bad))
+        loaded = pb._load_last_rm_seen()
+        self.assertIn("KAUS", loaded)
+        self.assertEqual(loaded["KAUS"], ("2026-05-03", 46.4))
+        self.assertNotIn("KLAX", loaded)
+        self.assertNotIn("KMSP", loaded)
+
+    def test_check_new_low_alerts_persists_baseline_on_first_sighting(self):
+        # Mock the dependencies _check_new_low_alerts uses.
+        orig_get_rm = pb.get_running_min
+        orig_cd = pb._climate_date_nws
+        orig_discord = pb.discord_send
+        try:
+            rm_map = {info["station"]: 50.0 for _, info in pb.CITIES.items()}
+            pb.get_running_min = lambda st, cd: rm_map.get(st)
+            pb._climate_date_nws = lambda tz, now_utc=None: "2026-05-03"
+            pb.discord_send = lambda msg: None
+            pb._check_new_low_alerts()
+            # File should now exist with all 20 stations recorded.
+            self.assertTrue(self._tmp_path.exists())
+            loaded = pb._load_last_rm_seen()
+            self.assertEqual(len(loaded), 20)
+            self.assertEqual(loaded["KAUS"], ("2026-05-03", 50.0))
+        finally:
+            pb.get_running_min = orig_get_rm
+            pb._climate_date_nws = orig_cd
+            pb.discord_send = orig_discord
+
+    def test_restart_simulation_persisted_baseline_blocks_silent_corruption(self):
+        # The bug we're guarding against: corrupt upstream rm (27.14°F) is
+        # written to obs db; bot restarts; without persistence, the first
+        # cycle would treat 27.14 as the baseline and never alert. With
+        # persistence, the prior baseline (44.6) is reloaded and the drop
+        # to 27.14 fires the alert.
+        pb._last_rm_seen["KMDW"] = ("2026-05-03", 44.6)
+        pb._save_last_rm_seen()
+        # Simulate restart — clear in-memory state and reload from disk.
+        pb._last_rm_seen.clear()
+        pb._last_rm_seen.update(pb._load_last_rm_seen())
+        self.assertEqual(pb._last_rm_seen["KMDW"], ("2026-05-03", 44.6))
+        # Now upstream injects corrupt 27.14 → alert MUST fire on next check.
+        msgs: list[str] = []
+        orig_get_rm = pb.get_running_min
+        orig_cd = pb._climate_date_nws
+        orig_discord = pb.discord_send
+        try:
+            rm_map = {info["station"]: 50.0 for _, info in pb.CITIES.items()}
+            rm_map["KMDW"] = 27.14  # corrupt
+            pb.get_running_min = lambda st, cd: rm_map.get(st)
+            pb._climate_date_nws = lambda tz, now_utc=None: "2026-05-03"
+            pb.discord_send = lambda msg: msgs.append(msg)
+            pb._check_new_low_alerts()
+            kmdw_msgs = [m for m in msgs if "KMDW" in m]
+            self.assertEqual(len(kmdw_msgs), 1, f"expected 1 KMDW alert, got {len(kmdw_msgs)}: {msgs}")
+            self.assertIn("44.6°F", kmdw_msgs[0])
+            self.assertIn("27.1°F", kmdw_msgs[0])
+        finally:
+            pb.get_running_min = orig_get_rm
+            pb._climate_date_nws = orig_cd
+            pb.discord_send = orig_discord
 
 
 class TestRunningLowSummary(unittest.TestCase):
