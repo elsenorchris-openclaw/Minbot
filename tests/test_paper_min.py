@@ -5316,5 +5316,100 @@ class TestYesTailMaxBetCap(unittest.TestCase):
                          "MAX_BET_BUY_YES_TAIL_USD was renamed to MAX_BET_BUY_YES_USD")
 
 
+class TestNbpStaleAlertCycleAware(unittest.TestCase):
+    """2026-05-04: `_nbp_alert_overdue` replaces flat `age_h > 3.0` check
+    that fired halfway through every normal 6h NBP inter-cycle gap. Alert
+    must now fire only when the next cycle is past its expected landing
+    time (cycle_dt + 6h + publish_latency + 30min grace). Falls back to
+    `age_h > 6.0` when cycle_dt is unknown."""
+
+    def setUp(self):
+        # Patch datetime.now used inside _nbp_alert_overdue. The function
+        # is in the pb namespace and reads `datetime.now(timezone.utc)`,
+        # so we replace pb.datetime with a class whose .now() returns the
+        # frozen value while preserving fromisoformat / timedelta.
+        from datetime import datetime as real_dt, timezone as real_tz
+        self._real_dt = real_dt
+        self._real_tz = real_tz
+        self._frozen = None
+        outer = self
+        class _FrozenDateTime:
+            @staticmethod
+            def now(tz=None):
+                if outer._frozen is None:
+                    return outer._real_dt.now(tz)
+                return outer._frozen
+            @staticmethod
+            def fromisoformat(s):
+                return outer._real_dt.fromisoformat(s)
+        self._orig_pb_datetime = pb.datetime
+        pb.datetime = _FrozenDateTime
+
+    def tearDown(self):
+        pb.datetime = self._orig_pb_datetime
+
+    def _freeze(self, year, month, day, hour, minute=0):
+        self._frozen = self._real_dt(year, month, day, hour, minute,
+                                     tzinfo=self._real_tz.utc)
+
+    def test_no_alert_during_normal_cycle_gap(self):
+        # Cycle 01z fetched at 02:10 UTC, now is 06:00 UTC. Next cycle
+        # (07z) lands ~08:10 UTC; cache is 4h old but next cycle hasn't
+        # been published yet — this was the false-positive case.
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        self._freeze(2026, 5, 4, 6, 0)
+        self.assertFalse(pb._nbp_alert_overdue(cycle_dt, age_h=4.0),
+                         "must NOT alert mid-cycle when next cycle hasn't published yet")
+
+    def test_no_alert_at_just_before_expected_landing(self):
+        # cycle_dt + 6h + 70min publish = 08:10 UTC. +30min grace = 08:40.
+        # At 08:39 UTC we should still be quiet (give NOAA every chance).
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        self._freeze(2026, 5, 4, 8, 39)
+        self.assertFalse(pb._nbp_alert_overdue(cycle_dt, age_h=6.5))
+
+    def test_alert_when_next_cycle_overdue(self):
+        # 09:00 UTC > 08:40 UTC expected landing → alert.
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        self._freeze(2026, 5, 4, 9, 0)
+        self.assertTrue(pb._nbp_alert_overdue(cycle_dt, age_h=7.0),
+                        "must alert when next cycle is past expected landing time")
+
+    def test_alert_well_past_expected_landing(self):
+        # Two hours past expected — definite failure mode.
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        self._freeze(2026, 5, 4, 10, 30)
+        self.assertTrue(pb._nbp_alert_overdue(cycle_dt, age_h=8.5))
+
+    def test_no_alert_just_after_fetch(self):
+        # cycle_dt + 6h + 100min = 08:40. At 02:30 UTC (cache age 0.3h)
+        # we are nowhere near the threshold.
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        self._freeze(2026, 5, 4, 2, 30)
+        self.assertFalse(pb._nbp_alert_overdue(cycle_dt, age_h=0.3))
+
+    def test_unknown_cycle_dt_falls_back_to_6h_threshold(self):
+        # Cold start / schema migration: cycle_dt is None. Use plain age_h
+        # threshold of 6.0h. 5h does NOT alert, 6.5h does.
+        self.assertFalse(pb._nbp_alert_overdue(None, age_h=5.0))
+        self.assertTrue(pb._nbp_alert_overdue(None, age_h=6.5))
+        # Boundary: exactly 6.0 returns False (use strict >).
+        self.assertFalse(pb._nbp_alert_overdue(None, age_h=6.0))
+
+    def test_threshold_uses_NBP_PUBLISH_LATENCY_MIN_constant(self):
+        # If someone bumps NBP_PUBLISH_LATENCY_MIN, the alert threshold
+        # should track. Verify the boundary moves when we monkey-patch.
+        cycle_dt = self._real_dt(2026, 5, 4, 1, 0, tzinfo=self._real_tz.utc)
+        orig = pb.NBP_PUBLISH_LATENCY_MIN
+        try:
+            pb.NBP_PUBLISH_LATENCY_MIN = 0  # zero latency → threshold = cycle+6h+30m = 07:30
+            self._freeze(2026, 5, 4, 7, 31)
+            self.assertTrue(pb._nbp_alert_overdue(cycle_dt, age_h=6.5))
+            self._freeze(2026, 5, 4, 7, 29)
+            self.assertFalse(pb._nbp_alert_overdue(cycle_dt, age_h=6.4))
+        finally:
+            pb.NBP_PUBLISH_LATENCY_MIN = orig
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

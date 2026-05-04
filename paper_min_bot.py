@@ -1922,10 +1922,36 @@ def _stale_cache_alert(source: str, series: str, age_s: float,
     discord_send(msg)
 
 
+def _nbp_alert_overdue(cycle_dt: Optional[datetime], age_h: float) -> bool:
+    """Return True when NBP cache is stale beyond the natural cycle gap.
+
+    NBP publishes every 6h (01/07/13/19 UTC) with ~`NBP_PUBLISH_LATENCY_MIN`
+    publish latency. Our HEAD-poll detects new cycles within seconds. So
+    cache age crossing `cycle_dt + 6h + publish_latency + 30min grace`
+    means we missed the next cycle — a real refresh failure worth pinging.
+
+    Pre-2026-05-04 this was a flat `age_h > 3.0` check, which fired
+    halfway through every normal 6h inter-cycle gap (false positive every
+    ~6h). The cycle-aware threshold sits between ~7h30m and ~7h40m post
+    last-cycle, well before the 8h hard-stale block.
+
+    Falls back to `age_h > 6.0` when `cycle_dt` is unknown (cold start
+    or schema migration), preserving alerting in the absence of cycle
+    metadata."""
+    if cycle_dt is None:
+        return age_h > 6.0
+    expected_next_landed = cycle_dt + timedelta(
+        hours=6, minutes=NBP_PUBLISH_LATENCY_MIN + 30
+    )
+    return datetime.now(timezone.utc) > expected_next_landed
+
+
 def _nbp_staleness_alert(age_h: float) -> None:
-    """Fire a rate-limited Discord alert when NBP cache is meaningfully stale
-    (age_h > 3.0 — past the point where HEAD-poll refresh should have caught
-    a new cycle). Single global key — NBP cache is one shared cycle, not
+    """Fire a rate-limited Discord alert when NBP cache is meaningfully stale.
+    Caller must have already determined the cache is overdue (see
+    `_nbp_alert_overdue` — cycle-aware: fires only after the next NBP cycle
+    should have been published + ingested, ~7h40m after the cached cycle's
+    nominal hour). Single global key — NBP cache is one shared cycle, not
     per-series."""
     key = "stale:NBP:cache"
     now = time.time()
@@ -1936,10 +1962,10 @@ def _nbp_staleness_alert(age_h: float) -> None:
     msg = (
         f":warning: **STALE CACHE FALLBACK** `NBP` — "
         f"cache age={age_h:.1f}h "
-        f"(HEAD-poll refresh should land sub-2h post-cycle; >3h implies "
+        f"(next cycle overdue past publish-latency + grace — implies "
         f"S3/parse failure). σ inflated. Throttled 30m."
     )
-    log(f"  [stale-cache] NBP cache age={age_h:.1f}h (>3h — refresh likely failing)", "warn")
+    log(f"  [stale-cache] NBP cache age={age_h:.1f}h (next cycle overdue — refresh likely failing)", "warn")
     discord_send(msg)
 
 
@@ -2653,15 +2679,19 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         if mu_source in ("nbp", "hrrr_d1_override", "nbp_d0_override"):
             with _nbp_cache_lock:
                 _ts = _nbp_cache_ts
+                _cdt = _nbp_cache_cycle_dt
             if _ts > 0:
                 age_h = (time.time() - _ts) / 3600.0
                 if age_h > 1.0:
                     stale_mult = min(1.30, 1.0 + 0.05 * (age_h - 1.0))
                     sigma = sigma * stale_mult
-                    # 2026-04-30: alert raised from >1h to >3h. With HEAD-poll
-                    # refresh, fresh cycle lands sub-2h after publish; >3h
-                    # implies a real S3/parse failure worth pinging.
-                    if age_h > 3.0:
+                    # 2026-05-04: cycle-aware alert. Old `age_h > 3.0` fired
+                    # halfway through every normal 6h NBP inter-cycle gap,
+                    # producing one false positive every ~6h. Now we alert
+                    # only when `_nbp_alert_overdue` says the next cycle is
+                    # past its expected landing time (cycle_dt + 6h + publish
+                    # latency + 30min grace).
+                    if _nbp_alert_overdue(_cdt, age_h):
                         _nbp_staleness_alert(age_h)
         # Per-station σ inflation (2026-04-29). Counters NBP forecasts that
         # are systematically too narrow at specific stations.

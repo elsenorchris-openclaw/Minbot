@@ -3,7 +3,21 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-03 late evening) — persist `_last_rm_seen` across restarts
+## Latest change (2026-05-04 early morning) — NBP staleness alert is now cycle-aware
+
+`_nbp_staleness_alert` had a flat `age_h > 3.0` trigger that fired halfway through every normal 6h NBP inter-cycle gap. NBP publishes 01/07/13/19 UTC with ~70 min publish latency, so between cycles the cache is correctly 4-7h old; the old threshold produced one false-positive Discord ping every ~6h regardless of whether the HEAD-poll was actually missing publications.
+
+**Fix:** new `_nbp_alert_overdue(cycle_dt, age_h)` helper. Alert fires only when `now > cycle_dt + 6h + NBP_PUBLISH_LATENCY_MIN + 30min grace` — i.e., when the next cycle is past its expected landing time (~7h40m post the cached cycle's nominal hour). Falls back to plain `age_h > 6.0` when `cycle_dt` is unknown (cold start). The `NBP_HARD_STALE_SEC = 8h` block remains as the final safety net.
+
+**Why now:** repeated `:warning: STALE CACHE FALLBACK NBP — cache age=4.0h ...` Discord pings on 2026-05-04 between the 01z fetch (02:10 UTC) and the next-expected 07z cycle (~08:10 UTC). Confirmed not a real failure: `https://noaa-nbm-grib2-pds.s3.amazonaws.com/blend.20260504/07/text/blend_nbptx.t07z` returned 404 at the time of the alert — NOAA simply hadn't published yet.
+
+**Tests added: 7** in `TestNbpStaleAlertCycleAware` (`tests/test_paper_min.py`) covering normal-gap quiet behavior, exact-landing-boundary behavior, alert-when-overdue, cold-start fallback, and the `NBP_PUBLISH_LATENCY_MIN` constant being respected. Full suite: 364 paper_min tests + 18 om_dynamic_ttl tests pass; zero regressions.
+
+**No behavior change to trading.** σ inflation logic for stale NBP is unchanged (still ramps `+5%/h after 1h, capped at +30% at 7h`). Only the Discord alert threshold moved.
+
+---
+
+## Previous change (2026-05-03 late evening) — persist `_last_rm_seen` across restarts
 
 `_check_new_low_alerts()` polls obs-pipeline's `running_min` once per scan and emits a Discord `❄️ NEW LOW` when any of the 20 stations' rm steps down. State was an in-memory dict only, so any restart wiped the baseline. The first cycle after a restart silently established a fresh baseline at whatever rm was current — including any corrupt upstream value. (The 2026-05-03 obs-pipeline `PK WND` false-match wrote 27.14°F to KMDW running_min; without persistence, a restart in that window would have absorbed 27.14 as the new baseline and never alerted on the regression.)
 
