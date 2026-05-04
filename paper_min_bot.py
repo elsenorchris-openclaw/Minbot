@@ -412,6 +412,15 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 HARD_STOP_BRACKET_LOSS_PCT = 999.0  # disabled (was 0.80) — sentinel
 HARD_STOP_TAIL_LOSS_PCT = 999.0     # disabled (was 0.70) — sentinel
 
+# 2026-05-04: very-loose value-dead market stop. Hard-stop is disabled, but
+# a position trading at ≤1c is essentially worthless (market is ~99% certain
+# the other side wins). This is the final safety net so deep-out-of-money
+# positions don't tie up capital indefinitely. Obs-winner override fires
+# FIRST and blocks this exit on positions the obs still confirms — so genuine
+# recovery cases (e.g. min-temp BUY_NO with rm < floor − buffer) hold even
+# when bid is 1c.
+MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-winner override
+
 # ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
 # V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").
 # Removed after all-gate audit on min_bot historical candidates: 2/2
@@ -432,11 +441,14 @@ HARD_STOP_TAIL_LOSS_PCT = 999.0     # disabled (was 0.70) — sentinel
 # has running_min). Bypassed when _obs_confirmed_alive.
 H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
-# 2026-05-03: laddered ask-chase on first-entry BUY_NO partial fills. After
-# the initial maker order fills < intended count, walk the ask up by 1c each
+# 2026-05-03: laddered ask-chase on first-entry partial fills. After the
+# initial maker order fills < intended count, walk the ask up by 1c each
 # retry until edge < MIN_EDGE or remainder filled. Caps execution time +
 # slippage compounding. See _should_enter ladder block below.
-LADDER_MAX_RETRIES = 3
+# 2026-05-04: bumped 3 → 5 (PHX/AUS/SEA orderbooks too thin for 3 walks
+# to clear meaningful intended counts) AND extended to BUY_YES (was BUY_NO
+# only). BUY_YES ladder uses yes_ask + MAX_BET_BUY_YES_USD ($5) cap.
+LADDER_MAX_RETRIES = 5
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 # 2026-05-02: BANKROLL_REF_USD now drives live Kelly sizing (was: documentation-
 # only). Chris bumped to $500 because actual Kalshi cash had drifted to ~$2-50
@@ -3950,44 +3962,57 @@ def execute_opportunity(opp: dict) -> bool:
     actual_cost = filled * price
 
     # 2026-05-03 LADDER CHASE — close the under-fill gap on thin Kalshi books.
-    # First-entry BUY_NO partial fills at the no_ask were leaving 80%+ of intended
-    # Kelly orphaned (PHX-MAY04 1/34, AUS-MAY03 2/26, SFO-MAY03 10/49). Walk the
-    # ask up by 1c at a time, re-checking edge at the new price. Stop when:
+    # First-entry partial fills at the ask were leaving 80%+ of intended Kelly
+    # orphaned (PHX-MAY04 1/34, AUS-MAY03 2/26, SFO-MAY03 10/49). Walk the ask
+    # up by 1c at a time, re-checking edge at the new price. Stop when:
     #   - remainder filled
     #   - new edge below MIN_EDGE (Chris's gate — preserve the existing entry bar)
-    #   - cumulative cost would breach MAX_BET_USD
+    #   - cumulative cost would breach the action's per-trade cap
     #   - LADDER_MAX_RETRIES hit (latency cap)
-    # Restricted to first-entry BUY_NO. BUY_YES has $5 per-trade cap so chase
-    # budget is small. Add-ons already iterate via the existing scan loop.
+    # 2026-05-04: extended from BUY_NO-only to BUY_YES too. BUY_YES uses the
+    # yes_ask side and the $5 MAX_BET_BUY_YES_USD cap; chase budget is small
+    # but the orphan rate on min-temp BUY_YES (e.g. AUS-MAY04 1/9) was the
+    # same structural issue. Add-ons still iterate via the existing scan loop.
     if (filled > 0 and filled < count and not is_addon
-            and action == "BUY_NO"
+            and action in ("BUY_NO", "BUY_YES")
             and edge >= MIN_EDGE):
         mp_yes = float(opp.get("model_prob") or 0)
         last_ask_c = price_cents
         cumulative_filled = filled
         cumulative_cost = actual_cost
+        # Per-action ladder config: which side's ask to chase, which cap to
+        # respect, and how to recompute edge at the new price.
+        if action == "BUY_NO":
+            _ask_field = "no_ask_dollars"
+            _max_cap_usd = MAX_BET_USD
+        else:  # BUY_YES
+            _ask_field = "yes_ask_dollars"
+            _max_cap_usd = MAX_BET_BUY_YES_USD
         for _retry in range(LADDER_MAX_RETRIES):
             remainder = count - cumulative_filled
             if remainder <= 0:
                 break
             try:
                 _md = kalshi_get(f"/trade-api/v2/markets/{ticker}").get("market", {})
-                _new_ask_c = int(round(float(_md.get("no_ask_dollars", 0)) * 100))
+                _new_ask_c = int(round(float(_md.get(_ask_field, 0)) * 100))
             except Exception as _le:
                 log(f"  ladder fetch failed on {ticker}: {type(_le).__name__}", "warn")
                 break
             if _new_ask_c <= last_ask_c:
                 _new_ask_c = last_ask_c + 1  # ensure progress against stale quote
             _new_price = _new_ask_c / 100.0
-            _new_edge = 1.0 - mp_yes - _new_price
+            if action == "BUY_NO":
+                _new_edge = 1.0 - mp_yes - _new_price
+            else:  # BUY_YES
+                _new_edge = mp_yes - _new_price
             if _new_edge < MIN_EDGE:
                 log(f"  ladder stop {ticker}: new_edge={_new_edge:.2%} < MIN_EDGE "
                     f"at {_new_ask_c}c (filled {cumulative_filled}/{count})")
                 break
-            _budget_left = MAX_BET_USD - cumulative_cost
+            _budget_left = _max_cap_usd - cumulative_cost
             if _budget_left < _new_price:
-                log(f"  ladder stop {ticker}: at MAX_BET_USD cap "
-                    f"(cum=${cumulative_cost:.2f}, ask {_new_ask_c}c)")
+                log(f"  ladder stop {ticker}: at {action} cap "
+                    f"(cum=${cumulative_cost:.2f}, ask {_new_ask_c}c, cap=${_max_cap_usd:.2f})")
                 break
             _max_count = min(remainder, int(_budget_left / _new_price))
             if _max_count < 1:
@@ -4416,7 +4441,24 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                 log(f"  HOLD {ticker}: obs-winning check raised {type(_winx).__name__}: {_winx}; "
                     f"falling through to MTM stop", "warn")
 
-        # Hard stop.
+        # 2026-05-04: very-loose value-dead market stop. Hard-stop (below) is
+        # sentinel-disabled; this is a final safety net that fires only when
+        # the position is essentially worthless. Bid ≤ 1c means market
+        # consensus is ~99% the other side wins. The position can still
+        # technically recover (especially min-temp BUY_NO where rm only
+        # decreases), but the obs-winner override above already protects
+        # genuine recovery cases — if obs still confirms a win at this
+        # price, we hold; if not, we cut and free the capital.
+        if int(current_bid_c) <= MARKET_STOP_BID_CEIL_C:
+            log(f"  MARKET_STOP trigger {ticker}: bid={int(current_bid_c)}c "
+                f"≤ {MARKET_STOP_BID_CEIL_C}c (value-dead, no obs-winner override)")
+            if _execute_exit(ticker, pos, sell_side, int(current_bid_c), "market_stop"):
+                n_exits += 1
+            continue
+
+        # Hard stop. Sentinel-disabled (HARD_STOP_*_LOSS_PCT = 999.0 since
+        # 2026-05-04, see constant comment); the loss_pct >= 999 comparison
+        # is impossible. Code retained for ease of re-enable.
         floor = pos.get("floor")
         cap = pos.get("cap")
         is_tail = (floor is None) != (cap is None)  # exactly one bound = tail

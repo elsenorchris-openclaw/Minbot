@@ -1717,16 +1717,17 @@ class TestPositionExitLogic(unittest.TestCase):
         self.assertEqual(len(self._captured_orders), 0)
         self.assertEqual(len(self._captured_records), 0)
 
-    def test_hard_stop_disabled_at_99pct_loss_on_bracket(self):
-        """Even near-total MTM loss must not exit on hard_stop. Lets the
-        position ride to settlement; bankroll/sizing already bound the
-        downside per σ-aware Kelly."""
+    def test_hard_stop_disabled_at_96pct_loss_on_bracket(self):
+        """Near-total MTM loss above the 1c MARKET_STOP threshold must not
+        exit on hard_stop. (At bid=1c the loose MARKET_STOP would fire —
+        see TestMarketStopValueDead — so we test at 2c here to isolate
+        the hard_stop disable.)"""
         pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
                              floor=45.0, cap=46.0)
         with pb._positions_lock:
             pb._open_positions[pos["market_ticker"]] = pos
         markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
-                                          "yes_bid": 99, "no_bid": 1}}  # 98% loss
+                                          "yes_bid": 98, "no_bid": 2}}  # 96% loss, bid above MARKET_STOP
         n = pb.check_open_positions_for_exit(markets)
         self.assertEqual(n, 0)
 
@@ -1816,6 +1817,173 @@ class TestPositionExitLogic(unittest.TestCase):
             pb._open_positions[pos["market_ticker"]] = pos
         n = pb.check_open_positions_for_exit({})
         self.assertEqual(n, 0)
+
+
+class TestMarketStopValueDead(unittest.TestCase):
+    """2026-05-04: MARKET_STOP_BID_CEIL_C = 1. Hard-stop is disabled, but
+    a position trading at ≤1c is essentially worthless — final safety net
+    so deep-out-of-money positions don't tie up capital indefinitely.
+    Obs-winner override fires FIRST and protects positions where rm
+    confirms a recovery path."""
+
+    def setUp(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        # Mock the same network/storage seams TestPositionExitLogic mocks
+        self._orig_place = pb.place_kalshi_sell_order
+        self._orig_wait = pb.wait_for_fill
+        self._orig_save = pb._save_positions
+        self._orig_send = pb.discord_send
+        self._orig_append = pb._append_jsonl
+        self._orig_get_rm = pb.get_running_min
+        self._captured_orders: list[tuple] = []
+        self._captured_records: list[dict] = []
+        pb.place_kalshi_sell_order = lambda ticker, side, count, price_cents: (
+            self._captured_orders.append((ticker, side, count, price_cents)) or "FAKE_OID"
+        )
+        pb.wait_for_fill = lambda oid, expected, timeout: ("filled", expected)
+        pb._save_positions = lambda: None
+        pb.discord_send = lambda msg: None
+        pb._append_jsonl = lambda path, rec: self._captured_records.append(rec)
+        # No obs by default — the obs-winner override test re-points this
+        pb.get_running_min = lambda st, cd: None
+
+    def tearDown(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        pb.place_kalshi_sell_order = self._orig_place
+        pb.wait_for_fill = self._orig_wait
+        pb._save_positions = self._orig_save
+        pb.discord_send = self._orig_send
+        pb._append_jsonl = self._orig_append
+        pb.get_running_min = self._orig_get_rm
+
+    def _make_pos(self, ticker, action, entry_price, count, **overrides):
+        base = {
+            "kind": "entry",
+            "market_ticker": ticker,
+            "action": action,
+            "entry_price": entry_price,
+            "count": count,
+            "cost": entry_price * count,
+            "station": "KNYC", "date_str": "2026-04-27", "label": "NYC",
+            "tz": "America/New_York",
+        }
+        base.update(overrides)
+        return base
+
+    def test_market_stop_fires_at_1c_bid_buy_no(self):
+        """BUY_NO position with no_bid=1c (essentially worthless) must exit
+        on MARKET_STOP. rm=47 is above bracket — NOT a NO winner — so the
+        obs-winner override doesn't fire and MARKET_STOP gets to run."""
+        pb.get_running_min = lambda st, cd: 47.0  # in-bracket-or-above, not a NO winner
+        pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
+                             floor=45.0, cap=46.0)
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 99, "no_bid": 1}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 1)
+        self.assertEqual(len(self._captured_records), 1)
+        self.assertEqual(self._captured_records[0]["reason"], "market_stop")
+
+    def test_market_stop_fires_at_1c_bid_buy_yes(self):
+        """BUY_YES T-low with yes_bid=1c also exits on MARKET_STOP. rm above
+        cap means T-low YES has NOT won (cap=44.5, rm=50 > cap), so override
+        doesn't fire and MARKET_STOP runs."""
+        pb.get_running_min = lambda st, cd: 50.0  # above cap, T-low YES not winning
+        pos = self._make_pos("KXLOWTNYC-26APR27-T44", "BUY_YES", 0.20, 5,
+                             floor=None, cap=44.5)
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 1, "no_bid": 99}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 1)
+        self.assertEqual(self._captured_records[0]["reason"], "market_stop")
+
+    def test_market_stop_does_not_fire_at_2c_bid(self):
+        """Just above the threshold — must not exit. Confirms strict ≤1c
+        gate (wider would fire on legitimate noise)."""
+        pb.get_running_min = lambda st, cd: 47.0
+        pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
+                             floor=45.0, cap=46.0)
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 98, "no_bid": 2}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 0)
+
+    def test_market_stop_respects_obs_winner_override(self):
+        """rm confirms BUY_NO winner (rm < floor − 1) → must hold even at
+        1c bid. Recovery is locked in by obs; market price is wrong."""
+        pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
+                             floor=45.0, cap=46.0)
+        with pb._positions_lock:
+            pb._open_positions[pos["market_ticker"]] = pos
+        # Override the rm fetcher to return a winning value for this test
+        pb.get_running_min = lambda st, cd: 40.0  # ≤ floor-1 → BUY_NO winner
+        markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
+                                          "yes_bid": 99, "no_bid": 1}}
+        n = pb.check_open_positions_for_exit(markets)
+        self.assertEqual(n, 0,
+                         "obs-winner override must block MARKET_STOP "
+                         "(rm-confirmed winners ride to settlement)")
+
+    def test_constant_is_one_cent(self):
+        """Pin the threshold at 1¢. Any wider value would be a different
+        change requiring its own backtest."""
+        self.assertEqual(pb.MARKET_STOP_BID_CEIL_C, 1)
+
+
+class TestLadderConfig(unittest.TestCase):
+    """2026-05-04: LADDER_MAX_RETRIES bumped 3 → 5; ladder path extended
+    to BUY_YES (was BUY_NO only). Source-string + constant tests — full
+    ladder execution requires HTTP mocks and is covered indirectly by
+    integration tests in TestAddOnPath."""
+
+    def test_ladder_max_retries_is_5(self):
+        self.assertEqual(pb.LADDER_MAX_RETRIES, 5,
+                         "PHX/AUS/SEA orderbook depth needed > 3 walks "
+                         "to clear meaningful intended counts")
+
+    def test_ladder_action_gate_accepts_buy_no_and_buy_yes(self):
+        """Source-string check: the ladder gate must accept both action types."""
+        import os
+        path = os.path.dirname(os.path.abspath(pb.__file__))
+        with open(os.path.join(path, "paper_min_bot.py")) as f:
+            src = f.read()
+        # Must include both action strings in the gate
+        idx = src.find("LADDER CHASE")
+        self.assertGreater(idx, 0, "ladder block must exist")
+        block = src[idx:idx + 3000]
+        self.assertIn('action in ("BUY_NO", "BUY_YES")', block,
+                      "ladder gate must accept both BUY_NO and BUY_YES")
+
+    def test_ladder_uses_action_specific_ask_field(self):
+        """Source check: BUY_NO chases no_ask, BUY_YES chases yes_ask."""
+        import os
+        path = os.path.dirname(os.path.abspath(pb.__file__))
+        with open(os.path.join(path, "paper_min_bot.py")) as f:
+            src = f.read()
+        idx = src.find("LADDER CHASE")
+        block = src[idx:idx + 3000]
+        self.assertIn('"no_ask_dollars"', block, "BUY_NO ladder must use no_ask_dollars")
+        self.assertIn('"yes_ask_dollars"', block, "BUY_YES ladder must use yes_ask_dollars")
+
+    def test_ladder_uses_action_specific_cap(self):
+        """Source check: BUY_NO uses MAX_BET_USD ($30), BUY_YES uses
+        MAX_BET_BUY_YES_USD ($5)."""
+        import os
+        path = os.path.dirname(os.path.abspath(pb.__file__))
+        with open(os.path.join(path, "paper_min_bot.py")) as f:
+            src = f.read()
+        idx = src.find("LADDER CHASE")
+        block = src[idx:idx + 3000]
+        self.assertIn("_max_cap_usd = MAX_BET_USD", block)
+        self.assertIn("_max_cap_usd = MAX_BET_BUY_YES_USD", block)
 
 
 class TestQuickWinGates(unittest.TestCase):

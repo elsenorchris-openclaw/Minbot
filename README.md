@@ -3,7 +3,30 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-04 morning) — MTM hard-stop DISABLED (sentinel)
+## Latest change (2026-05-04 afternoon) — ladder bumped to 5 + extended to BUY_YES + value-dead MARKET_STOP
+
+Three companion changes addressing thin-orderbook fill problems and adding a final safety net after the morning's hard-stop disable.
+
+**1. `LADDER_MAX_RETRIES`: 3 → 5.** PHX/AUS/SEA orderbooks were too thin for 3 walks to clear meaningful intended counts. Real audit on today's open positions: PHX-MAY04-B64.5 filled 1/34 (3%), SEA-MAY04-B53.5 filled 10/62 (16%), AUS-MAY04-B55.5 filled 1/9 (11%). Five walks gives the bot more headroom before edge drops below `MIN_EDGE` and ladder gives up.
+
+**2. Ladder extended from BUY_NO-only to BUY_YES.** AUS-MAY04 BUY_YES showed the same 89% orphan rate as BUY_NO cases, but the 2026-05-03 ladder deploy was BUY_NO-only. Now action-aware: BUY_NO chases `no_ask_dollars` against `MAX_BET_USD` ($30) cap with edge `1 − mp_yes − price`; BUY_YES chases `yes_ask_dollars` against `MAX_BET_BUY_YES_USD` ($5) cap with edge `mp_yes − price`. Add-ons still iterate via the existing scan loop, unchanged.
+
+**3. New `MARKET_STOP_BID_CEIL_C = 1`.** Hard-stop is sentinel-disabled; this is the final safety net. When the position's bid (no_bid for BUY_NO, yes_bid for BUY_YES) is ≤ 1¢, market consensus is ~99% the other side wins — the position is essentially worthless. Exits with `reason="market_stop"`. The obs-winner override still fires FIRST and blocks this exit on positions where rm confirms a recovery path (e.g., BUY_NO with rm < floor − 1°F), so genuine recovery cases ride to settlement.
+
+```python
+LADDER_MAX_RETRIES = 5
+MARKET_STOP_BID_CEIL_C = 1   # exit if current bid ≤ 1¢ AND no obs-winner override
+```
+
+**Why MARKET_STOP at 1¢ specifically:** anything wider competes with the philosophy of the morning's hard-stop disable (let positions ride to settlement). 1¢ is the bid floor on Kalshi — a position trading there has essentially no upside ceiling that justifies tying up capital, and the obs-winner override means real recovery cases never see this gate. Re-evaluate threshold after 14d forward audit; widen if survivor-bias data shows positions recovering from 1¢, tighten if 1¢ exits are wrong too often.
+
+**Tests added: 9** in two new classes — `TestMarketStopValueDead` (5: fires at 1c BUY_NO, fires at 1c BUY_YES, no fire at 2c, obs-winner override blocks, constant pin) + `TestLadderConfig` (4: retries=5, action gate accepts both, action-specific ask field, action-specific cap). 5 pre-existing hard-stop tests already updated this morning. Full suite: **374 passed** (was 365, +9 new). Zero regressions.
+
+**Live verification post-deploy:** bot restarted, cycling clean. Forward audit hook: position records will show `_filled_count` vs `_intended_count` per ticker — compare to before-fix orphan rate; expect material improvement on PHX/AUS/SEA-class thin books.
+
+---
+
+## Previous change (2026-05-04 morning) — MTM hard-stop DISABLED (sentinel)
 
 `HARD_STOP_BRACKET_LOSS_PCT` and `HARD_STOP_TAIL_LOSS_PCT` set to 999.0 (sentinel disable, mirrors V1's `SESSION_DRAWDOWN_LIMIT = -9999` pattern from 2026-05-03). Positions now hold to settlement regardless of mid-day MTM.
 
