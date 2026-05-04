@@ -389,8 +389,28 @@ MSG_WORST_CITIES = {                # cities with historical poor MIN calibratio
 MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES territory blocks
 
 # ─── Hard stop on existing positions (V2 port, mid-cycle exit) ────────────
-HARD_STOP_BRACKET_LOSS_PCT = 0.80   # exit if MTM loss ≥ 80% on B-brackets
-HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery payoff)
+# 2026-05-04: DISABLED via sentinel values. Pattern mirrors V1's
+# SESSION_DRAWDOWN_LIMIT = -9999 disable from 2026-05-03.
+#
+# Trigger: KXLOWTMIA-26MAY04-B71.5 BUY_NO hard-stopped at $0.04 with rm=71.6
+# (exit_reason=hard_stop, pnl=-$8.91). Per Chris's call, the MTM-based hard
+# stop has been firing on min-temp BUY_NO positions where rm enters the
+# bracket from above and market price collapses, but the trade can still win
+# if rm continues to drop BELOW floor (only path for low-temp bracket BUY_NO
+# to win once obs touches the bracket). The hard stop locks in losses on
+# trades that the obs evolution can still rescue.
+#
+# Behavior with sentinels: the comparison `loss_pct >= 999.0` is impossible
+# (loss_pct is bounded by entry_price → 1.0 max), so the hard-stop branch
+# at line ~4404 is dead code without removing it. _check_obs_confirmed_loser
+# and _check_position_obs_winning still fire — those use rm vs floor/cap, not
+# MTM. Trailing TP / settlement / time-based exits unchanged.
+#
+# Re-enable: revert both to their prior values (0.80 / 0.70). Don't try to
+# tune mid-range — full disable is the simplest test of the hypothesis that
+# settlement-rides outperform MTM-cut over a 14-day forward audit.
+HARD_STOP_BRACKET_LOSS_PCT = 999.0  # disabled (was 0.80) — sentinel
+HARD_STOP_TAIL_LOSS_PCT = 999.0     # disabled (was 0.70) — sentinel
 
 # ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
 # V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").

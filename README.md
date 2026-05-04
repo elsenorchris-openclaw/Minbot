@@ -3,7 +3,27 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-04 early morning) — NBP staleness alert is now cycle-aware
+## Latest change (2026-05-04 morning) — MTM hard-stop DISABLED (sentinel)
+
+`HARD_STOP_BRACKET_LOSS_PCT` and `HARD_STOP_TAIL_LOSS_PCT` set to 999.0 (sentinel disable, mirrors V1's `SESSION_DRAWDOWN_LIMIT = -9999` pattern from 2026-05-03). Positions now hold to settlement regardless of mid-day MTM.
+
+**Trigger:** `KXLOWTMIA-26MAY04-B71.5` BUY_NO hard-stopped today at $0.04 with rm=71.6 (PNL −$8.91). Per Chris's call, the position would have won if held; the MTM-cut surrendered a trade the obs evolution could still rescue. Pattern: when min-temp BUY_NO has rm crossing into the bracket, market price collapses → hard-stop fires → bot exits → but `running_min` only decreases (it's a daily min), so the trade can still win if rm continues dropping below floor. The hard-stop short-circuits that recovery path.
+
+**What still works:**
+- `_check_obs_confirmed_loser` (entry-side blocker for `rm > cap + 1`) unchanged
+- `_check_position_obs_winning` override unchanged (positions where obs confirms a guaranteed win still hold without ambiguity)
+- Trailing TP / settlement / time-based exits unchanged
+- σ-aware Kelly sizing unchanged — bounds the per-trade downside
+
+**Behavior with sentinels:** `loss_pct >= 999.0` is impossible (loss_pct ≤ 1.0 since price ∈ [0, 1]), so the hard-stop branch in `check_open_positions_for_exit` becomes dead code without removing the surrounding logic. Re-enable: revert both constants to their prior values (0.80 / 0.70).
+
+**Tests updated:** 5 prior tests that asserted "hard-stop fires on X" flipped to "hold to settlement"; new `test_hard_stop_constants_are_sentinel_values` pins the disable. Full min_bot suite: **365 passed** (was 364, +1 sentinel test). Zero regressions.
+
+**Forward audit:** track P&L over a 14-day forward window. If the disable produces net-negative results vs prior 80%/70% MTM cut on the same trade pool, re-enable with a tightened threshold (e.g., 95%). Comparison data: pre-disable hard_stop trades + their settlement outcomes are in `data/trades_*.jsonl` with `reason=hard_stop`.
+
+---
+
+## Previous change (2026-05-04 early morning) — NBP staleness alert is now cycle-aware
 
 `_nbp_staleness_alert` had a flat `age_h > 3.0` trigger that fired halfway through every normal 6h NBP inter-cycle gap. NBP publishes 01/07/13/19 UTC with ~70 min publish latency, so between cycles the cache is correctly 4-7h old; the old threshold produced one false-positive Discord ping every ~6h regardless of whether the HEAD-poll was actually missing publications.
 

@@ -1699,53 +1699,55 @@ class TestPositionExitLogic(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_hard_stop_fires_on_bracket_at_80pct_loss(self):
-        """B-bracket position with MTM down 80% → hard stop fires."""
+    def test_hard_stop_disabled_at_80pct_loss_on_bracket(self):
+        """2026-05-04: HARD_STOP_BRACKET_LOSS_PCT sentinel-disabled (999.0).
+        B-bracket position even at 80% MTM loss must NOT exit. Trigger:
+        KXLOWTMIA-26MAY04-B71.5 hard-stopped at $0.04 with rm=71.6 (would
+        have won if held to settlement); per Chris, MTM-cut on min-temp
+        BUY_NO surrenders trades the obs evolution can still rescue."""
         pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
                              floor=45.0, cap=46.0)
         with pb._positions_lock:
             pb._open_positions[pos["market_ticker"]] = pos
-        # Current bid 10c → loss = (50−10)/50 = 80% → exit
+        # Bid 10c → 80% MTM loss → previously fired, now must not
         markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
                                           "yes_bid": 90, "no_bid": 10}}
         n = pb.check_open_positions_for_exit(markets)
-        self.assertEqual(n, 1)
-        self.assertEqual(len(self._captured_orders), 1)
-        ticker, side, count, price_c = self._captured_orders[0]
-        self.assertEqual(side, "no")
-        self.assertEqual(count, 2)
-        self.assertEqual(price_c, 10)
-        # Exit record written
-        self.assertEqual(len(self._captured_records), 1)
-        self.assertEqual(self._captured_records[0]["kind"], "exit")
-        self.assertEqual(self._captured_records[0]["reason"], "hard_stop")
+        self.assertEqual(n, 0, "hard-stop disabled — must hold to settlement")
+        self.assertEqual(len(self._captured_orders), 0)
+        self.assertEqual(len(self._captured_records), 0)
 
-    def test_hard_stop_does_not_fire_at_70pct_loss_on_bracket(self):
-        """B-bracket loss 70% < 80% threshold → no exit."""
+    def test_hard_stop_disabled_at_99pct_loss_on_bracket(self):
+        """Even near-total MTM loss must not exit on hard_stop. Lets the
+        position ride to settlement; bankroll/sizing already bound the
+        downside per σ-aware Kelly."""
         pos = self._make_pos("KXLOWTNYC-26APR27-B45.5", "BUY_NO", 0.50, 2,
                              floor=45.0, cap=46.0)
         with pb._positions_lock:
             pb._open_positions[pos["market_ticker"]] = pos
         markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
-                                          "yes_bid": 85, "no_bid": 15}}
+                                          "yes_bid": 99, "no_bid": 1}}  # 98% loss
         n = pb.check_open_positions_for_exit(markets)
         self.assertEqual(n, 0)
-        self.assertEqual(len(self._captured_orders), 0)
 
-    def test_hard_stop_fires_on_tail_at_70pct_loss(self):
-        """Tail (single-bound) uses tail threshold 70%. Use T-low BUY_YES
-        with cap=44.5 (so real DB rm=44.96 is ABOVE cap-1=43.5 → no winner
-        override → hard-stop path exercises). T-high BUY_YES is now exempt
-        from hard-stop entirely (2026-04-30, see TestHardStopSkipsBuyYesTHigh)."""
+    def test_hard_stop_disabled_at_70pct_loss_on_tail(self):
+        """Tail threshold also sentinel-disabled. T-low BUY_YES at 70% MTM
+        loss must NOT exit (was previous tail threshold)."""
         pos = self._make_pos("KXLOWTNYC-26APR27-T44", "BUY_YES", 0.20, 5,
-                             floor=None, cap=44.5)  # T-low (low ≤ 44)
+                             floor=None, cap=44.5)
         with pb._positions_lock:
             pb._open_positions[pos["market_ticker"]] = pos
-        # Loss = (20 − 6) / 20 = 70% → exit
         markets = {pos["market_ticker"]: {"market_ticker": pos["market_ticker"],
                                           "yes_bid": 6, "no_bid": 94}}
         n = pb.check_open_positions_for_exit(markets)
-        self.assertEqual(n, 1)
+        self.assertEqual(n, 0, "tail hard-stop disabled — must hold to settlement")
+
+    def test_hard_stop_constants_are_sentinel_values(self):
+        """Disable is via sentinel (999.0) so the loss_pct >= threshold
+        comparison is impossible (loss_pct ≤ 1.0). Confirms re-enable path
+        is documented in code (revert to 0.80 / 0.70)."""
+        self.assertGreaterEqual(pb.HARD_STOP_BRACKET_LOSS_PCT, 999.0)
+        self.assertGreaterEqual(pb.HARD_STOP_TAIL_LOSS_PCT, 999.0)
 
     def test_obs_winner_override_blocks_hard_stop(self):
         """Position deeply MTM-loss but rm confirms our side wins → HOLD, no exit."""
@@ -4278,11 +4280,10 @@ class TestHardStopSkipsWithoutObs(unittest.TestCase):
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 0)
 
-    def test_d0_with_obs_hard_stops_normally(self):
-        # cd started, rm available, MTM bad, rm not in winning territory →
-        # hard-stop fires. Use BUY_NO B-bracket (T-high BUY_YES is now
-        # exempt from hard-stop entirely; this test exercises the
-        # rm-available-and-losing path).
+    def test_d0_with_obs_does_not_hard_stop_after_disable(self):
+        # 2026-05-04: HARD_STOP_*_LOSS_PCT sentinel-disabled. Pre-disable,
+        # rm in bracket + 90% MTM loss would have triggered hard_stop.
+        # Now: hold to settlement.
         ticker = "KXLOWTNYC-26APR30-B45.5"
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
@@ -4296,8 +4297,8 @@ class TestHardStopSkipsWithoutObs(unittest.TestCase):
         self._rm_value = 45.2
         market_quotes = {ticker: {"yes_bid": 95, "yes_ask": 97, "no_bid": 3, "no_ask": 5}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 1)
-        self.assertEqual(self._exit_calls[0][3], "hard_stop")
+        self.assertEqual(n, 0, "hard-stop disabled — must hold to settlement")
+        self.assertEqual(len(self._exit_calls), 0)
 
     def test_d0_with_obs_winner_override_holds(self):
         # BUY_YES T-low: cap=53.5, floor=None, rm ≤ cap-1 (52.5) → winner.
@@ -4320,11 +4321,9 @@ class TestHardStopSkipsWithoutObs(unittest.TestCase):
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 0)  # obs-winner override held
 
-    def test_d1_with_db_rm_does_not_blanket_skip(self):
-        # If get_running_min returns a value for any reason, the rm-is-None
-        # gate doesn't protect — but BUY_NO B-bracket (with rm losing) STILL
-        # exercises the hard-stop path correctly. Use BUY_NO B-bracket since
-        # T-high BUY_YES would skip via the new T-high-skip rule.
+    def test_d1_with_db_rm_holds_after_disable(self):
+        # 2026-05-04: hard-stop disabled. Pre-disable, BUY_NO B-bracket with
+        # rm-in-bracket and 90% MTM loss would have hard-stopped; now holds.
         ticker = "KXLOWTNYC-26MAY01-B45.5"
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
@@ -4337,7 +4336,7 @@ class TestHardStopSkipsWithoutObs(unittest.TestCase):
         self._rm_value = 45.2  # in bracket → BUY_NO losing
         market_quotes = {ticker: {"yes_bid": 95, "yes_ask": 97, "no_bid": 3, "no_ask": 5}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 1)
+        self.assertEqual(n, 0, "hard-stop disabled — must hold to settlement")
 
 
 class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
@@ -4382,9 +4381,10 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
         n = pb.check_open_positions_for_exit(market_quotes)
         self.assertEqual(n, 0, "T-high BUY_YES must hold to settlement")
 
-    def test_buy_yes_t_low_still_hard_stops(self):
-        # T-low BUY_YES (cap set, floor None) where obs-winner override
-        # doesn't fire — hard-stop should still work normally.
+    def test_buy_yes_t_low_holds_after_disable(self):
+        # 2026-05-04: hard-stop globally disabled. T-low BUY_YES at MTM
+        # loss now holds to settlement. Pre-disable this test asserted
+        # n==1 (hard_stop fires); flipped to n==0 with the disable.
         ticker = "KXLOWTAUS-26APR30-T48"
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
@@ -4394,14 +4394,13 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
             "floor": None, "cap": 47.5,  # T-low (low ≤ 47)
             "sigma": 2.0, "running_min": None,
         }
-        # rm=60 — well above cap+1, NOT winning, no override.
         self._rm_value = 60.0
         market_quotes = {ticker: {"yes_bid": 3, "yes_ask": 5, "no_bid": 95, "no_ask": 97}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 1, "T-low BUY_YES must still hard-stop on real loss")
+        self.assertEqual(n, 0, "T-low BUY_YES must hold to settlement (hard-stop disabled)")
 
-    def test_buy_no_t_high_still_hard_stops(self):
-        # BUY_NO T-high (floor set, cap None) — hard-stop active for BUY_NO.
+    def test_buy_no_t_high_holds_after_disable(self):
+        # 2026-05-04: hard-stop globally disabled.
         ticker = "KXLOWTLAX-26APR30-T55"
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
@@ -4411,14 +4410,15 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
             "floor": 55.5, "cap": None,  # T-high
             "sigma": 2.5, "running_min": None,
         }
-        # rm=60 — above floor, BUY_NO T-high losing
         self._rm_value = 60.0
         market_quotes = {ticker: {"yes_bid": 95, "yes_ask": 97, "no_bid": 3, "no_ask": 5}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 1, "BUY_NO T-high must still hard-stop")
+        self.assertEqual(n, 0, "BUY_NO T-high must hold to settlement (hard-stop disabled)")
 
-    def test_buy_no_b_bracket_still_hard_stops(self):
-        # BUY_NO B-bracket — hard-stop active.
+    def test_buy_no_b_bracket_holds_after_disable(self):
+        # 2026-05-04: hard-stop globally disabled. The Miami trigger case:
+        # BUY_NO B-bracket with rm inside bracket — pre-disable would have
+        # hard-stopped, now holds to settlement.
         ticker = "KXLOWTLAX-26APR30-B56.5"
         pb._open_positions[ticker] = {
             "kind": "entry", "market_ticker": ticker,
@@ -4428,11 +4428,10 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
             "floor": 56.0, "cap": 57.0,
             "sigma": 2.0, "running_min": None,
         }
-        # rm=56.2 — INSIDE bracket, BUY_NO losing
-        self._rm_value = 56.2
+        self._rm_value = 56.2  # rm inside bracket — would have hard-stopped pre-disable
         market_quotes = {ticker: {"yes_bid": 95, "yes_ask": 97, "no_bid": 3, "no_ask": 5}}
         n = pb.check_open_positions_for_exit(market_quotes)
-        self.assertEqual(n, 1, "BUY_NO B-bracket must still hard-stop")
+        self.assertEqual(n, 0, "BUY_NO B-bracket must hold to settlement (hard-stop disabled)")
 
 
 class TestAbsDistanceSigmaRelative(unittest.TestCase):
