@@ -3170,10 +3170,19 @@ class TestPerSeriesSigmaMult(unittest.TestCase):
 
 
 class TestPerCityD1PrimarySource(unittest.TestCase):
-    """Per-city d-1+ primary source override (2026-04-29 source-MAE audit).
-    CHI uses HRRR instead of NBP on d-1+ (HRRR MAE 0.43°F vs NBP 2.33°F, n=18).
-    OKC uses HRRR instead of NBP on d-1+ (HRRR MAE 2.22°F vs NBP 3.50°F, n=24).
-    Other cities default to NBP."""
+    """Per-city d-1+ primary source override.
+
+    2026-04-29: CHI + OKC use HRRR on d-1+ (HRRR MAE 0.43/2.22°F vs
+    NBP 2.33/3.50°F).
+
+    2026-05-04: HOU, NOLA, SATX added — gulf-coast cities have NBP
+    forecast warm-biased 4-5°F at d-1 vs actual rm. HRRR is 2-7× more
+    accurate (n=4 each over 14d):
+      HOU  d-1: NBP 4.35 vs HRRR 1.58  (gap +2.77°F)
+      NOLA d-1: NBP 4.05 vs HRRR 0.55  (gap +3.50°F)
+      SATX d-1: NBP 5.10 vs HRRR 1.85  (gap +3.25°F)
+
+    All other cities default to NBP."""
 
     def test_chi_uses_hrrr_on_d_minus_1(self):
         self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTCHI"), "hrrr")
@@ -3181,112 +3190,131 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
     def test_okc_uses_hrrr_on_d_minus_1(self):
         self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTOKC"), "hrrr")
 
+    def test_hou_uses_hrrr_on_d_minus_1(self):
+        """KHOU: NBP 4.35 vs HRRR 1.58, gap +2.77°F (n=4)."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTHOU"), "hrrr")
+
+    def test_nola_uses_hrrr_on_d_minus_1(self):
+        """KMSY (KXLOWTNOLA): NBP 4.05 vs HRRR 0.55, gap +3.50°F (n=4)."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTNOLA"), "hrrr")
+
+    def test_satx_uses_hrrr_on_d_minus_1(self):
+        """KSAT: NBP 5.10 vs HRRR 1.85, gap +3.25°F (n=4)."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTSATX"), "hrrr")
+
     def test_other_cities_default_to_nbp(self):
-        # Most cities are NOT in the override dict — they fall through to NBP.
-        for series in ("KXLOWTNYC", "KXLOWTLAX", "KXLOWTSATX", "KXLOWTHOU",
-                       "KXLOWTBOS", "KXLOWTAUS"):
+        # Cities NOT in the override dict fall through to NBP.
+        # Note: HOU + SATX are now in PER_SERIES_D1_PRIMARY (added 2026-05-04),
+        # so removed from this list.
+        for series in ("KXLOWTNYC", "KXLOWTLAX", "KXLOWTBOS", "KXLOWTAUS",
+                       "KXLOWTSEA", "KXLOWTSFO", "KXLOWTMIA"):
             self.assertNotIn(series, pb.PER_SERIES_D1_PRIMARY,
                              f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
+
+    def test_d1_override_count_is_five(self):
+        """2 (CHI/OKC, 2026-04-29) + 3 (HOU/NOLA/SATX, 2026-05-04) = 5 total."""
+        self.assertEqual(len(pb.PER_SERIES_D1_PRIMARY), 5,
+                         f"Expected 5 d-1 HRRR overrides, got "
+                         f"{len(pb.PER_SERIES_D1_PRIMARY)}: "
+                         f"{sorted(pb.PER_SERIES_D1_PRIMARY)}")
 
 
 class TestPerCityD0PrimarySource(unittest.TestCase):
     """Per-city d-0 primary source override.
 
     2026-04-29: NYC/DC/BOS added (HRRR cool-bias -1.65 to -3.30°F,
-    NBP MAE 30-65% lower).
+    NBP MAE 30-65% lower per n=46-58k cycle samples).
 
-    2026-05-01: LAS/LAX/MIA/PHL/PHX/SEA/SFO added (audit on n=6-7 climate
-    days × 31k cycles per cell — see /tmp/all_cities_audit.py and the
-    MIA-26MAY01-B71.5 −$23.82 hard-stop post-mortem). All seven show NBP
-    MAE 31-63% lower than HRRR with HRRR cool-biased -1.07 to -3.53°F.
-    Pacific/coastal stations (LAX/SFO/SEA/PHX/LAS) tracking the same
-    Open-Meteo bilinear coastal warm-bias documented in V2 max-temp
-    (memory project_open_meteo_audit_20260429.md), opposite sign for
-    night minima.
+    2026-05-01: LAS/LAX/MIA/PHL/PHX/SEA/SFO added (n=6-7 climate days
+    × ~31k cycles per cell). All showed NBP MAE 31-63% lower than HRRR.
 
-    Stayed on HRRR d-0 (HRRR was BETTER, gap negative): AUS, DFW, MDW,
-    MSP, OKC. Tie zone (gap ±15%): ATL, DEN, HOU, SAT. Borderline
-    (15-30%, n still small): MSY."""
+    2026-05-04 RE-AUDIT (14d, n=5-6 settled actuals per cell, joined
+    candidate-log forecasts with obs.sqlite running_min — see
+    /tmp/inv2_audit_v2.py): NBP-vs-HRRR balance has SHIFTED. Removed 4
+    cells where HRRR is now materially better at d-0:
+      KXLOWTNYC: NBP MAE 1.97 vs HRRR 0.88 (gap +1.09°F) — REMOVED
+      KXLOWTDC:  NBP MAE 2.03 vs HRRR 1.66 (gap +0.37°F, marginal) — REMOVED
+      KXLOWTMIA: NBP MAE 1.92 vs HRRR 0.53 (gap +1.39°F) — REMOVED
+      KXLOWTPHX: NBP MAE 2.40 vs HRRR 1.52 (gap +0.88°F) — REMOVED
 
-    def test_nyc_uses_nbp_on_d_zero(self):
-        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTNYC"), "nbp")
+    Surviving NBP-better cohort (BOS/LAS/LAX/PHIL/SEA/SFO): MAE gap
+    -0.34 to -0.99°F vs HRRR. These remain NBP-routed.
 
-    def test_dc_uses_nbp_on_d_zero(self):
-        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTDC"), "nbp")
+    Removed cells fall through to the d-0 default (HRRR, freshest
+    nowcast). Re-audit ~2026-05-18 (≥21d cumulative window)."""
 
     def test_bos_uses_nbp_on_d_zero(self):
+        """KBOS: NBP MAE 0.87 vs HRRR 1.86 (gap −0.99°F)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTBOS"), "nbp")
 
-    # 2026-05-01 additions — RED → GREEN against unchanged constant.
     def test_las_uses_nbp_on_d_zero(self):
-        """KLAS: gap +58%, HRRR cool -2.80°F, NBP MAE 1.19 vs HRRR 2.80."""
+        """KLAS: NBP MAE 0.88 vs HRRR 1.46 (gap −0.58°F)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTLAS"), "nbp")
 
     def test_lax_uses_nbp_on_d_zero(self):
-        """KLAX: gap +34%, HRRR cool -3.53°F, NBP MAE 2.34 vs HRRR 3.53."""
+        """KLAX: NBP MAE 1.37 vs HRRR 1.90 (gap −0.53°F)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTLAX"), "nbp")
 
-    def test_mia_uses_nbp_on_d_zero(self):
-        """KMIA: gap +31%, HRRR cool -1.30°F, NBP MAE 0.91 vs HRRR 1.32.
-        Triggered by 2026-05-01 MIA-B71.5 −$23.82 hard-stop where HRRR
-        69.6°F vs actual 71.6°F vs NBP 72.0°F (NBP would have flipped to
-        BUY_YES and won)."""
-        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTMIA"), "nbp")
-
     def test_phl_uses_nbp_on_d_zero(self):
-        """KPHL: gap +63%, HRRR cool -1.78°F, NBP MAE 0.84 vs HRRR 2.24."""
+        """KPHL: NBP MAE 0.97 vs HRRR 1.76 (gap −0.79°F)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTPHIL"), "nbp")
 
-    def test_phx_uses_nbp_on_d_zero(self):
-        """KPHX: gap +55%, HRRR cool -3.08°F, NBP MAE 1.41 vs HRRR 3.15."""
-        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTPHX"), "nbp")
-
     def test_sea_uses_nbp_on_d_zero(self):
-        """KSEA: gap +62%, HRRR cool -1.07°F, NBP MAE 0.62 vs HRRR 1.62."""
+        """KSEA: NBP MAE 1.23 vs HRRR 1.57 (gap −0.34°F, marginal)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTSEA"), "nbp")
 
     def test_sfo_uses_nbp_on_d_zero(self):
-        """KSFO: gap +50%, HRRR cool -3.32°F, NBP MAE 1.68 vs HRRR 3.32."""
+        """KSFO: NBP MAE 0.93 vs HRRR 1.54 (gap −0.61°F)."""
         self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTSFO"), "nbp")
 
+    # 2026-05-04 REMOVALS: NBP no longer better at d-0 → default HRRR.
+
+    def test_nyc_REMOVED_from_d0_override(self):
+        """KXLOWTNYC removed 2026-05-04 — NBP became 1.09°F worse than
+        HRRR over 14d audit. Falls through to HRRR default."""
+        self.assertNotIn("KXLOWTNYC", pb.PER_SERIES_D0_PRIMARY)
+
+    def test_dc_REMOVED_from_d0_override(self):
+        """KXLOWTDC removed 2026-05-04 — NBP marginally worse (+0.37°F)
+        and one fewer override is cleaner."""
+        self.assertNotIn("KXLOWTDC", pb.PER_SERIES_D0_PRIMARY)
+
+    def test_mia_REMOVED_from_d0_override(self):
+        """KXLOWTMIA removed 2026-05-04 — biggest flip (NBP 1.39°F worse
+        than HRRR). Original 2026-05-01 deploy was triggered by a single
+        MIA hard_stop; current 14d data shows NBP itself is the warm-
+        biased source on KMIA."""
+        self.assertNotIn("KXLOWTMIA", pb.PER_SERIES_D0_PRIMARY)
+
+    def test_phx_REMOVED_from_d0_override(self):
+        """KXLOWTPHX removed 2026-05-04 — NBP 0.88°F worse than HRRR."""
+        self.assertNotIn("KXLOWTPHX", pb.PER_SERIES_D0_PRIMARY)
+
     def test_atl_NOT_overridden_on_d_zero(self):
-        """ATL gap −11% (HRRR slightly better). Don't flip."""
+        """ATL: HRRR slightly better historically. Don't flip."""
         self.assertNotIn("KXLOWTATL", pb.PER_SERIES_D0_PRIMARY)
 
     def test_inland_plains_default_to_hrrr_on_d_zero(self):
-        """Cities where HRRR is materially BETTER stay on HRRR. Gap < 0%
-        means flipping to NBP would HURT accuracy. Verified n=6-7 days.
-        AUS −69%, DFW −87%, MDW −69%, MSP −117%, OKC −111%."""
+        """Cities where HRRR is materially BETTER stay on HRRR."""
         for series in ("KXLOWTAUS", "KXLOWTDAL", "KXLOWTCHI", "KXLOWTMIN",
                        "KXLOWTOKC"):
             self.assertNotIn(
                 series, pb.PER_SERIES_D0_PRIMARY,
                 f"{series} HRRR is MAE-better on d-0; must stay on HRRR")
 
-    def test_tie_zone_cities_default_to_hrrr_on_d_zero(self):
-        """ATL/DEN/HOU/SAT: gap ±15% — tie zone, no clear winner. Default
-        HRRR until more data settles the tie (revisit at n>=10 days)."""
-        for series in ("KXLOWTATL", "KXLOWTDEN", "KXLOWTHOU", "KXLOWTSATX"):
-            self.assertNotIn(
-                series, pb.PER_SERIES_D0_PRIMARY,
-                f"{series} is in tie zone; default HRRR until data settles")
-
-    def test_msy_borderline_default_hrrr_on_d_zero(self):
-        """KMSY borderline (gap +23% — NBP better but below 30% threshold).
-        Hold until re-audit at n>=10 days."""
-        self.assertNotIn("KXLOWTMSY", pb.PER_SERIES_D0_PRIMARY)
-
-    def test_d0_override_count_is_ten(self):
-        """3 (NYC/DC/BOS, 2026-04-29) + 7 (2026-05-01 audit) = 10 total."""
-        self.assertEqual(len(pb.PER_SERIES_D0_PRIMARY), 10,
-                         f"Expected 10 d-0 NBP overrides, got "
+    def test_d0_override_count_is_six(self):
+        """6 surviving NBP-better cells: BOS, LAS, LAX, PHIL, SEA, SFO.
+        Was 10 pre-2026-05-04; removed NYC/DC/MIA/PHX after 14d re-audit."""
+        self.assertEqual(len(pb.PER_SERIES_D0_PRIMARY), 6,
+                         f"Expected 6 d-0 NBP overrides, got "
                          f"{len(pb.PER_SERIES_D0_PRIMARY)}: "
                          f"{sorted(pb.PER_SERIES_D0_PRIMARY)}")
 
     def test_d0_override_does_not_overlap_d1_override(self):
-        """A series should not be in BOTH dicts (would mean we're switching
-        sources twice for the same city — possible but currently no city
-        needs that)."""
+        """A series should not be in BOTH dicts (would mean we're
+        switching sources twice for the same city). Verified disjoint
+        even after 2026-05-04 changes (D1 added HOU/NOLA/SATX → HRRR;
+        D0 removed NYC/DC/MIA/PHX; no overlap with surviving D0 cohort)."""
         d0 = set(pb.PER_SERIES_D0_PRIMARY)
         d1 = set(pb.PER_SERIES_D1_PRIMARY)
         self.assertEqual(d0 & d1, set(),

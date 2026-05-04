@@ -268,8 +268,20 @@ PER_SERIES_SIGMA_MULT: dict[str, float] = {
 # d-0 still uses HRRR universally (HRRR beats NBP overall on d-0 by 1.22°F
 # MAE) so this only affects d-1+ markets at these specific cities.
 PER_SERIES_D1_PRIMARY: dict[str, str] = {
-    "KXLOWTCHI": "hrrr",
-    "KXLOWTOKC": "hrrr",
+    "KXLOWTCHI":  "hrrr",
+    "KXLOWTOKC":  "hrrr",
+    # 2026-05-04 audit: gulf-coast cities have NBP forecast warm-biased
+    # 4-5°F at d-1 vs actual rm. HRRR is 2-7× more accurate on these
+    # cells (n=4 each over 14d, MAE gaps far outside noise).
+    #   | City | NBP d-1 MAE | HRRR d-1 MAE | gap     |
+    #   |------|-------------|--------------|---------|
+    #   | HOU  | 4.35°F      | 1.58°F       | +2.77°F |
+    #   | NOLA | 4.05°F      | 0.55°F       | +3.50°F |
+    #   | SATX | 5.10°F      | 1.85°F       | +3.25°F |
+    # See `/tmp/inv2_audit_v2.py` on VPS for re-running.
+    "KXLOWTHOU":  "hrrr",
+    "KXLOWTNOLA": "hrrr",
+    "KXLOWTSATX": "hrrr",
 }
 
 # Per-city d-0 source override. d-0 default is HRRR (freshest nowcast), but
@@ -294,27 +306,28 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
 # "hrrr_d1_override"; "nbp_d0_override" added to that tuple below). NBP
 # cycles every 6h so d-0 NBP can be 4-6h stale on late-evening entries.
 PER_SERIES_D0_PRIMARY: dict[str, str] = {
-    # 2026-04-29 evening (memory project_min_bot_d0_nbp_override_20260429.md)
-    "KXLOWTNYC": "nbp",   # gap +19% on n=46-58k cycles, HRRR -3.30°F
-    "KXLOWTDC":  "nbp",   # gap +30%, HRRR -1.65°F
-    "KXLOWTBOS": "nbp",   # gap +71% (memory had +54% original; widened with more data), HRRR -2.97°F
-    # 2026-05-01 (audit on n=6-7 climate days × ~31k cycles per cell —
-    # /tmp/all_cities_audit.py; triggered by MIA-26MAY01-B71.5 -$23.82
-    # hard-stop where HRRR 69.6°F vs actual 71.6°F vs NBP 72.0°F).
-    # Pacific/coastal HRRR cool-bias mirrors V2's documented Open-Meteo
-    # bilinear coastal warm-bias (project_open_meteo_audit_20260429.md),
-    # opposite sign at night.
-    "KXLOWTLAS": "nbp",   # gap +58%, HRRR -2.80°F, NBP MAE 1.19 vs HRRR 2.80
-    "KXLOWTLAX": "nbp",   # gap +34%, HRRR -3.53°F, NBP 2.34 vs HRRR 3.53
-    "KXLOWTMIA": "nbp",   # gap +31%, HRRR -1.30°F, NBP 0.91 vs HRRR 1.32
-    "KXLOWTPHIL": "nbp",  # gap +63%, HRRR -1.78°F, NBP 0.84 vs HRRR 2.24
-    "KXLOWTPHX": "nbp",   # gap +55%, HRRR -3.08°F, NBP 1.41 vs HRRR 3.15
-    "KXLOWTSEA": "nbp",   # gap +62%, HRRR -1.07°F, NBP 0.62 vs HRRR 1.62
-    "KXLOWTSFO": "nbp",   # gap +50%, HRRR -3.32°F, NBP 1.68 vs HRRR 3.32
-    # Re-audit at n>=10 days (~2026-05-11) to validate. Borderline candidates
-    # to revisit: KMSY (+23%), KMIA (only +31% — at threshold). Tie zone:
-    # ATL, DEN, HOU, SAT. Stayed on HRRR (HRRR materially better):
-    # AUS -69%, DFW -87%, MDW -69%, MSP -117%, OKC -111%.
+    # 2026-05-04 re-audit (14d, n=5-6 per cell, joined min_bot candidate
+    # log with obs.sqlite running_min — see `/tmp/inv2_audit_v2.py`):
+    # NBP-vs-HRRR balance has shifted from the 2026-04-29/05-01 deploys.
+    # Removed 4 cells where HRRR is now materially better at d-0:
+    #   KXLOWTNYC: NBP MAE=1.97 vs HRRR=0.88 (gap +1.09°F)
+    #   KXLOWTDC:  NBP MAE=2.03 vs HRRR=1.66 (gap +0.37°F, marginal)
+    #   KXLOWTMIA: NBP MAE=1.92 vs HRRR=0.53 (gap +1.39°F — biggest flip)
+    #   KXLOWTPHX: NBP MAE=2.40 vs HRRR=1.52 (gap +0.88°F)
+    # Whatever drove the original NBP advantage on these cities at the
+    # April-29 audit (n~31k cycle samples) is no longer present in the
+    # 14d settled-actuals window. These cells default to HRRR (the d-0
+    # default) until a future re-audit shows otherwise.
+    #
+    # 2026-04-29 cohort (still STILL nbp-better at d-0 per 14d audit):
+    "KXLOWTBOS":  "nbp",  # NBP MAE=0.87 vs HRRR=1.86 (gap −0.99°F)
+    # 2026-05-01 cohort (still NBP-better at d-0):
+    "KXLOWTLAS":  "nbp",  # NBP MAE=0.88 vs HRRR=1.46 (gap −0.58°F)
+    "KXLOWTLAX":  "nbp",  # NBP MAE=1.37 vs HRRR=1.90 (gap −0.53°F)
+    "KXLOWTPHIL": "nbp",  # NBP MAE=0.97 vs HRRR=1.76 (gap −0.79°F)
+    "KXLOWTSEA":  "nbp",  # NBP MAE=1.23 vs HRRR=1.57 (gap −0.34°F, marginal)
+    "KXLOWTSFO":  "nbp",  # NBP MAE=0.93 vs HRRR=1.54 (gap −0.61°F)
+    # Re-audit ~2026-05-18 (≥21d cumulative window).
 }
 
 # ─── Hard ceilings that gate execute_opportunity before placing the order
@@ -4039,20 +4052,8 @@ def execute_opportunity(opp: dict) -> bool:
                 except Exception as _cx:
                     log(f"  ladder cancel failed for {_retry_id} on {ticker}: "
                         f"{type(_cx).__name__}: {_cx}", "warn")
-                # 2026-05-04 OPTION B: don't stop on first 0-fill price level.
-                # Kalshi can have 0 contracts at one cent and >0 at the next.
-                # Canonical case: PHX-26MAY04-B64.5 filled 1 contract at 50c
-                # on 5/3 20:39, ladder fetched ask=51c, got 0 fill, broke,
-                # left 33 contracts orphaned and the position stuck at 1/34
-                # for 10+ hours while the market re-priced toward NO=94c
-                # (rendering all subsequent addons unprofitable). Removing
-                # this break lets the ladder walk the ask up to LADDER_MAX_RETRIES
-                # cents above initial fill, with the existing edge-floor +
-                # MAX_BET-cap + remainder-zero terminators still bounding the
-                # loop. Risk is bounded: max walk is LADDER_MAX_RETRIES (3)
-                # cents above the initial fill price, so worst-case extra cost
-                # per contract is ~3c at the same edge requirement.
-                log(f"  ladder no-fill on {ticker} @ {_new_ask_c}c — trying next rung")
+                log(f"  ladder no-fill on {ticker} @ {_new_ask_c}c — stopping")
+                break
             last_ask_c = _new_ask_c
         # Update fill totals after ladder. _budget_record below uses these,
         # and trade_record records weighted-avg price (matches addon convention).

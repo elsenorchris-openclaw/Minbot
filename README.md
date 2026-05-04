@@ -3,7 +3,49 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-04 afternoon) — ladder bumped to 5 + extended to BUY_YES + value-dead MARKET_STOP
+## Latest change (2026-05-04 late afternoon) — `PER_SERIES_D{0,1}_PRIMARY` re-calibrated on 14d audit
+
+Recalibrated both per-city forecast-source override dicts based on a fresh 14d audit (`/tmp/inv2_audit_v2.py` on VPS — joined min_bot's candidate-log per-source forecasts with `obs.sqlite running_min` for actuals; n=4-6 settled cells per (city, days_out)).
+
+**`PER_SERIES_D0_PRIMARY` — 4 cells removed** where NBP became materially worse than HRRR over the 14d window:
+
+| Series | NBP MAE | HRRR MAE | Gap | Action |
+|---|---:|---:|---:|---|
+| `KXLOWTNYC` | 1.97 | **0.88** | +1.09°F | REMOVED → HRRR default |
+| `KXLOWTDC` | 2.03 | **1.66** | +0.37°F | REMOVED (marginal) → HRRR default |
+| `KXLOWTMIA` | 1.92 | **0.53** | +1.39°F | REMOVED → HRRR default (biggest flip) |
+| `KXLOWTPHX` | 2.40 | **1.52** | +0.88°F | REMOVED → HRRR default |
+
+Surviving NBP-better cohort (gap −0.34 to −0.99°F): `KXLOWTBOS`, `KXLOWTLAS`, `KXLOWTLAX`, `KXLOWTPHIL`, `KXLOWTSEA`, `KXLOWTSFO`. **Total D0 overrides: 10 → 6.**
+
+The MIA flip is the headline. The 2026-05-01 deploy added KXLOWTMIA → NBP based on a single MIA-26MAY01 hard_stop where NBP would have been right; 14d aggregate now shows the opposite — NBP runs warm-biased on KMIA at d-0 (bias +1.92°F) while HRRR is essentially unbiased (-0.37°F). Today's MIA-26MAY04 hard_stop where NBP=74°F vs actual rm=71.6°F (HRRR=72°F was 0.4°F off) is consistent with the new audit, not the old one.
+
+**`PER_SERIES_D1_PRIMARY` — 3 cells added** for gulf-coast cities where HRRR is materially better at d-1+:
+
+| Series | NBP d-1 MAE | HRRR d-1 MAE | Gap | Action |
+|---|---:|---:|---:|---|
+| `KXLOWTHOU` | 4.35 | **1.58** | +2.77°F | ADDED → HRRR |
+| `KXLOWTNOLA` | 4.05 | **0.55** | +3.50°F | ADDED → HRRR (biggest gap) |
+| `KXLOWTSATX` | 5.10 | **1.85** | +3.25°F | ADDED → HRRR |
+
+NBP runs 4-5°F warm on these gulf-coast cities at d-1 vs actual rm. HRRR is 2-7× more accurate. **Total D1 overrides: 2 → 5.**
+
+**Why the 2026-04-29 audit got these wrong:** the original audit used n~31k cycle samples per cell over a 6-7 day window of intra-day forecast cycle data. The 14d audit uses fewer points but each one is the LATEST pre-settle forecast vs the actual settled rm. The 14d view is a more direct measure of "what μ would I have used at trade time vs what actually happened." Different question, different answer; this view is the one that matters for trade sizing.
+
+**Tests updated:**
+- `TestPerCityD0PrimarySource` rewritten: 4 new `_REMOVED_` tests pin NYC/DC/MIA/PHX out of the dict; count assertion bumped 10 → 6.
+- `TestPerCityD1PrimarySource` extended: 3 new HOU/NOLA/SATX assertions; count assertion 2 → 5.
+- Disjoint-dicts invariant test still passes.
+
+Full suite: **376 passed** (was 374, +2 net new tests). Zero regressions.
+
+**Forward audit:** re-run `/tmp/inv2_audit_v2.py` ~2026-05-18 (≥21d cumulative window). If any cell flips again, this is a live distribution that needs continual recalibration — at which point a per-station rolling-bias-correction layer becomes more attractive than a static dict.
+
+**No behavior change to logic** — only the routing dicts moved. σ-aware Kelly, COASTAL_TIGHT_FLOOR (verified neutral, NOT bumped), MARKET_STOP, ladder, hard-stop disable all unchanged.
+
+---
+
+## Previous change (2026-05-04 afternoon) — ladder bumped to 5 + extended to BUY_YES + value-dead MARKET_STOP
 
 Three companion changes addressing thin-orderbook fill problems and adding a final safety net after the morning's hard-stop disable.
 
