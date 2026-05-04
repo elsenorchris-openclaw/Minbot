@@ -74,18 +74,25 @@ class TestLadderChase(unittest.TestCase):
         )
 
     def test_ladder_respects_max_bet_cap(self):
-        """Cumulative cost must not exceed MAX_BET_USD across initial + ladder."""
+        """Cumulative cost must not exceed MAX_BET_USD across initial + ladder.
+        2026-05-04: budget check now uses pessimistic worst-case cost
+        (max of bot's cumulative_cost and tracked _placed_max_cost) against
+        _LADDER_BUDGET_CAP = _max_cap_usd * 1.05. See PHX-26MAY04-B81.5
+        incident — bot's cumulative_cost can lag actual Kalshi state."""
         s = src()
-        m = re.search(
-            r"_budget_left = MAX_BET_USD - cumulative_cost\s*\n"
-            r"\s*if _budget_left < _new_price:",
+        # 1.05x slop cap
+        self.assertIn("_LADDER_BUDGET_CAP = _max_cap_usd * 1.05", s,
+            "_LADDER_BUDGET_CAP slop constant must exist")
+        # Pessimistic cost
+        self.assertRegex(
             s,
-        )
-        self.assertIsNotNone(
-            m,
-            "Ladder must check remaining budget against MAX_BET_USD before "
-            "each retry placement."
-        )
+            r"_pessimistic_cost\s*=\s*max\(cumulative_cost,\s*_placed_max_cost\)",
+            "Budget check must use max(cumulative_cost, _placed_max_cost)")
+        # Budget subtraction
+        self.assertRegex(
+            s,
+            r"_budget_left\s*=\s*_LADDER_BUDGET_CAP\s*-\s*_pessimistic_cost",
+            "_budget_left must subtract pessimistic from cap")
 
     def test_ladder_respects_max_retries(self):
         s = src()

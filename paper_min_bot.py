@@ -4001,6 +4001,17 @@ def execute_opportunity(opp: dict) -> bool:
         else:  # BUY_YES
             _ask_field = "yes_ask_dollars"
             _max_cap_usd = MAX_BET_BUY_YES_USD
+        # 2026-05-04 OVERFILL CAP: pessimistic worst-case spend tracker.
+        # `cumulative_cost` is the bot's tally based on wait_for_fill, which
+        # can lag actual Kalshi state if the order endpoint hasn't propagated
+        # the fill at fetch time (V1 PHX-26MAY04-B81.5: bot saw 6 fills /
+        # $3.12, reality 78 / $41.58 — kalshi_get returned fill_count_fp=0
+        # 100ms after place_order on a fresh-executed IOC rung). Bound damage
+        # by tracking the WORST-CASE cost (assume every placed order fills in
+        # full at its placement price) and refusing the next rung if that
+        # pessimistic total exceeds {action_cap} * 1.05.
+        _placed_max_cost = count * (price_cents / 100.0)
+        _LADDER_BUDGET_CAP = _max_cap_usd * 1.05
         for _retry in range(LADDER_MAX_RETRIES):
             remainder = count - cumulative_filled
             if remainder <= 0:
@@ -4022,10 +4033,14 @@ def execute_opportunity(opp: dict) -> bool:
                 log(f"  ladder stop {ticker}: new_edge={_new_edge:.2%} < MIN_EDGE "
                     f"at {_new_ask_c}c (filled {cumulative_filled}/{count})")
                 break
-            _budget_left = _max_cap_usd - cumulative_cost
+            # Pessimistic budget = max(bot tally, placed-orders worst case)
+            _pessimistic_cost = max(cumulative_cost, _placed_max_cost)
+            _budget_left = _LADDER_BUDGET_CAP - _pessimistic_cost
             if _budget_left < _new_price:
                 log(f"  ladder stop {ticker}: at {action} cap "
-                    f"(cum=${cumulative_cost:.2f}, ask {_new_ask_c}c, cap=${_max_cap_usd:.2f})")
+                    f"(cum=${cumulative_cost:.2f}, "
+                    f"placed_max=${_placed_max_cost:.2f}, "
+                    f"ask {_new_ask_c}c, cap=${_max_cap_usd:.2f})")
                 break
             _max_count = min(remainder, int(_budget_left / _new_price))
             if _max_count < 1:
@@ -4033,6 +4048,9 @@ def execute_opportunity(opp: dict) -> bool:
             _retry_id = place_kalshi_order(ticker, side, _max_count, _new_ask_c)
             if not _retry_id:
                 break
+            # 2026-05-04 OVERFILL CAP: bump worst-case-cost tracker immediately
+            # after successful place_order, before any fill-detection race.
+            _placed_max_cost += _max_count * _new_price
             _r_status, _r_filled = wait_for_fill(_retry_id, _max_count, ORDER_FILL_TIMEOUT_SEC)
             if _r_filled > 0:
                 if _r_filled < _max_count:
