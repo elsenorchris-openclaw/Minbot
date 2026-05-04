@@ -4347,6 +4347,111 @@ def _check_position_obs_winning(pos: dict, rm: float) -> bool:
     return False
 
 
+# 2026-05-04 night SHADOW deploy: OBS_CONFIRMED_LOSER exit detection.
+# STRICTER than entry-side `_check_obs_confirmed_loser` because false
+# positives at exit-time mean SELLING A WINNER (much worse than entry-time
+# false positives which just mean missing a trade). Three safety layers:
+#
+# 1. Post-low-lock time gate (hour >= 8 local, _is_post_sunrise). For LOW-
+#    temp brackets, the daily low locks before sunrise. After 8 AM local,
+#    rm is essentially the day's final low.
+# 2. 1°F CLI-rounding buffer matching the existing WINNER-override
+#    convention (rm < floor - 1.0 = winner). For LOSER, the symmetric
+#    boundary uses rm > floor + 1.0 in some cases — see per-case logic.
+# 3. TZ-exception fail-safe: if we can't determine local time, return
+#    False (don't sell). Conservative default.
+#
+# THIS FUNCTION IS CURRENTLY USED FOR SHADOW LOGGING ONLY. The
+# `check_open_positions_for_exit` integration logs `OBS_CONFIRMED_LOSER
+# would-fire` events but does not call `_execute_exit`. Stage-2 activation
+# requires:
+#   - 7-14 days of shadow data
+#   - 0 false positives (no winner mistakenly flagged)
+#   - estimated $ recovery > $30/wk to justify even small false-positive risk
+def _check_position_obs_confirmed_loser_for_exit(pos: dict, rm: float) -> bool:
+    """STRICT loser detection for exit-side use.
+
+    Decision rules per (action, bracket-shape) — all require post-sunrise
+    (hour >= 8 local) for the low-temp confirmation:
+
+      BUY_NO + B-bracket [floor, cap]:
+        rm >= floor + 1.0 AND rm <= cap (rm firmly in or below upper edge,
+        with 1°F buffer below floor to absorb ASOS-vs-METAR -1°F noise).
+
+      BUY_NO + T-cap (cap-only, "low ≤ X-1"):
+        rm <= cap - 1.0 (CLI definitively rounds to X-1 or lower).
+
+      BUY_NO + T-floor (floor-only, "low ≥ X"):
+        rm > floor + 1.0 (1°F buffer above floor).
+
+      BUY_YES + B-bracket [floor, cap]:
+        rm < floor - 0.5 (rm only decreases, won't recover) — NO post-
+          sunrise gate needed since the trajectory is monotone.
+        OR rm > cap + 1.5 AND post-low-lock (low locked above bracket;
+          1.5°F buffer = 1.0°F CLI safety + 0.5°F obs noise).
+
+      BUY_YES + T-low (cap-only, "low ≤ X"):
+        rm > cap + 0.5 AND post-low-lock (low has set above threshold).
+
+      BUY_YES + T-high (floor-only, "low ≥ X"):
+        rm < floor - 0.5 (rm only decreases, won't recover).
+
+    Returns False on ANY exception (TZ lookup failure, missing fields).
+    Better to miss a recovery opportunity than sell a winner.
+    """
+    try:
+        floor = pos.get("floor")
+        cap = pos.get("cap")
+        action = pos.get("action")
+        tz = pos.get("tz") or pos.get("entry_tz") or "America/New_York"
+
+        # Compute post-low-lock once. Used by most branches.
+        try:
+            post_lock = _is_post_sunrise(tz)
+        except Exception:
+            return False  # fail-safe
+
+        if action == "BUY_NO":
+            if floor is not None and cap is not None:
+                # B-bracket: rm IN [floor + 1.0, cap]. The +1.0 buffer
+                # mirrors the WINNER override's -1.0 buffer (rm < floor - 1.0
+                # = winner), keeping a 2°F dead zone between WINNER and
+                # LOSER for cases where CLI-vs-obs gap could flip the
+                # outcome.
+                if post_lock and (float(floor) + 1.0) <= rm <= float(cap):
+                    return True
+            elif cap is not None and floor is None:
+                # T-cap: rm <= cap - 1.0. Means actual low is solidly
+                # below the threshold; CLI will round to X-1 or lower.
+                if post_lock and rm <= float(cap) - 1.0:
+                    return True
+            elif floor is not None and cap is None:
+                # T-floor (BUY_NO bets low < X): rm > floor + 1.0.
+                if post_lock and rm > float(floor) + 1.0:
+                    return True
+        elif action == "BUY_YES":
+            if floor is not None and cap is not None:
+                # B-bracket: low went below floor (won't recover, rm
+                # monotone) OR low locked above cap+1.5 with post-lock.
+                if rm < float(floor) - 0.5:
+                    return True
+                if post_lock and rm > float(cap) + 1.5:
+                    return True
+            elif cap is not None and floor is None:
+                # T-low (YES bets low ≤ X): rm > cap + 0.5 means low has
+                # set above threshold. Post-lock ensures it's final.
+                if post_lock and rm > float(cap) + 0.5:
+                    return True
+            elif floor is not None and cap is None:
+                # T-high (YES bets low ≥ X): rm < floor - 0.5 means low
+                # has gone below threshold. rm monotone, no need for lock.
+                if rm < float(floor) - 0.5:
+                    return True
+    except Exception:
+        return False  # fail-safe: any unexpected error → don't sell
+    return False
+
+
 def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
                    reason: str) -> bool:
     """Place a SELL order for an existing position at sell_price_c. Polls for
@@ -4551,6 +4656,26 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                 # a position the obs may already have confirmed as winner.
                 log(f"  HOLD {ticker}: obs-winning check raised {type(_winx).__name__}: {_winx}; "
                     f"falling through to MTM stop", "warn")
+
+        # 2026-05-04 night SHADOW: OBS_CONFIRMED_LOSER detection (logging only).
+        # When obs definitively show position will lose, we COULD sell at
+        # current bid to recover residual value before MARKET_STOP catches
+        # it at ≤1c. BUT — false positive at exit-time = sell a winner =
+        # bad. Stage 1 logs would-fire events without selling so we can
+        # measure false-positive rate vs settlement outcomes for 7-14
+        # days. Stage 2 activation requires 0 false positives observed.
+        if rm is not None:
+            try:
+                if _check_position_obs_confirmed_loser_for_exit(pos, float(rm)):
+                    log(f"  SHADOW OBS_CONFIRMED_LOSER {ticker}: "
+                        f"rm={rm} bracket=[{pos.get('floor')},{pos.get('cap')}] "
+                        f"action={action} entry={entry_price:.2f} "
+                        f"current_bid={int(current_bid_c)}c "
+                        f"would-recover ${(int(current_bid_c)/100.0 - entry_price) * pos.get('count', 0):+.2f} "
+                        f"vs hold-to-loss ${-entry_price * pos.get('count', 0):+.2f}", "warn")
+            except Exception as _lex:
+                # Conservative: any error in shadow logging is non-fatal.
+                log(f"  SHADOW obs-loser check raised {type(_lex).__name__}: {_lex}", "warn")
 
         # 2026-05-04: very-loose value-dead market stop. Hard-stop (below) is
         # sentinel-disabled; this is a final safety net that fires only when
