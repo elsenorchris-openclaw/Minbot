@@ -401,6 +401,19 @@ MSG_WORST_CITIES = {                # cities with historical poor MIN calibratio
 }
 MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES territory blocks
 
+# ─── SKIP_MODEL_MARKET_DISAGREE (V2 port 2026-05-04, both sides) ──────────
+# Block when model and market disagree strongly. V2 BUY_NO original (+$223
+# lift / 15L:5W on n=253): when model says YES is moderately likely
+# (mp ≥ MP_FLOOR) AND market is paying a lot more for NO than the model
+# justifies (yes_bid_frac − mp ≥ GAP_MIN), the market has information the
+# model doesn't — the apparent edge is illusory. Mirrored for BUY_YES on
+# lows: when mp_no ≥ MP_FLOOR AND no_bid_frac − mp_no ≥ GAP_MIN, market
+# overpays NO vs model → BUY_YES likely loses. min_bot LIVE pool
+# (n=24, 4/29-5/02): catches DC-T46 BUY_YES (-$24, biggest live loss),
+# 1:0 helps:hurts. Bypassed by caller when _obs_confirmed_alive.
+SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR = 0.22
+SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25
+
 # ─── Hard stop on existing positions (V2 port, mid-cycle exit) ────────────
 # 2026-05-04: DISABLED via sentinel values. Pattern mirrors V1's
 # SESSION_DRAWDOWN_LIMIT = -9999 disable from 2026-05-03.
@@ -2630,6 +2643,44 @@ def _check_msg_gate(opp: dict) -> Optional[str]:
     return None
 
 
+# ─── SKIP_MODEL_MARKET_DISAGREE gate (V2 port, both sides) ────────────────
+def _check_model_market_disagree(opp: dict) -> Optional[str]:
+    """Block when model and market disagree by GAP_MIN with model assigning at
+    least MP_FLOOR probability to the losing side. Applied to BUY_NO (V2
+    original) and BUY_YES (mirrored for min_bot lows). Bypassed by caller
+    when _obs_confirmed_alive. See SKIP_MODEL_MARKET_DISAGREE_* constants for
+    backtest evidence."""
+    action = opp.get("action")
+    mp_v = opp.get("model_prob")
+    if action is None or mp_v is None:
+        return None
+    mp = float(mp_v)
+    if action == "BUY_NO":
+        yb = opp.get("yes_bid")
+        if yb is None:
+            return None
+        yes_bid_frac = float(yb) / 100.0
+        if (mp >= SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR
+                and (yes_bid_frac - mp) >= SKIP_MODEL_MARKET_DISAGREE_GAP_MIN):
+            return (f"MODEL_MARKET_DISAGREE: BUY_NO mp={mp:.0%} ≥ "
+                    f"{SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR:.0%} AND market "
+                    f"overpays YES by {yes_bid_frac - mp:.0%} ≥ "
+                    f"{SKIP_MODEL_MARKET_DISAGREE_GAP_MIN:.0%}")
+    elif action == "BUY_YES":
+        nb = opp.get("no_bid")
+        if nb is None:
+            return None
+        no_bid_frac = float(nb) / 100.0
+        mp_no = 1.0 - mp
+        if (mp_no >= SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR
+                and (no_bid_frac - mp_no) >= SKIP_MODEL_MARKET_DISAGREE_GAP_MIN):
+            return (f"MODEL_MARKET_DISAGREE: BUY_YES mp_no={mp_no:.0%} ≥ "
+                    f"{SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR:.0%} AND market "
+                    f"overpays NO by {no_bid_frac - mp_no:.0%} ≥ "
+                    f"{SKIP_MODEL_MARKET_DISAGREE_GAP_MIN:.0%}")
+    return None
+
+
 def find_opportunities(markets: list[dict]) -> list[dict]:
     """For each market, compute model_prob, edge vs yes_ask, and return
     opportunities sorted by absolute edge."""
@@ -3636,6 +3687,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
                 return ("COASTAL_TIGHT_FLOOR",
                         f"floor-mu gap {_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
                         f"(station={_ctf_station} marine cold-bias)")
+    mmd_block = _check_model_market_disagree(opp)
+    if mmd_block:
+        return ("MODEL_MARKET_DISAGREE", mmd_block)
     msg_block = _check_msg_gate(opp)
     if msg_block:
         return ("MSG", msg_block)
@@ -3902,6 +3956,32 @@ def execute_opportunity(opp: dict) -> bool:
         f2a_block = _check_f2a_gate(opp)
         if f2a_block:
             _log_skip(ticker, f"  skip {ticker}: {f2a_block}")
+            return False
+        # COASTAL_TIGHT_FLOOR (production parity 2026-05-04): mirror of
+        # _evaluate_gates twin. Was missing from execute_opportunity since
+        # commit 93b1570 — gate shadow-logged correctly but never blocked
+        # trades. See COASTAL_TIGHT_FLOOR_STATIONS / _evaluate_gates for
+        # backtest. BUY_NO B-bracket only.
+        if action == "BUY_NO":
+            _ctf_station = opp.get("station")
+            _ctf_floor = opp.get("floor")
+            _ctf_cap = opp.get("cap")
+            _ctf_mu = opp.get("mu")
+            if (_ctf_station in COASTAL_TIGHT_FLOOR_STATIONS
+                    and _ctf_floor is not None and _ctf_cap is not None
+                    and _ctf_mu is not None):
+                _ctf_gap = float(_ctf_floor) - float(_ctf_mu)
+                if _ctf_gap < COASTAL_TIGHT_FLOOR_MIN_GAP_F:
+                    _log_skip(ticker,
+                        f"  skip {ticker}: COASTAL_TIGHT_FLOOR — floor-mu gap "
+                        f"{_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
+                        f"(station={_ctf_station} marine cold-bias)")
+                    return False
+        # SKIP_MODEL_MARKET_DISAGREE (V2 port 2026-05-04, both sides). Mirror
+        # of _evaluate_gates twin. See SKIP_MODEL_MARKET_DISAGREE_* constants.
+        mmd_block = _check_model_market_disagree(opp)
+        if mmd_block:
+            _log_skip(ticker, f"  skip {ticker}: {mmd_block}")
             return False
         # MSG multi-source consensus gate (V2 port, BUY_NO only).
         msg_block = _check_msg_gate(opp)

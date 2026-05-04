@@ -2089,11 +2089,15 @@ class TestQuickWinGates(unittest.TestCase):
         self.assertEqual(len(self._captured), 1)
 
     def test_h_2_0_does_not_block_buy_yes(self):
-        """H_2.0 is BUY_NO-only. BUY_YES with disagreement 3°F passes."""
+        """H_2.0 is BUY_NO-only. BUY_YES with disagreement 3°F passes.
+
+        Quotes tightened 2026-05-04 to avoid triggering the new
+        MODEL_MARKET_DISAGREE gate: mp=0.70 → mp_no=0.30; no_bid=50c →
+        gap = 0.50 − 0.30 = 0.20 < SKIP_MODEL_MARKET_DISAGREE_GAP_MIN (0.25)."""
         opp = self._opp(action="BUY_YES", model_prob=0.70, mu=45.5,
                         is_today=False, disagreement=3.0,
                         entry_price=0.30, edge=0.30,
-                        yes_bid=27, yes_ask=30, no_bid=68, no_ask=70)
+                        yes_bid=45, yes_ask=50, no_bid=50, no_ask=55)
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1)
 
@@ -5338,7 +5342,12 @@ class TestYesTailMarginGate(unittest.TestCase):
                          "DC-T46 case must not place an order")
 
     def test_yes_thigh_with_margin_passes_in_execute(self):
-        opp = self._yes_thigh(mu=48.5)  # margin = 2.0°F
+        # 2026-05-04: tighten quotes to avoid triggering the new
+        # MODEL_MARKET_DISAGREE gate (mp=0.65 → mp_no=0.35; default
+        # no_bid=68c gave gap 0.33 ≥ 0.25 → MMD blocked). no_bid=55c →
+        # gap 0.20 < 0.25 lets MMD pass so we can isolate YES_TAIL_MARGIN.
+        opp = self._yes_thigh(mu=48.5, yes_bid=42, yes_ask=45,
+                              no_bid=55, no_ask=58)  # margin = 2.0°F
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1,
                          "BUY_YES T-high with margin ≥ 1°F must pass")
