@@ -412,6 +412,11 @@ HARD_STOP_TAIL_LOSS_PCT = 0.70      # exit if MTM loss ≥ 70% on tails (lottery
 # has running_min). Bypassed when _obs_confirmed_alive.
 H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
+# 2026-05-03: laddered ask-chase on first-entry BUY_NO partial fills. After
+# the initial maker order fills < intended count, walk the ask up by 1c each
+# retry until edge < MIN_EDGE or remainder filled. Caps execution time +
+# slippage compounding. See _should_enter ladder block below.
+LADDER_MAX_RETRIES = 3
 BANKROLL_FLOOR_USD = 5.00           # refuse new orders if portfolio cash < this
 # 2026-05-02: BANKROLL_REF_USD now drives live Kelly sizing (was: documentation-
 # only). Chris bumped to $500 because actual Kalshi cash had drifted to ~$2-50
@@ -3893,6 +3898,81 @@ def execute_opportunity(opp: dict) -> bool:
             log(f"  cancel-remainder failed for {order_id} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  partial fill {filled}/{count} on {ticker}; cancelled remainder")
     actual_cost = filled * price
+
+    # 2026-05-03 LADDER CHASE — close the under-fill gap on thin Kalshi books.
+    # First-entry BUY_NO partial fills at the no_ask were leaving 80%+ of intended
+    # Kelly orphaned (PHX-MAY04 1/34, AUS-MAY03 2/26, SFO-MAY03 10/49). Walk the
+    # ask up by 1c at a time, re-checking edge at the new price. Stop when:
+    #   - remainder filled
+    #   - new edge below MIN_EDGE (Chris's gate — preserve the existing entry bar)
+    #   - cumulative cost would breach MAX_BET_USD
+    #   - LADDER_MAX_RETRIES hit (latency cap)
+    # Restricted to first-entry BUY_NO. BUY_YES has $5 per-trade cap so chase
+    # budget is small. Add-ons already iterate via the existing scan loop.
+    if (filled > 0 and filled < count and not is_addon
+            and action == "BUY_NO"
+            and edge >= MIN_EDGE):
+        mp_yes = float(opp.get("model_prob") or 0)
+        last_ask_c = price_cents
+        cumulative_filled = filled
+        cumulative_cost = actual_cost
+        for _retry in range(LADDER_MAX_RETRIES):
+            remainder = count - cumulative_filled
+            if remainder <= 0:
+                break
+            try:
+                _md = kalshi_get(f"/trade-api/v2/markets/{ticker}").get("market", {})
+                _new_ask_c = int(round(float(_md.get("no_ask_dollars", 0)) * 100))
+            except Exception as _le:
+                log(f"  ladder fetch failed on {ticker}: {type(_le).__name__}", "warn")
+                break
+            if _new_ask_c <= last_ask_c:
+                _new_ask_c = last_ask_c + 1  # ensure progress against stale quote
+            _new_price = _new_ask_c / 100.0
+            _new_edge = 1.0 - mp_yes - _new_price
+            if _new_edge < MIN_EDGE:
+                log(f"  ladder stop {ticker}: new_edge={_new_edge:.2%} < MIN_EDGE "
+                    f"at {_new_ask_c}c (filled {cumulative_filled}/{count})")
+                break
+            _budget_left = MAX_BET_USD - cumulative_cost
+            if _budget_left < _new_price:
+                log(f"  ladder stop {ticker}: at MAX_BET_USD cap "
+                    f"(cum=${cumulative_cost:.2f}, ask {_new_ask_c}c)")
+                break
+            _max_count = min(remainder, int(_budget_left / _new_price))
+            if _max_count < 1:
+                break
+            _retry_id = place_kalshi_order(ticker, side, _max_count, _new_ask_c)
+            if not _retry_id:
+                break
+            _r_status, _r_filled = wait_for_fill(_retry_id, _max_count, ORDER_FILL_TIMEOUT_SEC)
+            if _r_filled > 0:
+                if _r_filled < _max_count:
+                    try:
+                        kalshi_delete(f"/trade-api/v2/portfolio/orders/{_retry_id}")
+                    except Exception as _cx:
+                        log(f"  ladder cancel-remainder failed for {_retry_id} on {ticker}: "
+                            f"{type(_cx).__name__}: {_cx}", "warn")
+                cumulative_filled += _r_filled
+                cumulative_cost += _r_filled * _new_price
+                log(f"  LADDER +{_r_filled}x @ {_new_ask_c}c on {ticker} "
+                    f"(cum {cumulative_filled}/{count}, ${cumulative_cost:.2f}, "
+                    f"new_edge={_new_edge:.2%})", "trade")
+            else:
+                try:
+                    kalshi_delete(f"/trade-api/v2/portfolio/orders/{_retry_id}")
+                except Exception as _cx:
+                    log(f"  ladder cancel failed for {_retry_id} on {ticker}: "
+                        f"{type(_cx).__name__}: {_cx}", "warn")
+                log(f"  ladder no-fill on {ticker} @ {_new_ask_c}c — stopping")
+                break
+            last_ask_c = _new_ask_c
+        # Update fill totals after ladder. _budget_record below uses these,
+        # and trade_record records weighted-avg price (matches addon convention).
+        if cumulative_filled > filled:
+            filled = cumulative_filled
+            actual_cost = cumulative_cost
+            price = actual_cost / filled if filled > 0 else price
     _budget_record(actual_cost, opp.get("event_ticker", ""),
                    is_addon=is_addon)
     # Per-order trade record (always reflects THIS order, not cumulative
