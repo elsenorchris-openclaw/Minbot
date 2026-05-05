@@ -291,19 +291,31 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
     "KXLOWTHOU":  "hrrr",
     "KXLOWTNOLA": "hrrr",
     "KXLOWTSATX": "hrrr",
-    # 2026-05-05 follow-up audit (n=5 settled days, 2026-04-30 → 2026-05-04):
-    # MAE essentially tied (NBP 2.12°F vs HRRR 2.10°F) — the case is
-    # bias DIRECTION, not magnitude. NBP error is warm-skewed and
-    # asymmetric:
-    #   NBP errs:   0.00, +0.40, +1.80, +5.40, +3.00  → 4/5 warm, 2 ≥ +3°F
-    #   HRRR errs: -3.00, -3.70, -3.00, +0.70, +0.10  → 0/5 warm > +1°F
-    # For BUY_NO trades, only WARM-side forecast error is the failure
-    # mode (overstated mu → false confidence min won't be in bracket →
-    # actual settles into bracket). HRRR's cold bias does not produce
-    # losing BUY_NO entries; its trades simply look less attractive.
-    # KMIA-26MAY04-B71.5 BUY_NO: NBP=74.0, HRRR=71.1, actual=71.0 →
-    # HRRR-PRIMARY would have placed mu IN bracket → no BUY_NO generated.
-    "KXLOWTMIA":  "hrrr",
+    # 2026-05-05 broader audit — KMIA flipped from "hrrr" to "nbm" + KDEN/KMIN
+    # added. KMIA is a same-day re-audit refinement: morning's HRRR-PRIMARY was
+    # right call given NBP's catastrophic warm bias, but the broader 14d audit
+    # showed NBM is even better (MAE 1.15 vs HRRR 1.70 vs NBP 1.74 at d-1, n=4):
+    #   KMIA d-1 errs (NBP, HRRR, NBM):
+    #     4-30: 0.0,  -3.0, -0.8 → NBM and NBP roughly equal
+    #     5-01: +0.4, -3.7, -3.6 → NBP best
+    #     5-02: +1.8, -3.0, -3.0 → NBP best
+    #     5-03: +5.4, +0.7, +0.7 → HRRR/NBM tied
+    #     5-04: +3.0, +0.1, +0.1 → HRRR/NBM tied
+    #   NBM matches HRRR's accuracy on warm days + NBP's cold-direction
+    #   resilience on cool days.
+    "KXLOWTMIA":  "nbm",  # was "hrrr" (deployed earlier 2026-05-05 commit
+                          # 6014618); flipped to "nbm" same day after
+                          # broader audit. NBM is the structurally-better
+                          # source on KMIA d-1 in both directions.
+    # 2026-05-05 audit additions (n=4-5 per cell):
+    "KXLOWTDEN":  "nbm",  # NBP MAE=2.80 vs HRRR=1.40 vs NBM=1.05 (n=4).
+                          # NBP runs −2.4°F cold at d-1 — biggest cell-MAE
+                          # gap in the audit (+1.75°F NBM vs current NBP).
+    "KXLOWTMIN":  "hrrr", # NBP MAE=4.24 vs HRRR=3.68 vs NBM=4.50 (n=5).
+                          # All sources struggle (3.7-4.5°F MAE) but HRRR
+                          # is best. Marginal flip; KMIN d-1 trades are
+                          # high-noise regardless. Re-audit when NAM-MOS
+                          # gets ported.
 }
 
 # Per-city d-0 source override. d-0 default is HRRR (freshest nowcast), but
@@ -349,6 +361,15 @@ PER_SERIES_D0_PRIMARY: dict[str, str] = {
     "KXLOWTPHIL": "nbp",  # NBP MAE=0.97 vs HRRR=1.76 (gap −0.79°F)
     "KXLOWTSEA":  "nbp",  # NBP MAE=1.23 vs HRRR=1.57 (gap −0.34°F, marginal)
     "KXLOWTSFO":  "nbp",  # NBP MAE=0.93 vs HRRR=1.54 (gap −0.61°F)
+    # 2026-05-05 audit additions (n=6 per cell, broader 14d audit catching
+    # cells that the May-04 narrow audit missed):
+    "KXLOWTATL":  "nbp",  # NBP MAE=1.13 vs HRRR=2.03 (gap +0.90°F, n=6).
+                          # HRRR runs −1.70°F cold-biased on KATL d-0; NBP
+                          # +0.67°F warm but tighter overall. Trigger:
+                          # KATL-26MAY05-B54.5 BUY_NO entry today on HRRR
+                          # mu=51.4 vs actual rm=55.94 (4°F off).
+    "KXLOWTDAL":  "nbp",  # NBP MAE=0.53 vs HRRR=1.20 (gap +0.67°F, n=6).
+                          # NBP excellent on KDAL d-0 (-0.27°F bias).
     # Re-audit ~2026-05-18 (≥21d cumulative window).
 }
 
@@ -2858,6 +2879,15 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             mu = nbp["mu"]
             sigma = nbp["sigma"]
             mu_source = "nbp_d0_override"
+        elif (is_today
+              and PER_SERIES_D0_PRIMARY.get(m["series"]) == "nbm"
+              and nbm is not None):
+            # 2026-05-05: per-city d-0 override → NBM_OM. Used for cells
+            # where NBM materially beats both NBP and HRRR per audit.
+            # NBM has no native sigma; reuse NBP's σ if available, else 2.5°F.
+            mu = nbm
+            sigma = nbp["sigma"] if nbp else 2.5
+            mu_source = "nbm_d0_override"
         elif is_today and hrrr is not None:
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
@@ -2868,6 +2898,14 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr_d1_override"
+        elif (not is_today
+              and PER_SERIES_D1_PRIMARY.get(m["series"]) == "nbm"
+              and nbm is not None):
+            # 2026-05-05: per-city d-1+ override → NBM_OM. KMIA / KDEN
+            # at d-1 have NBM as the lowest-MAE source (audit n=4).
+            mu = nbm
+            sigma = nbp["sigma"] if nbp else 2.5
+            mu_source = "nbm_d1_override"
         elif nbp:
             mu = nbp["mu"]
             sigma = nbp["sigma"]

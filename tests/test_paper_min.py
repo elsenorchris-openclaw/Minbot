@@ -3217,29 +3217,57 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
         """KSAT: NBP 5.10 vs HRRR 1.85, gap +3.25°F (n=4)."""
         self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTSATX"), "hrrr")
 
-    def test_mia_uses_hrrr_on_d_minus_1(self):
-        """KMIA: NBP 2.12 vs HRRR 2.10°F MAE (n=5). MAE tied — case is
-        bias direction. NBP 4/5 warm, 2 errors ≥+3°F; HRRR 0/5 warm >+1°F.
-        Warm-side error is the BUY_NO failure mode. KMIA-26MAY04-B71.5
-        was the trigger (NBP=74, actual=71 → BUY_NO loss)."""
-        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTMIA"), "hrrr")
+    def test_mia_uses_nbm_on_d_minus_1(self):
+        """KMIA: 2026-05-05 broader audit (n=4) flipped from "hrrr" to
+        "nbm". Per-source MAE: NBP 1.74, HRRR 1.70, NBM 1.15. NBM wins
+        in BOTH directions: matches HRRR on warm days + NBP on cool days.
+        First "nbm" PRIMARY value in the codebase; consumer code in
+        find_opportunities has new branch for nbm_d1_override."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTMIA"), "nbm")
+
+    def test_den_uses_nbm_on_d_minus_1(self):
+        """KDEN: NBP 2.80 vs HRRR 1.40 vs NBM 1.05 (n=4, gap +1.75°F vs
+        current NBP). Biggest single-cell MAE improvement in the audit.
+        NBP runs −2.4°F cold-biased on KDEN d-1."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTDEN"), "nbm")
+
+    def test_min_uses_hrrr_on_d_minus_1(self):
+        """KMIN: NBP 4.24 vs HRRR 3.68 vs NBM 4.50 (n=5). All sources
+        struggle (3.7-4.5°F MAE) but HRRR is best — marginal flip from
+        default NBP. KMIN d-1 trades remain high-noise; re-audit when
+        NAM-MOS is ported to min_bot."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTMIN"), "hrrr")
 
     def test_other_cities_default_to_nbp(self):
         # Cities NOT in the override dict fall through to NBP.
-        # Note: HOU + SATX added 2026-05-04, MIA added 2026-05-05 — all
-        # removed from this list.
+        # Note: HOU + SATX added 2026-05-04; MIA flipped to "nbm" 2026-05-05;
+        # KDEN added 2026-05-05 — all removed from this list.
         for series in ("KXLOWTNYC", "KXLOWTLAX", "KXLOWTBOS", "KXLOWTAUS",
                        "KXLOWTSEA", "KXLOWTSFO"):
             self.assertNotIn(series, pb.PER_SERIES_D1_PRIMARY,
                              f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
 
-    def test_d1_override_count_is_six(self):
+    def test_d1_override_count_is_eight(self):
         """2 (CHI/OKC, 2026-04-29) + 3 (HOU/NOLA/SATX, 2026-05-04) +
-        1 (MIA, 2026-05-05) = 6 total."""
-        self.assertEqual(len(pb.PER_SERIES_D1_PRIMARY), 6,
-                         f"Expected 6 d-1 HRRR overrides, got "
+        1 (MIA, 2026-05-05 morning, "hrrr") + 2 (KDEN/KMIN, 2026-05-05
+        broader audit) = 8 total. Note: KMIA changed value (hrrr→nbm) but
+        count unchanged for that flip."""
+        self.assertEqual(len(pb.PER_SERIES_D1_PRIMARY), 8,
+                         f"Expected 8 d-1 overrides, got "
                          f"{len(pb.PER_SERIES_D1_PRIMARY)}: "
                          f"{sorted(pb.PER_SERIES_D1_PRIMARY)}")
+
+    def test_nbm_primary_value_is_supported(self):
+        """The PRIMARY dicts now accept "nbm" alongside "nbp" and "hrrr".
+        find_opportunities has the corresponding nbm_d{0,1}_override
+        branches in the mu-selection block. Verify both PRIMARY dicts
+        contain at most {"nbp","hrrr","nbm"} values."""
+        valid = {"nbp", "hrrr", "nbm"}
+        for d, name in [(pb.PER_SERIES_D0_PRIMARY, "D0"),
+                        (pb.PER_SERIES_D1_PRIMARY, "D1")]:
+            for series, src in d.items():
+                self.assertIn(src, valid,
+                    f"{name}[{series}] = {src!r} not in {valid}")
 
 
 class TestPerCityD0PrimarySource(unittest.TestCase):
@@ -3313,23 +3341,33 @@ class TestPerCityD0PrimarySource(unittest.TestCase):
         """KXLOWTPHX removed 2026-05-04 — NBP 0.88°F worse than HRRR."""
         self.assertNotIn("KXLOWTPHX", pb.PER_SERIES_D0_PRIMARY)
 
-    def test_atl_NOT_overridden_on_d_zero(self):
-        """ATL: HRRR slightly better historically. Don't flip."""
-        self.assertNotIn("KXLOWTATL", pb.PER_SERIES_D0_PRIMARY)
+    def test_atl_uses_nbp_on_d_zero(self):
+        """KATL: 2026-05-05 broader audit (n=6) found NBP MAE 1.13 vs
+        HRRR 2.03 (gap +0.90°F). HRRR runs −1.70°F cold-biased on KATL
+        d-0. Trigger: KATL-26MAY05-B54.5 BUY_NO entry today on HRRR
+        mu=51.4 vs actual rm=55.94 (4°F off)."""
+        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTATL"), "nbp")
+
+    def test_dal_uses_nbp_on_d_zero(self):
+        """KDAL: 2026-05-05 audit (n=6) found NBP MAE 0.53 vs HRRR
+        1.20 (gap +0.67°F). NBP excellent on KDAL d-0 (-0.27°F bias)."""
+        self.assertEqual(pb.PER_SERIES_D0_PRIMARY.get("KXLOWTDAL"), "nbp")
 
     def test_inland_plains_default_to_hrrr_on_d_zero(self):
-        """Cities where HRRR is materially BETTER stay on HRRR."""
-        for series in ("KXLOWTAUS", "KXLOWTDAL", "KXLOWTCHI", "KXLOWTMIN",
+        """Cities where HRRR is materially BETTER stay on HRRR.
+        Note: KDAL flipped to NBP 2026-05-05 — removed from this list."""
+        for series in ("KXLOWTAUS", "KXLOWTCHI", "KXLOWTMIN",
                        "KXLOWTOKC"):
             self.assertNotIn(
                 series, pb.PER_SERIES_D0_PRIMARY,
                 f"{series} HRRR is MAE-better on d-0; must stay on HRRR")
 
-    def test_d0_override_count_is_six(self):
-        """6 surviving NBP-better cells: BOS, LAS, LAX, PHIL, SEA, SFO.
-        Was 10 pre-2026-05-04; removed NYC/DC/MIA/PHX after 14d re-audit."""
-        self.assertEqual(len(pb.PER_SERIES_D0_PRIMARY), 6,
-                         f"Expected 6 d-0 NBP overrides, got "
+    def test_d0_override_count_is_eight(self):
+        """8 NBP-better cells: BOS, LAS, LAX, PHIL, SEA, SFO (2026-04-29
+        and 2026-05-01 cohorts) + ATL, DAL (2026-05-05 audit additions).
+        Was 6 pre-2026-05-05."""
+        self.assertEqual(len(pb.PER_SERIES_D0_PRIMARY), 8,
+                         f"Expected 8 d-0 overrides, got "
                          f"{len(pb.PER_SERIES_D0_PRIMARY)}: "
                          f"{sorted(pb.PER_SERIES_D0_PRIMARY)}")
 
