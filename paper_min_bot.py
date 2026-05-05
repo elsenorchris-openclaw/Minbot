@@ -581,6 +581,58 @@ def _log_skip(ticker: str, msg: str) -> None:
     log(msg)
 
 
+def _audit_skip(opp: dict, decision: str, msg: str) -> None:
+    """Audit-aware gate-skip helper (2026-05-04 night Phase B extension).
+
+    Wraps _log_skip + decision_log.record(). Use at every execute_opportunity
+    gate-skip-and-return-False site so each gate decision lands in
+    bot_decisions.sqlite alongside V1+V2's eval rows. The `decision` tag
+    becomes the queryable column for cross-bot backtests.
+
+    Spread is captured in fraction form (cents/100) for cross-bot consistency.
+    Failures inside record() are swallowed — never let logging crash trading.
+    """
+    ticker = opp.get("market_ticker", "") if isinstance(opp, dict) else ""
+    _log_skip(ticker, msg)
+    if _dlog is None or not isinstance(opp, dict):
+        return
+    try:
+        action = opp.get("action")
+        if action == "BUY_YES":
+            ya, yb = opp.get("yes_ask"), opp.get("yes_bid")
+            sp = (ya - yb) if (ya is not None and yb is not None) else None
+        else:
+            na, nb = opp.get("no_ask"), opp.get("no_bid")
+            sp = (na - nb) if (na is not None and nb is not None) else None
+        _dlog.record(
+            bot='min_bot', stage='gate', decision=decision,
+            ticker=ticker,
+            series=opp.get('series'),
+            settlement_date=opp.get('date_str'),
+            station=opp.get('station'),
+            floor=opp.get('floor'), cap=opp.get('cap'),
+            days_out=_days_out_int(opp),
+            next_action=action,
+            yes_bid=(opp.get('yes_bid') / 100.0) if opp.get('yes_bid') is not None else None,
+            yes_ask=(opp.get('yes_ask') / 100.0) if opp.get('yes_ask') is not None else None,
+            no_bid=(opp.get('no_bid') / 100.0) if opp.get('no_bid') is not None else None,
+            no_ask=(opp.get('no_ask') / 100.0) if opp.get('no_ask') is not None else None,
+            spread=(sp / 100.0) if sp is not None else None,
+            model_prob=opp.get('model_prob'),
+            edge=opp.get('edge'),
+            mu_blended=opp.get('mu'),
+            sigma_final=opp.get('sigma'),
+            nbp_mu=opp.get('mu_nbp'), nbp_sigma=opp.get('sigma_nbp'),
+            hrrr_high=opp.get('mu_hrrr'),
+            nbm_high=opp.get('mu_nbm_om'),
+            running_min=opp.get('running_min'),
+            disagree_ratio=opp.get('disagreement'),
+            blocker_reason=msg.strip(),
+        )
+    except Exception:
+        pass
+
+
 def _atomic_write_json(path: Path, data: Any) -> None:
     tmp = Path(str(path) + ".tmp")
     with open(tmp, "w") as f:
@@ -3840,7 +3892,7 @@ def execute_opportunity(opp: dict) -> bool:
         # Cold start with no successful balance fetch (e.g. Kalshi 401-ing).
         # Refuse rather than size against a synthetic fallback. Caller will
         # try again next scan; balance refresh runs inside _get_bankroll_cached.
-        _log_skip(ticker,
+        _audit_skip(opp, "NO_BANKROLL",
             f"  skip {ticker}: no verified bankroll yet "
             f"(get_kalshi_balance returned None); refusing trade")
         return False
@@ -3883,7 +3935,7 @@ def execute_opportunity(opp: dict) -> bool:
         # The hard-stop catches these post-entry, but the round-trip is costly
         # (LAX-T54 round-trip 2026-04-27 lost $3.44 in 18 min).
         if _check_obs_confirmed_loser(opp):
-            _log_skip(ticker,
+            _audit_skip(opp, "OBS_CONFIRMED_LOSER",
                 f"  skip {ticker}: OBS_CONFIRMED_LOSER — rm={opp.get('running_min')} "
                 f"already in YES territory (floor={opp.get('floor')}, cap={opp.get('cap')})")
             return False
@@ -3895,7 +3947,8 @@ def execute_opportunity(opp: dict) -> bool:
             # (μ at-or-near bracket boundary — honest forecast still landing
             # in the wrong bracket). High apparent edge IS a real model-error
             # signal, even when NBP aligns with recent CLI.
-            _log_skip(ticker, f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
+            _audit_skip(opp, "MAX_EDGE_EXCEEDED",
+                f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
             return False
         if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
             # NBP-CLI consistency bypass kept HERE only. Backtest: 3/3 cheap
@@ -3904,20 +3957,23 @@ def execute_opportunity(opp: dict) -> bool:
             # "very confident NO" trades where the bot's confidence was
             # justified by recent CLI patterns.
             if not _nbp_consistent_with_recent_cli(opp):
-                _log_skip(ticker, f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
+                _audit_skip(opp, "MODEL_PROB_OUT_OF_RANGE",
+                    f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
                 return False
             # else: bypass — recent CLI supports the extreme prob.
         # Directional consistency: never bet against our own model.
         if action == "BUY_NO" and mp > DIRECTIONAL_BUY_NO_MAX_MP:
-            _log_skip(ticker, f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%} (action vs model disagree)")
+            _audit_skip(opp, "DIRECTIONAL_NO_DISAGREE",
+                f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%} (action vs model disagree)")
             return False
         if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
-            _log_skip(ticker, f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
+            _audit_skip(opp, "DIRECTIONAL_YES_DISAGREE",
+                f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
             return False
         # Global BUY_NO T-high block (2026-05-01, was LAX-only).
         if (action == "BUY_NO"
                 and opp.get("floor") is not None and opp.get("cap") is None):
-            _log_skip(ticker,
+            _audit_skip(opp, "NO_THIGH",
                 f"  skip {ticker}: NO_THIGH — BUY_NO on T-high market blocked "
                 f"(structurally fights nighttime cooling; backtest 6L:1W on n=7)")
             return False
@@ -3932,7 +3988,7 @@ def execute_opportunity(opp: dict) -> bool:
                 else:
                     _yt_margin = float(_yt_cp) - float(_yt_mu)
                 if _yt_margin < YES_TAIL_MIN_MARGIN_F:
-                    _log_skip(ticker,
+                    _audit_skip(opp, "YES_TAIL_MARGIN",
                         f"  skip {ticker}: YES_TAIL_MARGIN — margin "
                         f"{_yt_margin:+.1f}°F < {YES_TAIL_MIN_MARGIN_F}°F "
                         f"into YES region (DC-T46-class boundary risk)")
@@ -3956,7 +4012,7 @@ def execute_opportunity(opp: dict) -> bool:
                 min_dist = max(MIN_ABS_DISTANCE_F,
                                MIN_ABS_DISTANCE_SIGMA_K * sigma_v)
                 if abs_dist < min_dist:
-                    _log_skip(ticker,
+                    _audit_skip(opp, "ABS_DISTANCE",
                         f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
                         f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F "
                         f"(min {min_dist:.2f}°F = max(0.5, {MIN_ABS_DISTANCE_SIGMA_K}×σ={sigma_v:.1f}))")
@@ -3964,7 +4020,7 @@ def execute_opportunity(opp: dict) -> bool:
         # F2A asymmetry gate (V2 port, BUY_NO only).
         f2a_block = _check_f2a_gate(opp)
         if f2a_block:
-            _log_skip(ticker, f"  skip {ticker}: {f2a_block}")
+            _audit_skip(opp, "F2A", f"  skip {ticker}: {f2a_block}")
             return False
         # COASTAL_TIGHT_FLOOR (production parity 2026-05-04): mirror of
         # _evaluate_gates twin. Was missing from execute_opportunity since
@@ -3981,7 +4037,7 @@ def execute_opportunity(opp: dict) -> bool:
                     and _ctf_mu is not None):
                 _ctf_gap = float(_ctf_floor) - float(_ctf_mu)
                 if _ctf_gap < COASTAL_TIGHT_FLOOR_MIN_GAP_F:
-                    _log_skip(ticker,
+                    _audit_skip(opp, "COASTAL_TIGHT_FLOOR",
                         f"  skip {ticker}: COASTAL_TIGHT_FLOOR — floor-mu gap "
                         f"{_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
                         f"(station={_ctf_station} marine cold-bias)")
@@ -3990,12 +4046,13 @@ def execute_opportunity(opp: dict) -> bool:
         # of _evaluate_gates twin. See SKIP_MODEL_MARKET_DISAGREE_* constants.
         mmd_block = _check_model_market_disagree(opp)
         if mmd_block:
-            _log_skip(ticker, f"  skip {ticker}: {mmd_block}")
+            _audit_skip(opp, "MODEL_MARKET_DISAGREE",
+                f"  skip {ticker}: {mmd_block}")
             return False
         # MSG multi-source consensus gate (V2 port, BUY_NO only).
         msg_block = _check_msg_gate(opp)
         if msg_block:
-            _log_skip(ticker, f"  skip {ticker}: {msg_block}")
+            _audit_skip(opp, "MSG", f"  skip {ticker}: {msg_block}")
             return False
         # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
@@ -4006,20 +4063,22 @@ def execute_opportunity(opp: dict) -> bool:
         if action == "BUY_NO" and not opp.get("is_today", False):
             disag = float(opp.get("disagreement", 0.0))
             if disag > H_2_0_DISAGREE_F:
-                _log_skip(ticker,
+                _audit_skip(opp, "H_2_DISAGREE",
                     f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
                     f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
                 return False
         disagreement = float(opp.get("disagreement", 0.0))
         if disagreement > MAX_DISAGREEMENT_F:
-            _log_skip(ticker, f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
+            _audit_skip(opp, "DISAGREEMENT",
+                f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
             return False
         # Mu-vs-running_min sanity: pre-sunrise, forecast μ vs observed lowest > 5°F = wrong.
         rm = opp.get("running_min")
         if rm is not None and not opp.get("post_sunrise_lock"):
             mu_check = float(opp.get("mu", 0.0))
             if abs(mu_check - float(rm)) > MAX_MU_VS_RM_DIFF_F:
-                _log_skip(ticker, f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
+                _audit_skip(opp, "MU_VS_RM",
+                    f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
                 return False
     # Spread filter — always applies (even on obs_alive bypass; thin books are
     # untradable regardless of obs confirmation).
@@ -4071,7 +4130,7 @@ def execute_opportunity(opp: dict) -> bool:
     ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""),
                                    is_addon=is_addon)
     if not ok:
-        _log_skip(ticker, f"  skip {ticker}: {reason}")
+        _audit_skip(opp, "BUDGET", f"  skip {ticker}: {reason}")
         return False
     price_cents = int(round(price * 100))
     order_id = place_kalshi_order(ticker, side, count, price_cents)
