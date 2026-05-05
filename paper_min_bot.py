@@ -60,6 +60,25 @@ try:
 except Exception:
     _dlog = None  # bot operates normally without audit if library unavailable
 
+# 2026-05-05 evening: per-station bias correction (Phase B min_bot wiring).
+# Reads from shared_tools/data/per_station_bias.json (refreshed nightly by
+# per_station_bias.py at 14:35 UTC). Returns None for non-applicable cells
+# so this is a SOFT augmentation: missing/stale/malformed table → no-op.
+# Sign convention: positive bias = forecast warmer than actual; corrected
+# mu = raw_mu - bias.
+#
+# Rollout: as of 2026-05-05, the bias table has NO applicable min cells
+# (min_bot is the only contributor; n=5-6 < min_n=7 threshold). KAUS d-0
+# min/HRRR (bias=+3.37, n=6) is one day shy of activation. Auto-activates
+# without code change as cells reach n=7+ over the next 1-7 days.
+try:
+    import bias_correction as _bias_correction
+except Exception:
+    _bias_correction = None  # bot operates normally without bias correction
+USE_BIAS_CORRECTION = True  # 2026-05-05: enabled (no applicable cells today
+                             # → zero behavioral impact; auto-activates as
+                             # data accumulates).
+
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
@@ -2916,6 +2935,34 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             mu_source = "nbm_om"
         if mu is None:
             continue
+
+        # 2026-05-05: per-station bias correction. Reads from
+        # shared_tools/data/per_station_bias.json. get_bias() returns None
+        # for non-applicable cells (n too low, unstable, |bias| too small).
+        # The base source for the lookup is the underlying forecast source
+        # — strip the d{0,1}_override suffix so e.g. "nbp_d0_override" maps
+        # to "nbp" in the bias table (which is keyed by raw source name).
+        bias_applied_F: Optional[float] = None
+        if USE_BIAS_CORRECTION and _bias_correction is not None:
+            base_src = mu_source
+            for suffix in ("_d0_override", "_d1_override", "_om"):
+                if base_src.endswith(suffix):
+                    base_src = base_src[:-len(suffix)]
+                    break
+            try:
+                _do = 0 if is_today else 1  # min_bot rarely evaluates >d-1; collapse to 1
+                _bias = _bias_correction.get_bias(
+                    station=m.get("station") or "",
+                    source=base_src,
+                    days_out=_do,
+                    forecast_type="min",
+                )
+                if _bias is not None and abs(_bias) > 0.0:
+                    mu = float(mu) - float(_bias)
+                    bias_applied_F = float(_bias)
+                    mu_source = f"{mu_source}_bias_corr"
+            except Exception:
+                pass  # never let bias correction break trade decisions
         # Inflate sigma if HRRR and NBP (or NBM) disagree significantly —
         # disagreement = model uncertainty we haven't captured.
         disagreement = 0.0
