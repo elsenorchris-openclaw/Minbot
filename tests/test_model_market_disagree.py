@@ -187,11 +187,12 @@ class TestDCT46Integration(unittest.TestCase):
             "disagreement": 0.5,
         }
         blocked_by, reason = pb._evaluate_gates(opp)
-        # YES_TAIL_MARGIN may fire first (μ-floor=+0.5°F < 1.0). Either gate
-        # blocking is acceptable — both are correct verdicts. We only require
-        # the trade to be blocked.
+        # Multiple gates correctly block DC-T46. Production gate order:
+        # DIRECTIONAL_BUY_YES (mp=0.62 < 0.65 since 2026-05-04 commit 3aed75c) →
+        # YES_TAIL_MARGIN (μ-floor=+0.5°F < 1.0) → MODEL_MARKET_DISAGREE.
+        # Test only requires the trade to be blocked by SOME defensible gate.
         self.assertIsNotNone(blocked_by, f"DC-T46 must be blocked, got: {blocked_by}/{reason}")
-        self.assertIn(blocked_by, ("YES_TAIL_MARGIN", "MODEL_MARKET_DISAGREE"))
+        self.assertIn(blocked_by, ("DIRECTIONAL_BUY_YES", "YES_TAIL_MARGIN", "MODEL_MARKET_DISAGREE"))
 
     def test_mmd_blocks_buy_yes_b_bracket_clean_setup(self):
         """B-bracket BUY_YES setup that bypasses YES_TAIL_MARGIN (only fires on

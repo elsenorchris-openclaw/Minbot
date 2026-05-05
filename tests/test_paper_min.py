@@ -1115,8 +1115,11 @@ class TestDirectionalGateTightened(unittest.TestCase):
     """Directional gate evolution:
        2026-04-27: tightened 0.50 → 0.40/0.60 (added action-vs-model rule)
        2026-04-29 night: BUY_NO further tightened 0.40 → 0.20 (V2 port; deduped
-                 pool n=42 confirmed h:h 12:1 lift +$5.16). BUY_YES kept at 0.60.
-    Current: BUY_NO requires mp ≤ 0.20; BUY_YES requires mp ≥ 0.60."""
+                 pool n=42 confirmed h:h 12:1 lift +$5.16).
+       2026-05-04 night: BUY_YES tightened 0.60 → 0.65 (commit 3aed75c).
+                 BUY_YES T-floor mp 60-65% bucket bled -$34.28 / 7 trades
+                 (2W:5L), catches DC-T46/OKC-T47/ATL-T53/OKC-T51.
+    Current: BUY_NO requires mp ≤ 0.20; BUY_YES requires mp ≥ 0.65."""
 
     def setUp(self):
         pb._cached_bankroll = 100.0  # cold-start guard requires verified bankroll
@@ -1189,13 +1192,14 @@ class TestDirectionalGateTightened(unittest.TestCase):
         self.assertEqual(self._order_calls, [])
 
     def test_buy_yes_just_below_new_threshold_blocked(self):
-        """mp=0.59 must block (NYC-T44 reconstruction at mp=0.42 also blocked)."""
-        pb.execute_opportunity(self._opp("BUY_YES", 0.59))
+        """mp=0.64 just below 0.65 — must block (NYC-T44 reconstruction at
+        mp=0.42 also blocked, exercising the gate at the deeper end)."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.64))
         self.assertEqual(self._order_calls, [])
 
     def test_buy_yes_at_new_threshold_passes(self):
-        """mp=0.60 is the threshold (strict less-than blocks)."""
-        pb.execute_opportunity(self._opp("BUY_YES", 0.60))
+        """mp=0.65 is the threshold (strict less-than blocks)."""
+        pb.execute_opportunity(self._opp("BUY_YES", 0.65))
         self.assertEqual(len(self._order_calls), 1)
 
 
@@ -3186,6 +3190,13 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
       NOLA d-1: NBP 4.05 vs HRRR 0.55  (gap +3.50°F)
       SATX d-1: NBP 5.10 vs HRRR 1.85  (gap +3.25°F)
 
+    2026-05-05: MIA added — MAE essentially tied (NBP 2.12 vs HRRR
+    2.10°F over n=5 d) but bias direction is asymmetric and matters
+    for BUY_NO trade quality:
+      NBP errs:   0.00, +0.40, +1.80, +5.40, +3.00  → 4/5 warm
+      HRRR errs: -3.00, -3.70, -3.00, +0.70, +0.10  → 0/5 warm > +1°F
+    Trigger: KMIA-26MAY04-B71.5 BUY_NO −$8.91 hard_stop loss.
+
     All other cities default to NBP."""
 
     def test_chi_uses_hrrr_on_d_minus_1(self):
@@ -3206,19 +3217,27 @@ class TestPerCityD1PrimarySource(unittest.TestCase):
         """KSAT: NBP 5.10 vs HRRR 1.85, gap +3.25°F (n=4)."""
         self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTSATX"), "hrrr")
 
+    def test_mia_uses_hrrr_on_d_minus_1(self):
+        """KMIA: NBP 2.12 vs HRRR 2.10°F MAE (n=5). MAE tied — case is
+        bias direction. NBP 4/5 warm, 2 errors ≥+3°F; HRRR 0/5 warm >+1°F.
+        Warm-side error is the BUY_NO failure mode. KMIA-26MAY04-B71.5
+        was the trigger (NBP=74, actual=71 → BUY_NO loss)."""
+        self.assertEqual(pb.PER_SERIES_D1_PRIMARY.get("KXLOWTMIA"), "hrrr")
+
     def test_other_cities_default_to_nbp(self):
         # Cities NOT in the override dict fall through to NBP.
-        # Note: HOU + SATX are now in PER_SERIES_D1_PRIMARY (added 2026-05-04),
-        # so removed from this list.
+        # Note: HOU + SATX added 2026-05-04, MIA added 2026-05-05 — all
+        # removed from this list.
         for series in ("KXLOWTNYC", "KXLOWTLAX", "KXLOWTBOS", "KXLOWTAUS",
-                       "KXLOWTSEA", "KXLOWTSFO", "KXLOWTMIA"):
+                       "KXLOWTSEA", "KXLOWTSFO"):
             self.assertNotIn(series, pb.PER_SERIES_D1_PRIMARY,
                              f"{series} should not be in PER_SERIES_D1_PRIMARY (default NBP)")
 
-    def test_d1_override_count_is_five(self):
-        """2 (CHI/OKC, 2026-04-29) + 3 (HOU/NOLA/SATX, 2026-05-04) = 5 total."""
-        self.assertEqual(len(pb.PER_SERIES_D1_PRIMARY), 5,
-                         f"Expected 5 d-1 HRRR overrides, got "
+    def test_d1_override_count_is_six(self):
+        """2 (CHI/OKC, 2026-04-29) + 3 (HOU/NOLA/SATX, 2026-05-04) +
+        1 (MIA, 2026-05-05) = 6 total."""
+        self.assertEqual(len(pb.PER_SERIES_D1_PRIMARY), 6,
+                         f"Expected 6 d-1 HRRR overrides, got "
                          f"{len(pb.PER_SERIES_D1_PRIMARY)}: "
                          f"{sorted(pb.PER_SERIES_D1_PRIMARY)}")
 
