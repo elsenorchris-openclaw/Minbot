@@ -1006,6 +1006,49 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
         return None
 
 
+# 2026-05-05: V1-port `_cli_aligned_rm` analog for min-bot. Returns the
+# integer-°F-rounded running_min that matches NWS CLI's reporting precision.
+# Used by precision_shadow_audit.py and (after validation) by entry/exit
+# gate comparisons against bracket floor/cap to align bot's view with how
+# Kalshi will settle.
+#
+# Why: bot's running_min can be 0-1°F above CLI integer settlement because
+#   (a) integer-°C sources (madis_fsl2, nws_obs) round DOWN at the 0.5°C
+#       boundary (e.g., true 13.3°C displayed as 13°C → 55.4°F when CLI's
+#       2-min ASOS avg rounds 55.94°F → 56°F), and
+#   (b) CLI uses 2-min ASOS averages with integer °F rounding, structurally
+#       different from our 5-min METAR snapshot.
+# When bot's raw rm=55.4°F is compared to bracket cap=55, raw rm is "in
+# bracket" (BUY_NO would lose). cli_aligned_rmin(55.4)=55 still in bracket
+# at this value, but cli_aligned_rmin(55.94)=56 (CLI's actual rounding) is
+# out of bracket — matching how Kalshi settles.
+#
+# USE_CLI_ALIGNED_RMIN flag: OFF by default (no behavior change). Flip on
+# only after the precision_shadow_audit.py 7-day report (2026-05-12) shows
+# net P&L lift from the cli-aligned variant. Gate-by-gate wiring is
+# deferred until then; this helper is a pure utility today.
+USE_CLI_ALIGNED_RMIN = False  # 2026-05-05: OFF; audit-pending
+
+def _cli_aligned_rmin(running_min: Optional[float]) -> Optional[float]:
+    """CLI-aligned integer °F running_min for bracket-edge comparisons.
+
+    Returns int(round_half_up(running_min)) as a float when the flag is on;
+    otherwise returns the raw value unchanged. Half-up rounding matches
+    NWS CLI convention. Returns None if input is None.
+
+    No production callers as of 2026-05-05. After 2026-05-12 audit decides
+    A vs B winner, this will be wired into:
+      - _check_obs_confirmed_loser (entry-side BUY_NO B-bracket comparison)
+      - _check_obs_confirmed_alive (entry-side BUY_NO B-bracket comparison)
+      - _check_position_obs_confirmed_loser_for_exit (exit-side guard)
+    """
+    if running_min is None:
+        return None
+    if not USE_CLI_ALIGNED_RMIN:
+        return float(running_min)
+    return float(int(float(running_min) + 0.5))
+
+
 # NEW LOW Discord alerts (2026-04-30) — mirror of V1/V2 max-bot's "NEW HIGH"
 # pattern. Min-bot doesn't write running_min itself (obs-pipeline does), so we
 # poll here once per scan and emit on a downward step. State is per-station,
