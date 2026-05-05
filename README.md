@@ -43,6 +43,27 @@ Full suite: **376 passed** (was 374, +2 net new tests). Zero regressions.
 
 **No behavior change to logic** — only the routing dicts moved. σ-aware Kelly, COASTAL_TIGHT_FLOOR (verified neutral, NOT bumped), MARKET_STOP, ladder, hard-stop disable all unchanged.
 
+**2026-05-05 follow-up — MIA added to D1 HRRR-PRIMARY (post-loss audit):**
+
+KMIA-26MAY04-B71.5 BUY_NO −$8.91 loss (NBP=74°F vs actual rm=71°F) prompted a 5-day MIA d-1 audit. Per-source error stats:
+
+| | NBP | HRRR | NBM_OM |
+|---|---:|---:|---:|
+| MAE | 2.12°F | 2.10°F | **1.64°F** |
+| bias | **+2.12°F warm** | −1.78°F cold | −1.32°F cold |
+| warm errors >+1°F | **4/5 days** | 0/5 | 0/5 |
+
+MAE is essentially tied between NBP and HRRR — the case is bias DIRECTION, not magnitude. NBP error is warm-skewed and asymmetric:
+
+- NBP errs:  `0.00, +0.40, +1.80, +5.40, +3.00`  → 4/5 warm, 2 ≥ +3°F
+- HRRR errs: `−3.00, −3.70, −3.00, +0.70, +0.10`  → 0/5 warm > +1°F
+
+For BUY_NO trades, only WARM-side forecast error is the failure mode (overstated μ → false confidence min won't be in bracket → actual settles into bracket). HRRR's cold bias does not produce losing BUY_NO entries; its trades simply look less attractive. KMIA-26MAY04-B71.5 specifically: NBP=74.0, HRRR=71.1, actual=71.0 → HRRR-PRIMARY would have placed μ IN bracket → no BUY_NO generated. Adding KMIA matches the gulf-coast cohort pattern. **Total D1 overrides: 5 → 6.**
+
+`COASTAL_TIGHT_FLOOR` (wired correctly via `d4b3e5d` today) is the safety-net gate for coastal BUY_NO; this per-series cohort change is the upstream prevention.
+
+Full suite: **574 passed / 5 fail** (the 5 fails are pre-existing ladder tests unrelated to forecast routing).
+
 ---
 
 ## Previous change (2026-05-04 afternoon) — ladder bumped to 5 + extended to BUY_YES + value-dead MARKET_STOP

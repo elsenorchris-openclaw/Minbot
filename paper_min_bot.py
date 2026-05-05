@@ -291,6 +291,19 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
     "KXLOWTHOU":  "hrrr",
     "KXLOWTNOLA": "hrrr",
     "KXLOWTSATX": "hrrr",
+    # 2026-05-05 follow-up audit (n=5 settled days, 2026-04-30 → 2026-05-04):
+    # MAE essentially tied (NBP 2.12°F vs HRRR 2.10°F) — the case is
+    # bias DIRECTION, not magnitude. NBP error is warm-skewed and
+    # asymmetric:
+    #   NBP errs:   0.00, +0.40, +1.80, +5.40, +3.00  → 4/5 warm, 2 ≥ +3°F
+    #   HRRR errs: -3.00, -3.70, -3.00, +0.70, +0.10  → 0/5 warm > +1°F
+    # For BUY_NO trades, only WARM-side forecast error is the failure
+    # mode (overstated mu → false confidence min won't be in bracket →
+    # actual settles into bracket). HRRR's cold bias does not produce
+    # losing BUY_NO entries; its trades simply look less attractive.
+    # KMIA-26MAY04-B71.5 BUY_NO: NBP=74.0, HRRR=71.1, actual=71.0 →
+    # HRRR-PRIMARY would have placed mu IN bracket → no BUY_NO generated.
+    "KXLOWTMIA":  "hrrr",
 }
 
 # Per-city d-0 source override. d-0 default is HRRR (freshest nowcast), but
