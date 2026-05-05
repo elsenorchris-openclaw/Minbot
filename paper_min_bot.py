@@ -1835,14 +1835,27 @@ def _fetch_open_meteo_batched(url: str, model: str, daily_var: str,
 
 
 def refresh_nbm_om_forecasts() -> None:
-    """Fetch best_match daily min via Open-Meteo (batched, free endpoint)."""
+    """Fetch best_match daily min via Open-Meteo (batched, paid customer endpoint).
+
+    2026-05-05: switched from `api.open-meteo.com` (free tier, 10k/day cap)
+    to `customer-api.open-meteo.com` + apikey (paid commercial tier, same
+    key V1+V2 already use). Pre-fix the free endpoint exhausted its daily
+    quota at ~08:23 UTC and returned 429s for the rest of the day; min_bot
+    retried every ~17s for 6+ hours producing log spam and burning whatever
+    quota remained. Customer endpoint has no shared-IP daily cap.
+    """
+    _load_open_meteo_key()
+    if not _OPEN_METEO_API_KEY:
+        log("  NBM-OM disabled: OPEN_METEO_API_KEY not in .env", "warn")
+        return
     _fetch_open_meteo_batched(
-        "https://api.open-meteo.com/v1/forecast",
+        "https://customer-api.open-meteo.com/v1/forecast",
         model="best_match",
         daily_var="temperature_2m_min",
         cache=_nbm_om_cache,
         cache_lock=_nbm_om_cache_lock,
         label="NBM-OM",
+        apikey=_OPEN_METEO_API_KEY,
     )
 
 
