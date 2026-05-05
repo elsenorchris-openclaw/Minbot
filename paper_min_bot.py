@@ -51,6 +51,15 @@ from cryptography.hazmat.primitives.asymmetric import padding
 
 import kalshi_ws  # WebSocket BBO client (V2 pattern, ported 2026-04-24)
 
+# 2026-05-04 evening: cross-bot decision audit log (Phase B min_bot wiring).
+# Records full state at every fork into shared_tools/data/bot_decisions.sqlite.
+# Failures never propagate — record() returns False on error, caller continues.
+sys.path.insert(0, '/home/ubuntu/shared_tools')
+try:
+    import decision_log as _dlog
+except Exception:
+    _dlog = None  # bot operates normally without audit if library unavailable
+
 # ═══════════════════════════════════════════════════════════════════════
 # CONFIG
 # ═══════════════════════════════════════════════════════════════════════
@@ -4023,6 +4032,40 @@ def execute_opportunity(opp: dict) -> bool:
         spread = (na - nb) if (na is not None and nb is not None) else 0
     if spread > MAX_SPREAD_CENTS:
         _log_skip(ticker, f"  skip {ticker}: spread {spread}c > {MAX_SPREAD_CENTS}c")
+        # 2026-05-04: cross-bot decision audit log — Phase B min_bot wiring.
+        # min_bot uses cents (yes_ask − yes_bid) instead of fraction; convert
+        # to fraction for cross-bot consistency in the schema.
+        if _dlog is not None:
+            try:
+                _dlog.record(
+                    bot='min_bot', stage='filter', decision='FILTERED_SPREAD',
+                    ticker=ticker,
+                    series=opp.get('series'),
+                    settlement_date=opp.get('date_str'),
+                    station=opp.get('station'),
+                    floor=opp.get('floor'), cap=opp.get('cap'),
+                    days_out=_days_out_int(opp),
+                    next_action=action,
+                    filter_name='SPREAD',
+                    filter_value=spread / 100.0,  # cents → fraction
+                    filter_threshold=MAX_SPREAD_CENTS / 100.0,
+                    yes_bid=(opp.get('yes_bid') / 100.0) if opp.get('yes_bid') is not None else None,
+                    yes_ask=(opp.get('yes_ask') / 100.0) if opp.get('yes_ask') is not None else None,
+                    no_bid=(opp.get('no_bid') / 100.0) if opp.get('no_bid') is not None else None,
+                    no_ask=(opp.get('no_ask') / 100.0) if opp.get('no_ask') is not None else None,
+                    spread=spread / 100.0,
+                    model_prob=opp.get('model_prob'),
+                    edge=edge,
+                    mu_blended=opp.get('mu'),
+                    sigma_final=opp.get('sigma'),
+                    nbp_mu=opp.get('mu_nbp'), nbp_sigma=opp.get('sigma_nbp'),
+                    hrrr_high=opp.get('mu_hrrr'),
+                    nbm_high=opp.get('mu_nbm_om'),
+                    running_min=opp.get('running_min'),
+                    is_addon=is_addon,
+                )
+            except Exception:
+                pass
         return False
     # Per-cycle / daily / per-event budget.
     ok, reason = _budget_can_take(intended_cost, opp.get("event_ticker", ""),
@@ -4240,6 +4283,57 @@ def execute_opportunity(opp: dict) -> bool:
         "_is_addon": is_addon,
     }
     _append_jsonl(_trades_file_today(), trade_record)
+
+    # 2026-05-04: cross-bot decision audit log — Phase B min_bot wiring.
+    # Mirrors trade_record above with consistent column names; queryable
+    # via SQL alongside V1+V2 entries in bot_decisions.sqlite.
+    if _dlog is not None:
+        try:
+            _dlog.record(
+                bot='min_bot', stage='exec', decision='ENTRY_FILLED',
+                ticker=ticker,
+                series=opp.get('series'),
+                settlement_date=opp.get('date_str'),
+                station=opp.get('station'),
+                floor=opp.get('floor'), cap=opp.get('cap'),
+                days_out=_days_out_int(opp),
+                local_hour=_entry_local_hour,
+                next_action=opp['action'],
+                # Quotes (cents → fraction)
+                yes_bid=(opp.get('yes_bid') / 100.0) if opp.get('yes_bid') is not None else None,
+                yes_ask=(opp.get('yes_ask') / 100.0) if opp.get('yes_ask') is not None else None,
+                no_bid=(opp.get('no_bid') / 100.0) if opp.get('no_bid') is not None else None,
+                no_ask=(opp.get('no_ask') / 100.0) if opp.get('no_ask') is not None else None,
+                spread=trade_record.get('entry_spread_cents') / 100.0
+                       if trade_record.get('entry_spread_cents') is not None else None,
+                volume_24h=opp.get('volume'),
+                # Model
+                model_prob=opp['model_prob'],
+                edge=edge,
+                mu_blended=opp['mu'],
+                sigma_final=opp['sigma'],
+                # Forecast sources
+                nbp_mu=opp.get('mu_nbp'), nbp_sigma=opp.get('sigma_nbp'),
+                hrrr_high=opp.get('mu_hrrr'),
+                nbm_high=opp.get('mu_nbm_om'),
+                disagree_ratio=opp.get('disagreement'),
+                # Obs
+                running_min=opp.get('running_min'),
+                # Freshness ages
+                hrrr_age_min=trade_record.get('hrrr_age_min'),
+                nbm_age_min=trade_record.get('nbm_om_age_min'),
+                nbp_age_min=trade_record.get('nbp_age_min'),
+                # Execution
+                fill_count=filled,
+                actual_cost=actual_cost,
+                order_id=order_id,
+                fill_price_cents=int(round(price * 100)),
+                # Context
+                is_addon=is_addon,
+            )
+        except Exception:
+            pass
+
     cumulative_count = filled
     cumulative_cost = actual_cost
     with _positions_lock:
