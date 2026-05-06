@@ -237,7 +237,17 @@ class TestCoastalTightFloorBothCallSites(unittest.TestCase):
     COASTAL_TIGHT_FLOOR into _evaluate_gates ONLY (the candidate-log path),
     NOT execute_opportunity (the actual decision path). Same class as the
     May 1 addon-path bug. This test ensures both paths block the same trade.
+
+    2026-05-06: gate disabled by default (_COASTAL_TIGHT_FLOOR_ENABLED=False).
+    Tests force-enable in setUp to keep validating the wiring for re-enable.
     """
+
+    def setUp(self):
+        self._orig_ctf_enabled = pb._COASTAL_TIGHT_FLOOR_ENABLED
+        pb._COASTAL_TIGHT_FLOOR_ENABLED = True
+
+    def tearDown(self):
+        pb._COASTAL_TIGHT_FLOOR_ENABLED = self._orig_ctf_enabled
 
     def test_constant_present(self):
         self.assertTrue(hasattr(pb, "COASTAL_TIGHT_FLOOR_STATIONS"))

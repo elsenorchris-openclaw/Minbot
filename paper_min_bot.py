@@ -142,18 +142,23 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters
 MIN_EDGE = 0.20                     # min edge to take a trade
-MAX_EDGE = 0.45                     # 0.40 → 0.42 (2026-04-27 evening) → 0.55 (2026-04-28 night,
-                                    # with NBP-CLI consistency bypass) → 0.45 (2026-04-29 early,
-                                    # bypass rolled back). Backtest of the 0.55+bypass policy on
-                                    # historical candidates: 8 bypass-passers, 5/5 of the BUY_NO
-                                    # MAX_EDGE-bypass cases lost (μ at-or-near bracket boundary —
-                                    # honest forecast still landing in the wrong bracket). 3/3 of
-                                    # the mp-range-only bypass cases (edge < 0.42 but mp outside
-                                    # [0.15, 0.85] with NBP consistent) won. Conclusion: high
-                                    # apparent edge IS a real model-error signal, even when NBP
-                                    # aligns with recent CLI. mp-range bypass kept; MAX_EDGE
-                                    # bypass removed; constant nudged to V2-validated 0.45.
-MIN_MODEL_PROB = 0.15               # skip model_prob < 15% (too unlikely to bet)
+MAX_EDGE = 0.50                     # 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) →
+                                    # 0.50 (2026-05-06). 5/4-5/6 audit: 21 winners / 9 losers
+                                    # blocked at 0.45 cap (70% would-win rate). The post-Apr-29
+                                    # rollback to 0.45 was based on 4/29 BUY_NO bypass losses;
+                                    # current regime has the model identifying deep-tail BUY_NO
+                                    # winners correctly at high edge. V2 raised 0.45→0.50 on
+                                    # 5/3 (P3 of filter audit, +18 era-wide, h:h 5:2).
+                                    # min_bot has the downstream catchers V2's note depends on
+                                    # (MODEL_MARKET_DISAGREE shipped 5/4, OBS_CONFIRMED_LOSER
+                                    # long-standing). Re-evaluate ~2026-05-20.
+MIN_MODEL_PROB = 0.05               # 2026-05-06: 0.15 → 0.05. 5/4-5/6 audit found
+                                    # 8,022 candidates blocked / 3 days, ~90% would have
+                                    # WON. min_bot was killing its own deep-tail BUY_NO
+                                    # channel where the model is most confident (mp 0-15%
+                                    # = model says 0-15% chance in bracket; usually right).
+                                    # V2 uses MIN_MODEL_PROB=0.03; min_bot now at 0.05
+                                    # (slightly more conservative). Re-evaluate ~2026-05-20.
 MAX_MODEL_PROB = 0.85               # skip model_prob > 85% (crowded / low payout)
 MIN_ORDER_PRICE = 0.05              # don't bet contracts priced < 5¢
 MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
@@ -1397,6 +1402,12 @@ COASTAL_NO_MPBYPASS_STATIONS = frozenset({
 # 1-2°F when marine layer / Gulf moisture moderates the airmass).
 # Narrower than COASTAL_NO_MPBYPASS_STATIONS (which is 10 stations) — only
 # the 4 here showed consistent coastal cold-bias on d-0/d-1 BUY_NO.
+_COASTAL_TIGHT_FLOOR_ENABLED = False  # 2026-05-06: disabled. 5/4-5/6 audit found
+                                       # 6 winners blocked / 1 loser — gate is regime-flipped.
+                                       # Original 5/3 backtest n=9 didn't generalize (cool-front
+                                       # regime broke the marine-cold-bias premise). Predicate
+                                       # preserved for fresh sliding-window re-enable. Re-evaluate
+                                       # ~2026-05-13.
 COASTAL_TIGHT_FLOOR_STATIONS = frozenset({"KLAX", "KSFO", "KMIA", "KHOU"})
 COASTAL_TIGHT_FLOOR_MIN_GAP_F = 2.1  # 2026-05-03: bumped 2.0 → 2.1 to include
                                        # gap=2.0 borderline cases. Re-audit on
@@ -3889,7 +3900,7 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     # 2026-05-03 COASTAL_TIGHT_FLOOR: known marine-cold-bias cities require a
     # 2°F cushion between bracket floor and bot's mu before BUY_NO B-bracket.
     # See COASTAL_TIGHT_FLOOR_STATIONS docstring for backtest evidence.
-    if action == "BUY_NO":
+    if _COASTAL_TIGHT_FLOOR_ENABLED and action == "BUY_NO":
         _ctf_station = opp.get("station")
         _ctf_floor = opp.get("floor")
         _ctf_cap = opp.get("cap")
@@ -4181,7 +4192,7 @@ def execute_opportunity(opp: dict) -> bool:
         # commit 93b1570 — gate shadow-logged correctly but never blocked
         # trades. See COASTAL_TIGHT_FLOOR_STATIONS / _evaluate_gates for
         # backtest. BUY_NO B-bracket only.
-        if action == "BUY_NO":
+        if _COASTAL_TIGHT_FLOOR_ENABLED and action == "BUY_NO":
             _ctf_station = opp.get("station")
             _ctf_floor = opp.get("floor")
             _ctf_cap = opp.get("cap")

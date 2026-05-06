@@ -3,7 +3,28 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-04 late afternoon) — `PER_SERIES_D{0,1}_PRIMARY` re-calibrated on 14d audit
+## Latest change (2026-05-06 morning) — Overfilter rollback: `MIN_MODEL_PROB` 0.15→0.05, `MAX_EDGE` 0.45→0.50, `COASTAL_TIGHT_FLOOR` disabled
+
+A 5/4–5/6 audit (8 days of `bot_decisions.sqlite` rows + `trades_*.jsonl` candidates joined to `obs.sqlite running_min` for actual outcomes) found three gates were costing more than they were saving in the current regime. All three changed today.
+
+**1. `MIN_MODEL_PROB` 0.15 → 0.05** — `MP_RANGE` blocked **8,022 candidates over 3 days**. Sample of 31 → ~28 would have **won**. The bot was killing its own deep-tail BUY_NO channel where the model's signal is strongest (mp 3–14% means model says 3–14% chance of being in bracket, and the model is right ~90% of the time). V2 uses 0.03; min_bot now at 0.05 for marginal conservatism. Note: F2A still blocks BUY_NO at mp < 0.05, so the deepest tail (mp 0–5%) remains gated — the change opens up the 5–15% mp band.
+
+**2. `MAX_EDGE` 0.45 → 0.50** — At the 0.45 cap (since 4/29), 5/4–5/6 blocks were **21 winners / 9 losers** (70% would-win rate). The 4/29 rollback to 0.45 was based on an n=5 BUY_NO-bypass-loss observation; current regime has the model correctly identifying deep-tail BUY_NO winners at high apparent edge. V2 raised 0.45→0.50 on 5/3 (P3 of filter audit, +$418 era-wide, h:h 5:2) — this is a parity change. min_bot has the V2 downstream catchers (`MODEL_MARKET_DISAGREE` shipped 5/4, `OBS_CONFIRMED_LOSER` long-standing).
+
+**3. `COASTAL_TIGHT_FLOOR` disabled via `_COASTAL_TIGHT_FLOOR_ENABLED = False`** — Original 5/3 backtest (n=9) showed h:h 6:0 (6 losses prevented). Live 5/4–5/6 result: 7 BUY_NO blocks, **6 won, 1 lost** — gate is regime-flipped. Cool-front shifted coastal lows out of brackets, breaking the marine-cold-bias premise. Predicate preserved (`COASTAL_TIGHT_FLOOR_STATIONS`, `COASTAL_TIGHT_FLOOR_MIN_GAP_F`) for fresh sliding-window re-enable. Re-evaluate ~2026-05-13.
+
+**Why this matters:** entry rate had dropped from ~10/day (4/29–5/3) to 4–7/day (5/4–5/6) with PnL flipping from +$15–50/day realized to −$3/day. The combination of these three gates was suppressing the bot's profitable BUY_NO B-bracket channel (era-wide n=28, W=25, L=3, +$164). Estimated overfilter cost: $200–500/day in missed profit.
+
+### Tests
+- `tests/test_paper_min.py` — 384 OK, 1 skip (`test_low_mp_passes_when_nbp_consistent`: bypass path obsolete when `MIN_MODEL_PROB == F2A_PROB_LO`)
+- `tests/test_model_market_disagree.py` — `TestCoastalTightFloorBothCallSites` `setUp/tearDown` now force-enables `_COASTAL_TIGHT_FLOOR_ENABLED` to keep validating wiring while flag is `False` in production
+- 5 pre-existing ladder-test failures (`test_ladder_chase_20260503`, `test_ladder_no_fill_continue_20260504`) are unchanged and unrelated
+
+Backups: `paper_min_bot.py.bak.pre_overfilter_20260506-065313`, `tests/test_paper_min.py.bak.pre_overfilter_20260506-065313`, `README.md.bak.pre_overfilter_20260506-065313`.
+
+Re-evaluate ~2026-05-20.
+
+## Previous change (2026-05-04 late afternoon) — `PER_SERIES_D{0,1}_PRIMARY` re-calibrated on 14d audit
 
 Recalibrated both per-city forecast-source override dicts based on a fresh 14d audit (`/tmp/inv2_audit_v2.py` on VPS — joined min_bot's candidate-log per-source forecasts with `obs.sqlite running_min` for actuals; n=4-6 settled cells per (city, days_out)).
 
@@ -519,10 +540,10 @@ All in `paper_min_bot.py`:
 | `DAILY_EXPOSURE_CAP_USD` | `$10000.00` (sentinel) | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27) → $120 (2026-04-28 night) → **effectively unlimited (2026-04-29 evening, per Chris)**. With ~$279 bankroll, $20/bet, 3 entries/cycle, and `BANKROLL_FLOOR_USD=$5`, the bankroll itself is the binding constraint — the bot stops placing orders once balance drops below $5. The $10,000 sentinel is unreachable at current scale; revisit only if bankroll grows past $5k. |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
-| `MAX_EDGE` | `0.45` | Skip edges > 45%. Evolution: 0.40 → 0.42 (2026-04-27) → 0.55 with NBP-CLI bypass (2026-04-28 night) → **0.45 with bypass rolled back** (2026-04-29 early). Backtest on n=8 historical bypass-passers: 5/5 BUY_NO MAX_EDGE-bypass cases LOST (μ at-or-near bracket boundary — honest forecasts still landing in the wrong bracket). High apparent edge IS a real model-error signal even when NBP aligns with recent CLI. **No bypass.** |
+| `MAX_EDGE` | `0.50` | Skip edges > 50%. Evolution: 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) → **0.50 (5/6)**. 5/6 raise driven by 21:9 winner:loser blocked-rate at 0.45 cap. No bypass — `MAX_EDGE` itself is the firewall. |
 | ~~PRICE_ZONE~~ | ~~yes_bid 30-40c~~ | **REMOVED 2026-04-29** after gate-audit on min_bot historical candidates: 2/2 PRICE_ZONE-blocked cases were winners (NYC-26APR25-B42.5 BUY_NO @66¢ → +$0.34/c; ATL-26APR27-B59.5 BUY_NO @67¢ → +$0.33/c). V2's max-temp finding (50% WR / −$99 / n=50) does not appear to hold for min-temp markets. Sample is small (n=2) but 100% winners and gate-cost is non-trivial; re-enable from git history if a future audit flips the signal. |
 | **H_2.0** | `disagreement 2°F` | **BUY_NO d-1+ only** (V2-inspired). Skip when pairwise forecast disagreement (NBP/HRRR/NBM max diff) > 2°F on day-1+ markets where we have no obs to break ties. Tighter than `MAX_DISAGREEMENT_F=5.0`. Bypassed by `_obs_confirmed_alive`. |
-| `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.15` / `0.85` | Skip wildly unlikely or near-certain. **Bypassed by `_nbp_consistent_with_recent_cli`** when forecast μ is within ±2°F of the station's last-7-day CLI low range. Backtest 2026-04-29: 3/3 historical bypass cases (cheap BUY_NO with mp 3-11%, μ clearly outside bracket, NBP consistent) all won — the gate was blocking legit "very confident NO" trades. Bypass kept for this gate only; same bypass on MAX_EDGE was rolled back same day after 5/5 losses. |
+| `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.05` / `0.85` | Skip wildly unlikely or near-certain. Lowered 0.15→0.05 on **2026-05-06** after audit found 8,022 blocks / 3 days, ~90% would-win rate — bot was killing its own deep-tail BUY_NO channel. **Bypassed by `_nbp_consistent_with_recent_cli`** when forecast μ is within ±2°F of the station's last-7-day CLI low range; bypass is now near-moot for the lower side because `F2A_PROB_LO=0.05` blocks at the same mp threshold. |
 | **Directional consistency** | `mp 0.20 / 0.60` | BUY_NO requires `mp ≤ 0.20`; BUY_YES requires `mp ≥ 0.60`. Don't bet against your own model. **Evolution**: 0.50 (initial) → 0.40/0.60 (2026-04-27, CHI-T41 mp=34% / NYC-T44 mp=42% BUY_YES losers triggered) → **BUY_NO 0.40 → 0.20** (2026-04-29 night, V2 port). 2026-04-29 audit on deduped n=42 BUY_NO pool: trades with mp ∈ (0.20, 0.40] had 12L:1W, lift +$5.16 over no-filter; every mp bucket above 0.20 is net negative. April 29 forward-test: of 13 entries, only LAX-30-B56.5 would have been newly blocked (currently coin-flip; small + impact). BUY_YES side kept at 0.60 — symmetric tightening to 0.80 not yet validated on min_bot. mp_range_bypass (NBP-CLI consistency) applies to MIN/MAX_MODEL_PROB only, NOT to directional consistency. |
 | `MIN_ABS_DISTANCE_F` | `0.5°F` | **BUY_NO only** — skip when `\|mu − bracket_mid\| < 0.5°F` (mu inside or near bracket center). 1.0 → 1.5 (2026-04-27 AM) → reverted to 0.5 (2026-04-27 PM) after Kalshi-truth audit on n=15: at 1.5°F we'd have blocked 9/9 winners with dist 0.5–1.5°F (BUY_NO with mu *at the bracket edge*, not inside). PHIL-B44.5 (0.1°F, mu inside) is still caught at 0.5°F. BUY_YES intentionally not gated. |
 | **F2A asymmetry gate** | mp / sigma | **BUY_NO only** (V2 port). Block if `mp < 0.05` (price-asymmetry trap), `mp ≥ 0.30` (calibration cliff), or `sigma < 1.5°F` (over-confident model). V2's distance-from-edge sub-check NOT ported — min-bot audit found at-edge mu is the BUY_NO sweet spot. Bypassed when `_obs_confirmed_alive`. |

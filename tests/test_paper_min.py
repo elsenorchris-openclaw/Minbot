@@ -2040,8 +2040,8 @@ class TestQuickWinGates(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_max_edge_is_0_45(self):
-        self.assertEqual(pb.MAX_EDGE, 0.45)
+    def test_max_edge_is_0_50(self):
+        self.assertEqual(pb.MAX_EDGE, 0.50)
 
     def test_edge_above_max_edge_blocked_unconditionally(self):
         """Edge > MAX_EDGE blocks regardless of NBP-CLI consistency. Backtest
@@ -2050,16 +2050,15 @@ class TestQuickWinGates(unittest.TestCase):
         orig = pb.get_recent_cli_range
         pb.get_recent_cli_range = lambda *a, **kw: (40.0, 42.0)
         try:
-            pb.execute_opportunity(self._opp(edge=0.50, no_ask=15))
+            pb.execute_opportunity(self._opp(edge=0.55, no_ask=15))
             self.assertEqual(self._captured, [],
                 "MAX_EDGE must block even when NBP is consistent — backtest evidence")
         finally:
             pb.get_recent_cli_range = orig
 
-    def test_edge_at_max_edge_passes(self):
-        """Edge = MAX_EDGE 0.45 (strict greater-than blocks). Passes.
-        BUY_NO with mp=0.20 (in [0.15, 0.40]) and no_ask=35c
-        → edge = (1-0.20) - 0.35 = 0.45 exactly."""
+    def test_edge_below_max_edge_passes(self):
+        """Edge=0.45 (below new MAX_EDGE=0.50). Passes.
+        BUY_NO with mp=0.20 and no_ask=35c → edge = (1-0.20) - 0.35 = 0.45."""
         opp = self._opp(model_prob=0.20, no_ask=35, no_bid=33, entry_price=0.35,
                         edge=0.45, yes_bid=63, yes_ask=65)
         pb.execute_opportunity(opp)
@@ -2518,12 +2517,12 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
 
     def _atl_b59_opp(self):
         """Reconstructs KXLOWTATL-26APR27-B59.5 backtest winner: BUY_NO,
-        edge=0.25, mp=0.08 (< MIN_MODEL_PROB=0.15), μ=62 with bracket [59,60]
+        edge=0.25, mp=0.03 (< MIN_MODEL_PROB=0.05), μ=62 with bracket [59,60]
         (μ 2°F above bracket — clearly outside), KATL recent CLI [44, 66]."""
         return {
             "market_ticker": "KXLOWTATL-26APR27-B59.5",
             "event_ticker": "KXLOWTATL-26APR27",
-            "action": "BUY_NO", "model_prob": 0.08, "edge": 0.25,
+            "action": "BUY_NO", "model_prob": 0.03, "edge": 0.25,
             "entry_price": 0.67, "yes_bid": 7, "yes_ask": 11,
             "no_bid": 65, "no_ask": 67, "mu": 62.0, "sigma": 4.5,
             "mu_source": "nbp", "running_min": None,
@@ -2533,8 +2532,12 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
             "series": "KXLOWTATL", "is_today": False,
         }
 
+    @unittest.skip("2026-05-06: MIN_MODEL_PROB=0.05 == F2A_PROB_LO=0.05 — "
+                   "the MP_RANGE bypass can no longer salvage low-mp BUY_NO "
+                   "(F2A blocks at the same threshold). Re-enable after F2A "
+                   "audit if F2A_PROB_LO is lowered.")
     def test_low_mp_passes_when_nbp_consistent(self):
-        """mp=8% < MIN_MODEL_PROB=15% but μ=62 fits recent [44, 66] →
+        """mp=3% < MIN_MODEL_PROB=5% but μ=62 fits recent [44, 66] →
         bypass mp-range → trade placed."""
         pb.get_recent_cli_range = lambda station, **kw: (44.0, 66.0) if station == "KATL" else None
         pb.execute_opportunity(self._atl_b59_opp())
@@ -2558,7 +2561,7 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
     def test_high_edge_blocks_even_with_consistency(self):
         """Backtest 2026-04-29: 5/5 BUY_NO MAX_EDGE-bypass cases lost. The
         MAX_EDGE bypass was removed. Even with NBP perfectly consistent,
-        edge > 0.45 must still block."""
+        edge > MAX_EDGE (0.50) must still block."""
         pb.get_recent_cli_range = lambda station, **kw: (60.0, 65.0)
         # MIA-26APR25-B71.5 reconstruction: μ=70.5 in [70,74] (consistent),
         # but edge 72% — must block.
@@ -2629,11 +2632,13 @@ class TestEvaluateGates(unittest.TestCase):
         self.assertEqual(gate, "MIN_EDGE")
 
     def test_max_edge(self):
-        gate, _ = pb._evaluate_gates(self._opp(edge=0.50))
+        # MAX_EDGE = 0.50 (raised 5/6); use edge=0.55 to be unambiguously above
+        gate, _ = pb._evaluate_gates(self._opp(edge=0.55))
         self.assertEqual(gate, "MAX_EDGE")
 
     def test_mp_range_low(self):
-        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.05))
+        # MIN_MODEL_PROB = 0.05 (lowered 5/6); use mp=0.03 to trigger MP_RANGE
+        gate, _ = pb._evaluate_gates(self._opp(model_prob=0.03))
         self.assertEqual(gate, "MP_RANGE")
 
     def test_mp_range_high(self):
@@ -2668,7 +2673,7 @@ class TestEvaluateGates(unittest.TestCase):
 
     def test_f2a_low_mp(self):
         gate, _ = pb._evaluate_gates(self._opp(model_prob=0.03))
-        # mp=0.03 < MIN_MODEL_PROB=0.15, so MP_RANGE fires before F2A
+        # mp=0.03 < MIN_MODEL_PROB=0.05, so MP_RANGE fires before F2A
         self.assertEqual(gate, "MP_RANGE")
 
     def test_msg_worst_city(self):
@@ -2720,14 +2725,21 @@ class TestCoastalTightFloorGate(unittest.TestCase):
     require >= 2.0°F gap between floor and mu — guards against marine cold-bias
     that under-predicted overnight lows on these stations by 1-2°F (n=9 audit:
     every entry had gap <= 2°F, 6 of 9 lost). Mechanism is coastal-specific:
-    same gate on inland stations HURT in audit, so we narrow to 4 stations."""
+    same gate on inland stations HURT in audit, so we narrow to 4 stations.
+
+    2026-05-06: gate disabled by default (_COASTAL_TIGHT_FLOOR_ENABLED=False)
+    after live audit found 6 winners blocked / 1 loser. Tests force-enable
+    the flag in setUp to keep validating gate logic for re-enable."""
 
     def setUp(self):
         self._orig_recent = pb.get_recent_cli_range
         pb.get_recent_cli_range = lambda *a, **kw: None
+        self._orig_ctf_enabled = pb._COASTAL_TIGHT_FLOOR_ENABLED
+        pb._COASTAL_TIGHT_FLOOR_ENABLED = True
 
     def tearDown(self):
         pb.get_recent_cli_range = self._orig_recent
+        pb._COASTAL_TIGHT_FLOOR_ENABLED = self._orig_ctf_enabled
 
     def _opp(self, station, mu, floor, **overrides):
         cap = floor + 1.0
@@ -2966,7 +2978,7 @@ class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
     def test_records_blocked_by(self):
         opp = {
             "market_ticker": "KXLOWTNYC-26APR28-B45.5", "kind": "bracket",
-            "action": "BUY_NO", "edge": 0.50, "model_prob": 0.20,
+            "action": "BUY_NO", "edge": 0.55, "model_prob": 0.20,
             "entry_price": 0.50, "yes_bid": 48, "yes_ask": 50,
             "no_bid": 48, "no_ask": 50, "mu": 41.0, "sigma": 2.5,
             "running_min": None, "post_sunrise_lock": False,
@@ -5084,7 +5096,7 @@ class TestAddOnPath(unittest.TestCase):
         """Edge has eroded above MAX_EDGE since first entry → no add-on."""
         self._seed_partial("KXLOWTBOS-26APR28-B45.5",
                            count=5, intended=50, cost=1.50)
-        opp = self._opp(edge=0.50)  # > MAX_EDGE
+        opp = self._opp(edge=0.55)  # > MAX_EDGE 0.50 (raised 5/6)
         self.assertFalse(pb.execute_opportunity(opp),
                          "addon must respect MAX_EDGE gate")
         self.assertEqual(self._place_calls, [])
