@@ -30,9 +30,39 @@ constraint — be humbler about claims, not louder.
 
 ## How to run the audit
 
+### Backtest tool with --stack (filter validation)
+
+For validating NEW filters or thresholds against the deployed chain:
+
 ```bash
 ssh -i ~/.ssh/kalshi-bot-key ubuntu@54.225.174.220
 cd /home/ubuntu/paper_min_bot
+
+python3 tools/backtest_filters.py --pool-stats     # baseline settled-pool stats
+python3 tools/backtest_filters.py --scenario list  # list deployed scenarios + LIVE_CHAIN
+python3 tools/backtest_filters.py --list-filters   # list all gate decision tags from bot_decisions
+
+# Validate a NEW filter — ALWAYS pair --custom (or --scenario) with --stack live
+python3 tools/backtest_filters.py --custom my.py:should_skip --stack live
+python3 tools/backtest_filters.py --scenario obs_confirmed_loser --stack live
+```
+
+⛔ **Always use `--stack live`** when validating a new filter. The tool's
+naive (no-`--stack`) report prints a WARNING because standalone
+measurement overstates lift when the candidate overlaps any deployed
+filter. Mirrors V1's `tools/v1_backtest_filters.py --stack live` and
+V2's `obs-pipeline-bot/tools/backtest_filters.py --stack live`.
+
+When a NEW filter is deployed in `paper_min_bot.py`, add it to BOTH the
+`SCENARIOS` dict AND `LIVE_CHAIN` in `tools/backtest_filters.py` in the
+SAME COMMIT. `LIVE_CHAIN` is the deploy gate — partial stacks silently
+overstate `lift_inc`.
+
+### Gate audit (existing tool)
+
+For analyzing what's been blocking historically:
+
+```bash
 python3 tools/gate_audit.py --list-gates           # known gate names
 python3 tools/gate_audit.py                        # all gates summary
 python3 tools/gate_audit.py --gate PRICE_ZONE      # detail on one gate
