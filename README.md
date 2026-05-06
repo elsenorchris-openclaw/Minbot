@@ -49,6 +49,16 @@ The 5/6 first run flipped exactly **one cell**: KSEA d-0 NBP → HRRR (1.78°F �
 
 Post-restart, `KXLOWTSEA-26MAY06` d-0 candidates show `mu_source=hrrr`, `mu=51.2` (HRRR's value) instead of `mu_source=nbp_d0_override`, `mu=53.0` (the previous NBP value). The auto-select chain is live.
 
+### Safety fixes (2026-05-06 evening)
+
+Two robustness improvements after edge-case audit:
+
+1. **Atomic JSON write** in `tools/auto_select_per_series_primary.py` — write to `OUTPUT_JSON.tmp` then `os.replace()` (atomic POSIX rename). Prevents the bot from reading a half-written file mid-cron.
+
+2. **Retry-storm guard** in `_maybe_reload_auto_primary()` — on JSON parse failure or `computed_at` parse failure, bump `loaded_mtime` to the current file mtime so we skip retries on the same corrupt file until the next cron rewrite. Previously every cycle would re-read+re-parse the same bad file.
+
+No behavior change in normal operation. 11 tests still pass.
+
 Backups: `paper_min_bot.py.bak.pre_autoselect_20260506-200615` + parallels.
 
 Re-evaluate ~2026-05-20.

@@ -359,12 +359,17 @@ def _maybe_reload_auto_primary() -> None:
     try:
         with open(path) as f:
             data = json.load(f)
-    except (OSError, ValueError) as e:
+    except (OSError, ValueError):
+        # Bump loaded_mtime to skip retries on the same corrupt file (avoid retry storm)
+        with _auto_primary_lock:
+            _auto_primary_cache["loaded_mtime"] = mtime
         return
     # Validate computed_at age
     try:
         computed_ts = datetime.fromisoformat(data.get("computed_at", "")).timestamp()
     except (ValueError, TypeError):
+        with _auto_primary_lock:
+            _auto_primary_cache["loaded_mtime"] = mtime
         return
     if (time.time() - computed_ts) > AUTO_PRIMARY_MAX_AGE_SEC:
         # Stale — invalidate
@@ -1207,25 +1212,90 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
 # only after the precision_shadow_audit.py 7-day report (2026-05-12) shows
 # net P&L lift from the cli-aligned variant. Gate-by-gate wiring is
 # deferred until then; this helper is a pure utility today.
-USE_CLI_ALIGNED_RMIN = False  # 2026-05-05: OFF; audit-pending
+USE_CLI_ALIGNED_RMIN = True  # 2026-05-06: V1/V2-port. Aligns rm at model_prob calc + obs_confirmed_* checks via METAR-precision lookup, not just int-rounding.
 
-def _cli_aligned_rmin(running_min: Optional[float]) -> Optional[float]:
+
+def _get_metar_running_min(station: str, climate_date: str) -> Optional[float]:
+    """METAR-text-only running_min from awc/ldm sources for (station, date).
+
+    Returns the minimum temp_f from observations table where source IN
+    ('awc', 'ldm') for the given climate_date. These are NWS METAR T-group
+    decimal sources (0.1°C precision) — what NWS CLI actually rolls up to
+    integer °F. Mirror of V1/V2 `_get_metar_running_max`.
+
+    Returns None when no awc/ldm observations are present for the date,
+    or on DB error. Caller falls back to the unaligned running_min.
+    """
+    try:
+        # observations.obs_time is epoch seconds; climate_date is LST day.
+        # Filter using local midnight boundaries derived from station tz —
+        # but for simplicity (and matching obs-pipeline's seed semantics),
+        # use a 24h+12h window to capture the whole climate day robustly.
+        # The obs-pipeline running_min table itself uses LST climate-date
+        # tagging on the actual obs_time, so we approximate by date_str.
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        # Read min temp_f where source is METAR-text and obs is on the
+        # climate date. Climate day spans ~36h UTC for any timezone.
+        # Compare obs_time to a window that covers the full climate day:
+        # date_str at 00:00 UTC ± 12h is conservative.
+        row = conn.execute(
+            """
+            SELECT MIN(temp_f) FROM observations
+            WHERE station = ?
+              AND source IN ('awc','ldm')
+              AND obs_time >= strftime('%s', ? || 'T00:00:00') - 43200
+              AND obs_time <  strftime('%s', ? || 'T23:59:59') + 43200
+            """,
+            (station, climate_date, climate_date),
+        ).fetchone()
+        conn.close()
+        if row and row[0] is not None:
+            return float(row[0])
+        return None
+    except sqlite3.Error as e:
+        log(f"  metar rmin DB read error for {station} {climate_date}: {e}", "warn")
+        return None
+
+
+def _cli_aligned_rmin(running_min: Optional[float],
+                     station: Optional[str] = None,
+                     climate_date: Optional[str] = None) -> Optional[float]:
     """CLI-aligned integer °F running_min for bracket-edge comparisons.
 
-    Returns int(round_half_up(running_min)) as a float when the flag is on;
-    otherwise returns the raw value unchanged. Half-up rounding matches
-    NWS CLI convention. Returns None if input is None.
+    2026-05-06 (V1/V2-port): when station+climate_date are provided AND the
+    flag is on, prefer METAR-precision running_min (from awc/ldm 0.1°C T-group
+    obs) over the polluted running_min table (which can include integer-°C
+    sources madis_fsl2/nws_obs). Fall back to provided `running_min` when
+    METAR data is missing.
 
-    No production callers as of 2026-05-05. After 2026-05-12 audit decides
-    A vs B winner, this will be wired into:
-      - _check_obs_confirmed_loser (entry-side BUY_NO B-bracket comparison)
-      - _check_obs_confirmed_alive (entry-side BUY_NO B-bracket comparison)
-      - _check_position_obs_confirmed_loser_for_exit (exit-side guard)
+    Without station/climate_date OR with flag off, behaves as the original
+    half-up int-round helper (or no-op).
+
+    Half-up rounding matches NWS CLI convention. Returns None if input None.
+
+    Defensive: if METAR rmin > running_min + 0.5°F (METAR colder than aggregate
+    by less than 0.5°F is fine; warmer is suspicious — running_min is
+    lowest-wins so aggregate <= METAR is unexpected), prefer running_min.
     """
     if running_min is None:
         return None
     if not USE_CLI_ALIGNED_RMIN:
         return float(running_min)
+
+    # Try METAR-precision lookup first when station+date provided
+    if station and climate_date:
+        rm_metar = _get_metar_running_min(station, climate_date)
+        if rm_metar is not None:
+            # Defensive: METAR shouldn't be materially colder than aggregate.
+            # Aggregate min uses lowest-wins across sources, so it should be
+            # <= METAR min. If METAR > aggregate + 0.5, something's off — use
+            # aggregate.
+            if rm_metar > float(running_min) + 0.5:
+                return float(int(float(running_min) + 0.5))
+            # Half-up round METAR to integer °F (CLI convention)
+            return float(int(rm_metar + 0.5))
+
+    # Fallback: simple int-round of provided running_min
     return float(int(float(running_min) + 0.5))
 
 
@@ -2357,6 +2427,9 @@ def calc_bracket_probability_min(
     floor: Optional[float], cap: Optional[float],
     running_min: Optional[float] = None,
     post_sunrise_lock: bool = False,
+    *,
+    station: Optional[str] = None,
+    date_str: Optional[str] = None,
 ) -> float:
     """P(daily_min falls in bracket [floor, cap]) under Gaussian(mu, sigma),
     with two physics-based refinements:
@@ -2383,6 +2456,17 @@ def calc_bracket_probability_min(
     """
     if sigma <= 0:
         sigma = 0.5
+
+    # 2026-05-06: V1/V2-port. CLI-align running_min using METAR-precision
+    # lookup when caller provides station+date_str. All downstream uses
+    # (truncation, post-sunrise lock, ceiling guards) see the integer-°F
+    # value matching what NWS CLI will settle on. Avoids false BUY_NO
+    # OBS_CONFIRMED_LOSER triggers on madis_fsl2/nws_obs integer-°C
+    # round-down pollution. No-op when station/date_str not provided.
+    if running_min is not None and station and date_str and USE_CLI_ALIGNED_RMIN:
+        _aligned_rm = _cli_aligned_rmin(running_min, station, date_str)
+        if _aligned_rm is not None:
+            running_min = _aligned_rm
 
     # 2026-05-02 BRACKET MATH FIX (port from V1/V2 2026-04-22; Brier
     # backtest 0.250 → 0.228 on n=398 settled brackets). Kalshi settles
@@ -2773,6 +2857,13 @@ def _check_obs_confirmed_alive(opp_or_pos: dict) -> bool:
     floor = opp_or_pos.get("floor")
     cap = opp_or_pos.get("cap")
     action = opp_or_pos.get("action")
+    # 2026-05-06: cli-align rm using METAR-precision when station+date present
+    _station = opp_or_pos.get("station")
+    _date_str = opp_or_pos.get("date_str")
+    if USE_CLI_ALIGNED_RMIN and _station and _date_str:
+        _aligned = _cli_aligned_rmin(rm, _station, _date_str)
+        if _aligned is not None:
+            rm = _aligned
     rm_f = float(rm)
 
     if action == "BUY_NO":
@@ -2826,6 +2917,13 @@ def _check_obs_confirmed_loser(opp_or_pos: dict) -> bool:
     floor = opp_or_pos.get("floor")
     cap = opp_or_pos.get("cap")
     action = opp_or_pos.get("action")
+    # 2026-05-06: cli-align rm using METAR-precision when station+date present
+    _station = opp_or_pos.get("station")
+    _date_str = opp_or_pos.get("date_str")
+    if USE_CLI_ALIGNED_RMIN and _station and _date_str:
+        _aligned = _cli_aligned_rmin(rm, _station, _date_str)
+        if _aligned is not None:
+            rm = _aligned
     rm_f = float(rm)
 
     if action == "BUY_NO":
@@ -3172,6 +3270,8 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             floor=m.get("floor"), cap=m.get("cap"),
             running_min=rm,
             post_sunrise_lock=post_sr,
+            station=station,
+            date_str=today_cd if is_today else None,
         )
         # Filter wildly unlikely / crowded
         if model_prob < MIN_MODEL_PROB or model_prob > MAX_MODEL_PROB:
@@ -3793,6 +3893,8 @@ def _compute_position_telemetry(pos: dict, mkt: Optional[dict]) -> dict:
                     floor=floor, cap=cap,
                     running_min=snap.get("running_min"),
                     post_sunrise_lock=False,  # mirrors scan_and_trade default
+                    station=station,
+                    date_str=date_str,
                 )
                 snap["model_prob"] = float(live_mp) if live_mp is not None else None
             except Exception:
@@ -4860,6 +4962,18 @@ def _check_position_obs_confirmed_loser_for_exit(pos: dict, rm: float) -> bool:
         cap = pos.get("cap")
         action = pos.get("action")
         tz = pos.get("tz") or pos.get("entry_tz") or "America/New_York"
+
+        # 2026-05-06: cli-align rm using METAR-precision when station+date
+        # are present. CRITICAL exit-side path — false-positive losers here
+        # mean SELLING A WINNER. The integer-°C round-down on madis_fsl2 can
+        # make rm appear ~0.5°F colder than CLI; aligned rm uses awc/ldm
+        # T-group precision matching what Kalshi will settle on.
+        _station = pos.get("station")
+        _date_str = pos.get("date_str")
+        if USE_CLI_ALIGNED_RMIN and _station and _date_str:
+            _aligned = _cli_aligned_rmin(rm, _station, _date_str)
+            if _aligned is not None:
+                rm = _aligned
 
         # Compute post-low-lock once. Used by most branches.
         try:

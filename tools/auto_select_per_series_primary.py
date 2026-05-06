@@ -14,6 +14,7 @@ Usage:
   python3 auto_select.py --explain        # verbose per-cell decision log
 """
 import json
+import os
 import sqlite3
 import glob
 import argparse
@@ -322,8 +323,10 @@ def run(dry_run=False, explain=False):
         'selections': selections,
     }
     if not dry_run:
-        with open(OUTPUT_JSON, 'w') as f:
+        tmp_path = OUTPUT_JSON + '.tmp'
+        with open(tmp_path, 'w') as f:
             json.dump(payload, f, indent=2)
+        os.replace(tmp_path, OUTPUT_JSON)
         # Append summary log
         log_entry = {
             'ts': now_utc.isoformat(),
