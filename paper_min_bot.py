@@ -621,6 +621,40 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR = 0.22
 SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25
 
+# ─── SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror) ──────────
+# 2026-05-06 night port from V1 SKIP_MU_NEAR_BELOW_BRACKET (commit 39670d1)
+# + companion tail_high mirror designed for min-temp markets.
+#
+# Two filters under one constant block + helper:
+#
+# (A) MU_NEAR_FLOOR_TAIL_HIGH — block BUY_YES on tail_high (T-floor)
+#     when blended μ sits 0..2.0F above floor. tail_high BUY_YES bets
+#     "min temp ≥ floor" (warm low day). When μ is just above floor,
+#     the cold tail of the Gaussian has meaningful probability of
+#     dipping actual below floor → BUY_YES loses.
+#
+#     Audit (5/4-5/6, n=44 with Kalshi truth, BUY_YES action only):
+#       - tail_high BUY_YES with μ in (0, 2]F above floor:  6L : 0W
+#       - 100% loser-only catch on this window
+#       - mu values: +0.5, +1.1, +1.3, +1.4, +1.5, +1.5
+#       - Tickers: TDC-T46, TOKC-T47, TATL-T53, TAUS-T56, TOKC-T51, TMIN-T38
+#       - 0 tail_high BUY_YES winners exist in the 7d pool — symmetric to
+#         V1's "no winners with mu just below mid" finding for B-bracket.
+#
+# (B) MU_NEAR_BELOW_BRACKET — same as V1's filter but applied to min_bot
+#     B-bracket BUY_NO entries. Block when 0 < (mid - μ) ≤ 2.0F.
+#
+#     Audit (5/4-5/6, n=44 with Kalshi truth, B-bracket BUY_NO):
+#       - μ in (0, 2]F below mid: 6L : 3W (2:1)
+#       - threshold sweep 1.0/1.5/2.0/2.5/3.0 — 2.0 is optimal
+#         (1.5 misses 1 loser at gap=1.9; 2.5 dilutes by adding 2L:2W)
+#
+# Both filters use threshold 2.0F to match V1's deployed
+# MU_NEAR_BELOW_BRACKET_MAX. Combined estimated lift: $90-230/wk against
+# current min_bot bleed of $748/wk.
+MU_NEAR_FLOOR_TAIL_HIGH_MAX_F = 2.0  # gap = mu - floor; skip BUY_YES if 0 < gap <= this
+MU_NEAR_BELOW_BRACKET_MAX_F = 2.0    # gap = mid - mu; skip BUY_NO if 0 < gap <= this
+
 # ─── Hard stop on existing positions (V2 port, mid-cycle exit) ────────────
 # 2026-05-04: DISABLED via sentinel values. Pattern mirrors V1's
 # SESSION_DRAWDOWN_LIMIT = -9999 disable from 2026-05-03.
@@ -3095,6 +3129,51 @@ def _check_model_market_disagree(opp: dict) -> Optional[str]:
     return None
 
 
+# ─── SKIP_MU_NEAR_FLOOR / SKIP_MU_NEAR_BELOW_BRACKET gate (V1 mirror) ─────
+def _check_mu_position_filter(opp: dict) -> Optional[tuple[str, str]]:
+    """Block when blended μ sits in a structurally-bad position relative
+    to the bracket the bot is betting against.
+
+    (A) tail_high BUY_YES, mu in (floor, floor + 2.0]F  → cold-tail risk
+    (B) B-bracket  BUY_NO,  mu in [mid - 2.0, mid)F     → warm-edge risk
+
+    Returns (tag, reason_str) on block, or None.
+
+    Bracket kind is inferred from floor/cap presence so the gate doesn't
+    require opp.bracket_kind to be populated:
+      - tail_high: floor set,    cap is None    (e.g. T58, "min ≥ 58.5")
+      - tail_low:  floor is None, cap set       (e.g. T46, "min ≤ 45.5")
+      - bracket:   both floor and cap set       (e.g. B47.5, "min in [47,48)")
+    """
+    action = opp.get("action")
+    mu = opp.get("mu")
+    if action is None or mu is None:
+        return None
+    mu_f = float(mu)
+    floor = opp.get("floor")
+    cap = opp.get("cap")
+
+    # (A) tail_high BUY_YES with mu just above floor
+    if action == "BUY_YES" and floor is not None and cap is None:
+        gap = mu_f - float(floor)
+        if 0.0 < gap <= MU_NEAR_FLOOR_TAIL_HIGH_MAX_F:
+            return ("MU_NEAR_FLOOR",
+                    f"BUY_YES tail_high mu={mu_f:.2f} only +{gap:.2f}F above "
+                    f"floor={floor:.1f} (≤{MU_NEAR_FLOOR_TAIL_HIGH_MAX_F:.1f}F) "
+                    f"— cold-tail risk, actual likely dips below floor")
+
+    # (B) B-bracket BUY_NO with mu just below midpoint
+    if action == "BUY_NO" and floor is not None and cap is not None:
+        mid = (float(floor) + float(cap)) / 2.0
+        gap = mid - mu_f
+        if 0.0 < gap <= MU_NEAR_BELOW_BRACKET_MAX_F:
+            return ("MU_NEAR_BELOW_BRACKET",
+                    f"BUY_NO bracket mu={mu_f:.2f} {gap:.2f}F below mid={mid:.1f} "
+                    f"(≤{MU_NEAR_BELOW_BRACKET_MAX_F:.1f}F) "
+                    f"— warm-edge tail catches actual in bracket")
+    return None
+
+
 def find_opportunities(markets: list[dict]) -> list[dict]:
     """For each market, compute model_prob, edge vs yes_ask, and return
     opportunities sorted by absolute edge."""
@@ -4156,6 +4235,11 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     mmd_block = _check_model_market_disagree(opp)
     if mmd_block:
         return ("MODEL_MARKET_DISAGREE", mmd_block)
+    # SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror, 2026-05-06).
+    # See _check_mu_position_filter docstring + constant block for backtest.
+    mu_block = _check_mu_position_filter(opp)
+    if mu_block is not None:
+        return mu_block
     msg_block = _check_msg_gate(opp)
     if msg_block:
         return ("MSG", msg_block)
@@ -4453,6 +4537,14 @@ def execute_opportunity(opp: dict) -> bool:
         if mmd_block:
             _audit_skip(opp, "MODEL_MARKET_DISAGREE",
                 f"  skip {ticker}: {mmd_block}")
+            return False
+        # SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror,
+        # 2026-05-06). See _check_mu_position_filter docstring + constant
+        # block for backtest evidence.
+        mu_block = _check_mu_position_filter(opp)
+        if mu_block is not None:
+            tag, reason = mu_block
+            _audit_skip(opp, tag, f"  skip {ticker}: {reason}")
             return False
         # MSG multi-source consensus gate (V2 port, BUY_NO only).
         msg_block = _check_msg_gate(opp)
