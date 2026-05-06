@@ -3,7 +3,31 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-06 morning) — Overfilter rollback: `MIN_MODEL_PROB` 0.15→0.05, `MAX_EDGE` 0.45→0.50, `COASTAL_TIGHT_FLOOR` disabled
+## Latest change (2026-05-06 mid-morning) — `MAX_EDGE` 0.50 → 0.70 after sweep audit
+
+Follow-up sweep on the same 8d resolved-candidate pool (n=2,125, deduped by ticker+action with outcomes attributed via `obs.sqlite running_min`). With the new `MIN_MODEL_PROB=[0.05, 0.85]` band already in place from the morning's deploy:
+
+- Cumulative BUY_NO `sum_pnl` at `MAX_EDGE=0.45` was +$27.39
+- At `MAX_EDGE=0.50` (this morning's deploy): +$27.94
+- At `MAX_EDGE=0.70`: **+$28.89 — the peak**, flat through 1.00
+- The single freed candidate above 0.50 is at edge 0.65–0.70, and it **won**. Zero losers in any cell ≥ 0.50 within the [0.05, 0.85] mp band
+
+So 0.70 captures the marginal lift with no observed downside. Small absolute lift (~$0.12/day expected on this sample), but it's a strict improvement on the data — every cell in the MIN×MAX grid above MAX_EDGE=0.50 is monotonically ≥ 0.50.
+
+**Why not even higher (0.85, 1.00)?** The data is flat above 0.70 — no additional candidates surface. 0.70 is the natural stopping point.
+
+**Why not raise `MAX_MODEL_PROB`?** Confirmed asymmetric: zero BUY_NO candidates exist at mp > 0.85 (DIRECTIONAL_BUY_NO_MAX_MP=0.20 + edge math both block). The 3 BUY_YES candidates at mp ≥ 0.85 in the 8d pool all lost (−$1.69 freed pool). MAX_MODEL_PROB stays at 0.85.
+
+### Tests
+- `tests/test_paper_min.py`: 384 OK + 1 skip — value-pin updated to `MAX_EDGE == 0.70`; 4 boundary tests bumped from edge=0.55 → 0.75 to remain unambiguously above the new cap
+- `tests/test_model_market_disagree.py`: 24 OK
+- 5 pre-existing ladder-test failures (`test_ladder_chase_20260503`, `test_ladder_no_fill_continue_20260504`) unchanged and unrelated
+
+Backups: `paper_min_bot.py.bak.pre_maxedge070_20260506-073759`, `tests/test_paper_min.py.bak.pre_maxedge070_20260506-073759`, `README.md.bak.pre_maxedge070_20260506-073759`.
+
+Re-evaluate ~2026-05-20.
+
+## Previous change (2026-05-06 morning) — Overfilter rollback: `MIN_MODEL_PROB` 0.15→0.05, `MAX_EDGE` 0.45→0.50, `COASTAL_TIGHT_FLOOR` disabled
 
 A 5/4–5/6 audit (8 days of `bot_decisions.sqlite` rows + `trades_*.jsonl` candidates joined to `obs.sqlite running_min` for actual outcomes) found three gates were costing more than they were saving in the current regime. All three changed today.
 
@@ -540,7 +564,7 @@ All in `paper_min_bot.py`:
 | `DAILY_EXPOSURE_CAP_USD` | `$10000.00` (sentinel) | $4 → $15 (2026-04-25) → $30 (2026-04-26) → $60 (2026-04-27) → $120 (2026-04-28 night) → **effectively unlimited (2026-04-29 evening, per Chris)**. With ~$279 bankroll, $20/bet, 3 entries/cycle, and `BANKROLL_FLOOR_USD=$5`, the bankroll itself is the binding constraint — the bot stops placing orders once balance drops below $5. The $10,000 sentinel is unreachable at current scale; revisit only if bankroll grows past $5k. |
 | `BANKROLL_FLOOR_USD` | `$5.00` | Startup refuses to run if balance below floor |
 | `MIN_EDGE` | `0.20` | Take only edges ≥ 20% |
-| `MAX_EDGE` | `0.50` | Skip edges > 50%. Evolution: 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) → **0.50 (5/6)**. 5/6 raise driven by 21:9 winner:loser blocked-rate at 0.45 cap. No bypass — `MAX_EDGE` itself is the firewall. |
+| `MAX_EDGE` | `0.70` | Skip edges > 70%. Evolution: 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) → 0.50 (5/6 morning) → **0.70 (5/6 mid-morning)**. Sweep with new MP_RANGE in place: 0.50→0.70 freed 1 BUY_NO candidate that won (+$0.95/8d), zero losers above 0.50. No bypass. |
 | ~~PRICE_ZONE~~ | ~~yes_bid 30-40c~~ | **REMOVED 2026-04-29** after gate-audit on min_bot historical candidates: 2/2 PRICE_ZONE-blocked cases were winners (NYC-26APR25-B42.5 BUY_NO @66¢ → +$0.34/c; ATL-26APR27-B59.5 BUY_NO @67¢ → +$0.33/c). V2's max-temp finding (50% WR / −$99 / n=50) does not appear to hold for min-temp markets. Sample is small (n=2) but 100% winners and gate-cost is non-trivial; re-enable from git history if a future audit flips the signal. |
 | **H_2.0** | `disagreement 2°F` | **BUY_NO d-1+ only** (V2-inspired). Skip when pairwise forecast disagreement (NBP/HRRR/NBM max diff) > 2°F on day-1+ markets where we have no obs to break ties. Tighter than `MAX_DISAGREEMENT_F=5.0`. Bypassed by `_obs_confirmed_alive`. |
 | `MIN_MODEL_PROB` / `MAX_MODEL_PROB` | `0.05` / `0.85` | Skip wildly unlikely or near-certain. Lowered 0.15→0.05 on **2026-05-06** after audit found 8,022 blocks / 3 days, ~90% would-win rate — bot was killing its own deep-tail BUY_NO channel. **Bypassed by `_nbp_consistent_with_recent_cli`** when forecast μ is within ±2°F of the station's last-7-day CLI low range; bypass is now near-moot for the lower side because `F2A_PROB_LO=0.05` blocks at the same mp threshold. |

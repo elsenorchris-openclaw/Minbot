@@ -142,16 +142,17 @@ LOG_HEARTBEAT_SEC = 600             # emit summary stats every 10 min
 
 # Opportunity filters
 MIN_EDGE = 0.20                     # min edge to take a trade
-MAX_EDGE = 0.50                     # 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) →
-                                    # 0.50 (2026-05-06). 5/4-5/6 audit: 21 winners / 9 losers
-                                    # blocked at 0.45 cap (70% would-win rate). The post-Apr-29
-                                    # rollback to 0.45 was based on 4/29 BUY_NO bypass losses;
-                                    # current regime has the model identifying deep-tail BUY_NO
-                                    # winners correctly at high edge. V2 raised 0.45→0.50 on
-                                    # 5/3 (P3 of filter audit, +18 era-wide, h:h 5:2).
-                                    # min_bot has the downstream catchers V2's note depends on
-                                    # (MODEL_MARKET_DISAGREE shipped 5/4, OBS_CONFIRMED_LOSER
-                                    # long-standing). Re-evaluate ~2026-05-20.
+MAX_EDGE = 0.70                     # 0.40 → 0.42 (4/27) → 0.55 (4/28) → 0.45 (4/29) →
+                                    # 0.50 (5/6 morning) → 0.70 (5/6 mid-morning, this change).
+                                    # Sweep over 8d of resolved candidates with new MP_RANGE
+                                    # [0.05, 0.85] in place: cumulative BUY_NO sum_pnl was +27.94
+                                    # at MAX_EDGE=0.50, peaks at +28.89 from 0.70 onward (flat
+                                    # through 1.00). The high-edge BUY_NO tail above 0.50 has
+                                    # 1 freed candidate at edge 0.65-0.70 — that one won. No
+                                    # losers surface above 0.50 within the [0.05, 0.85] mp band.
+                                    # Per-mp sample is small but no-downside: every cell in the
+                                    # MIN x MAX grid above MAX_EDGE=0.50 is monotonically >= 0.50.
+                                    # Re-evaluate ~2026-05-20.
 MIN_MODEL_PROB = 0.05               # 2026-05-06: 0.15 → 0.05. 5/4-5/6 audit found
                                     # 8,022 candidates blocked / 3 days, ~90% would have
                                     # WON. min_bot was killing its own deep-tail BUY_NO

@@ -2040,8 +2040,8 @@ class TestQuickWinGates(unittest.TestCase):
         base.update(overrides)
         return base
 
-    def test_max_edge_is_0_50(self):
-        self.assertEqual(pb.MAX_EDGE, 0.50)
+    def test_max_edge_is_0_70(self):
+        self.assertEqual(pb.MAX_EDGE, 0.70)
 
     def test_edge_above_max_edge_blocked_unconditionally(self):
         """Edge > MAX_EDGE blocks regardless of NBP-CLI consistency. Backtest
@@ -2050,14 +2050,14 @@ class TestQuickWinGates(unittest.TestCase):
         orig = pb.get_recent_cli_range
         pb.get_recent_cli_range = lambda *a, **kw: (40.0, 42.0)
         try:
-            pb.execute_opportunity(self._opp(edge=0.55, no_ask=15))
+            pb.execute_opportunity(self._opp(edge=0.75, no_ask=15))
             self.assertEqual(self._captured, [],
                 "MAX_EDGE must block even when NBP is consistent — backtest evidence")
         finally:
             pb.get_recent_cli_range = orig
 
     def test_edge_below_max_edge_passes(self):
-        """Edge=0.45 (below new MAX_EDGE=0.50). Passes.
+        """Edge=0.45 (below new MAX_EDGE=0.70). Passes.
         BUY_NO with mp=0.20 and no_ask=35c → edge = (1-0.20) - 0.35 = 0.45."""
         opp = self._opp(model_prob=0.20, no_ask=35, no_bid=33, entry_price=0.35,
                         edge=0.45, yes_bid=63, yes_ask=65)
@@ -2191,7 +2191,7 @@ class TestSkipLogDebounce(unittest.TestCase):
         opp = {
             "market_ticker": "KXLOWTNYC-26APR28-B45.5",
             "event_ticker": "KXLOWTNYC-26APR28",
-            "action": "BUY_NO", "model_prob": 0.50, "edge": 0.60,  # > MAX_EDGE 0.55
+            "action": "BUY_NO", "model_prob": 0.50, "edge": 0.75,  # > MAX_EDGE 0.70
             "entry_price": 0.50, "yes_bid": 47, "yes_ask": 50,
             "no_bid": 48, "no_ask": 50, "mu": 50.0, "sigma": 2.5,
             "mu_source": "nbp", "running_min": None,
@@ -2561,7 +2561,7 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
     def test_high_edge_blocks_even_with_consistency(self):
         """Backtest 2026-04-29: 5/5 BUY_NO MAX_EDGE-bypass cases lost. The
         MAX_EDGE bypass was removed. Even with NBP perfectly consistent,
-        edge > MAX_EDGE (0.50) must still block."""
+        edge > MAX_EDGE (0.70) must still block."""
         pb.get_recent_cli_range = lambda station, **kw: (60.0, 65.0)
         # MIA-26APR25-B71.5 reconstruction: μ=70.5 in [70,74] (consistent),
         # but edge 72% — must block.
@@ -2632,8 +2632,8 @@ class TestEvaluateGates(unittest.TestCase):
         self.assertEqual(gate, "MIN_EDGE")
 
     def test_max_edge(self):
-        # MAX_EDGE = 0.50 (raised 5/6); use edge=0.55 to be unambiguously above
-        gate, _ = pb._evaluate_gates(self._opp(edge=0.55))
+        # MAX_EDGE = 0.70 (raised 5/6 mid-morning); use edge=0.75 to be unambiguously above
+        gate, _ = pb._evaluate_gates(self._opp(edge=0.75))
         self.assertEqual(gate, "MAX_EDGE")
 
     def test_mp_range_low(self):
@@ -2978,7 +2978,7 @@ class TestRecordCandidateWritesBlockedBy(unittest.TestCase):
     def test_records_blocked_by(self):
         opp = {
             "market_ticker": "KXLOWTNYC-26APR28-B45.5", "kind": "bracket",
-            "action": "BUY_NO", "edge": 0.55, "model_prob": 0.20,
+            "action": "BUY_NO", "edge": 0.75, "model_prob": 0.20,
             "entry_price": 0.50, "yes_bid": 48, "yes_ask": 50,
             "no_bid": 48, "no_ask": 50, "mu": 41.0, "sigma": 2.5,
             "running_min": None, "post_sunrise_lock": False,
@@ -5096,7 +5096,7 @@ class TestAddOnPath(unittest.TestCase):
         """Edge has eroded above MAX_EDGE since first entry → no add-on."""
         self._seed_partial("KXLOWTBOS-26APR28-B45.5",
                            count=5, intended=50, cost=1.50)
-        opp = self._opp(edge=0.55)  # > MAX_EDGE 0.50 (raised 5/6)
+        opp = self._opp(edge=0.75)  # > MAX_EDGE 0.70 (raised 5/6 mid-morning)
         self.assertFalse(pb.execute_opportunity(opp),
                          "addon must respect MAX_EDGE gate")
         self.assertEqual(self._place_calls, [])
