@@ -299,6 +299,140 @@ PER_SERIES_SIGMA_MULT: dict[str, float] = {
 #   OKC:  HRRR MAE 2.22°F vs NBP 3.50°F (1.6x better; n=24, NBP runs −3.5°F
 #         cool-biased on KOKC similar to LAX pattern)
 # Other 18 cities have NBP equal-or-better — keep them on NBP.
+# ─── Auto-select primary forecast source (2026-05-06) ─────────────────
+# A daily cron (tools/auto_select_per_series_primary.py) writes
+# data/auto_primary_selection.json with weighted-MAE-best source per
+# (station, days_out). Bot reads at startup + on file mtime change.
+#
+# Lookup priority (highest wins):
+#   1. MANUAL_PRIMARY_OVERRIDES_D{0,1} (operator pin in code)
+#   2. auto_primary_selection.json (daily cron)
+#   3. PER_SERIES_D{0,1}_PRIMARY hardcoded dicts below
+#   4. 'hrrr' (d-0) or 'nbp' (d-1) baseline default
+#
+# JSON staleness: if file age > 2 days OR computed_at > 36h, fall through
+# to (3). This protects against silent cron failures.
+MANUAL_PRIMARY_OVERRIDES_D0: dict[str, str] = {}  # e.g. {"KXLOWTSEA": "hrrr"}
+MANUAL_PRIMARY_OVERRIDES_D1: dict[str, str] = {}
+
+AUTO_PRIMARY_SELECTION_PATH = "auto_primary_selection.json"  # resolved relative to DATA_DIR
+AUTO_PRIMARY_MAX_AGE_SEC = 36 * 3600  # 36h since computed_at — beyond that, treat as stale
+
+_auto_primary_cache: dict = {
+    "loaded_mtime": 0.0,
+    "computed_ts": 0.0,
+    "d0": {},   # icao -> source
+    "d1": {},
+    "valid": False,
+}
+_auto_primary_lock = threading.Lock()
+
+# Series -> ICAO mapping (used for auto-select JSON which is keyed by ICAO)
+_SERIES_TO_ICAO: dict[str, str] = {
+    "KXLOWTNYC": "KNYC", "KXLOWTSFO": "KSFO", "KXLOWTSEA": "KSEA",
+    "KXLOWTLAX": "KLAX", "KXLOWTMIA": "KMIA", "KXLOWTHOU": "KHOU",
+    "KXLOWTPHX": "KPHX", "KXLOWTPHIL": "KPHL", "KXLOWTOKC": "KOKC",
+    "KXLOWTBOS": "KBOS", "KXLOWTCHI": "KMDW", "KXLOWTMIN": "KMSP",
+    "KXLOWTDEN": "KDEN", "KXLOWTLAS": "KLAS", "KXLOWTATL": "KATL",
+    "KXLOWTDC": "KDCA", "KXLOWTDAL": "KDAL", "KXLOWTAUS": "KAUS",
+    "KXLOWTSATX": "KSAT", "KXLOWTNOLA": "KMSY",
+}
+
+
+def _maybe_reload_auto_primary() -> None:
+    """Reload auto_primary_selection.json if mtime has changed since last load.
+    Cheap when file unchanged. Thread-safe."""
+    path = os.path.join(DATA_DIR, AUTO_PRIMARY_SELECTION_PATH) if not os.path.isabs(AUTO_PRIMARY_SELECTION_PATH) else AUTO_PRIMARY_SELECTION_PATH
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        # No file — invalidate cache so we fall through to hardcoded
+        with _auto_primary_lock:
+            if _auto_primary_cache["valid"]:
+                _auto_primary_cache["valid"] = False
+                _auto_primary_cache["d0"] = {}
+                _auto_primary_cache["d1"] = {}
+        return
+    with _auto_primary_lock:
+        if mtime <= _auto_primary_cache["loaded_mtime"]:
+            return  # unchanged
+    try:
+        with open(path) as f:
+            data = json.load(f)
+    except (OSError, ValueError) as e:
+        return
+    # Validate computed_at age
+    try:
+        computed_ts = datetime.fromisoformat(data.get("computed_at", "")).timestamp()
+    except (ValueError, TypeError):
+        return
+    if (time.time() - computed_ts) > AUTO_PRIMARY_MAX_AGE_SEC:
+        # Stale — invalidate
+        with _auto_primary_lock:
+            _auto_primary_cache["valid"] = False
+            _auto_primary_cache["d0"] = {}
+            _auto_primary_cache["d1"] = {}
+            _auto_primary_cache["loaded_mtime"] = mtime
+            _auto_primary_cache["computed_ts"] = computed_ts
+        return
+    # Build the lookup dicts (icao -> source). Falsy values are skipped.
+    d0 = {}
+    d1 = {}
+    for icao, sel in (data.get("selections") or {}).items():
+        if isinstance(sel, dict):
+            v0 = sel.get("d0_primary")
+            if v0:
+                d0[icao] = v0
+            v1 = sel.get("d1_primary")
+            if v1:
+                d1[icao] = v1
+    with _auto_primary_lock:
+        _auto_primary_cache["loaded_mtime"] = mtime
+        _auto_primary_cache["computed_ts"] = computed_ts
+        _auto_primary_cache["d0"] = d0
+        _auto_primary_cache["d1"] = d1
+        _auto_primary_cache["valid"] = True
+
+
+def get_d0_primary(series: str) -> Optional[str]:
+    """Return the d-0 primary source for `series` (e.g. 'KXLOWTSEA'), or
+    None if no override applies (caller falls back to default 'hrrr').
+
+    Resolution order: manual override → auto-select → hardcoded → None.
+    """
+    # 1) Manual override (operator pin)
+    v = MANUAL_PRIMARY_OVERRIDES_D0.get(series)
+    if v:
+        return v
+    # 2) Auto-select (daily cron)
+    _maybe_reload_auto_primary()
+    icao = _SERIES_TO_ICAO.get(series)
+    with _auto_primary_lock:
+        if _auto_primary_cache["valid"] and icao:
+            v = _auto_primary_cache["d0"].get(icao)
+            if v:
+                return v
+    # 3) Hardcoded fallback
+    return PER_SERIES_D0_PRIMARY.get(series)
+
+
+def get_d1_primary(series: str) -> Optional[str]:
+    """Same as get_d0_primary but for d-1+. None means caller uses default 'nbp'."""
+    v = MANUAL_PRIMARY_OVERRIDES_D1.get(series)
+    if v:
+        return v
+    _maybe_reload_auto_primary()
+    icao = _SERIES_TO_ICAO.get(series)
+    with _auto_primary_lock:
+        if _auto_primary_cache["valid"] and icao:
+            v = _auto_primary_cache["d1"].get(icao)
+            if v:
+                return v
+    return PER_SERIES_D1_PRIMARY.get(series)
+
+
+# ─── Hardcoded fallback dicts (still used when auto-select unavailable) ───
+
 # d-0 still uses HRRR universally (HRRR beats NBP overall on d-0 by 1.22°F
 # MAE) so this only affects d-1+ markets at these specific cities.
 PER_SERIES_D1_PRIMARY: dict[str, str] = {
@@ -2902,16 +3036,18 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
         #     PER_SERIES_D1_PRIMARY (CHI, OKC → HRRR — backed by source-MAE
         #     audit 2026-04-29, see constant comment).
         #   - else fall back to NBM-OM.
+        _d0_primary = get_d0_primary(m["series"])
         if (is_today
-                and PER_SERIES_D0_PRIMARY.get(m["series"]) == "nbp"
+                and _d0_primary == "nbp"
                 and nbp):
             # Per-city d-0 override: NBP beats HRRR on this station's d-0
-            # min forecast (see PER_SERIES_D0_PRIMARY constant for evidence).
+            # min forecast (auto-select or hardcoded — see auto_primary_selection.json
+            # / PER_SERIES_D0_PRIMARY for evidence).
             mu = nbp["mu"]
             sigma = nbp["sigma"]
             mu_source = "nbp_d0_override"
         elif (is_today
-              and PER_SERIES_D0_PRIMARY.get(m["series"]) == "nbm"
+              and _d0_primary == "nbm"
               and nbm is not None):
             # 2026-05-05: per-city d-0 override → NBM_OM. Used for cells
             # where NBM materially beats both NBP and HRRR per audit.
@@ -2924,13 +3060,13 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr"
         elif (not is_today
-              and PER_SERIES_D1_PRIMARY.get(m["series"]) == "hrrr"
+              and get_d1_primary(m["series"]) == "hrrr"
               and hrrr is not None):
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr_d1_override"
         elif (not is_today
-              and PER_SERIES_D1_PRIMARY.get(m["series"]) == "nbm"
+              and get_d1_primary(m["series"]) == "nbm"
               and nbm is not None):
             # 2026-05-05: per-city d-1+ override → NBM_OM. KMIA / KDEN
             # at d-1 have NBM as the lowest-MAE source (audit n=4).
@@ -3526,14 +3662,15 @@ def _resolve_live_min_forecast(series: str, station: str, date_str: str,
     hrrr = get_hrrr_min(series, date_str)
     mu = sigma = None
     mu_source = ""
+    _d0p = get_d0_primary(series)
     if (is_today
-            and PER_SERIES_D0_PRIMARY.get(series) == "nbp"
+            and _d0p == "nbp"
             and nbp):
         mu, sigma, mu_source = nbp["mu"], nbp["sigma"], "nbp_d0_override"
     elif is_today and hrrr is not None:
         mu, sigma, mu_source = hrrr, (nbp["sigma"] if nbp else 2.5), "hrrr"
     elif (not is_today
-          and PER_SERIES_D1_PRIMARY.get(series) == "hrrr"
+          and get_d1_primary(series) == "hrrr"
           and hrrr is not None):
         mu, sigma, mu_source = hrrr, (nbp["sigma"] if nbp else 2.5), "hrrr_d1_override"
     elif nbp:

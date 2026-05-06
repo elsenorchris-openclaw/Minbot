@@ -3,7 +3,57 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-06 mid-morning) — `MAX_EDGE` 0.50 → 0.70 after sweep audit
+## Latest change (2026-05-06 afternoon) — auto-select per-series forecast source
+
+Replaces the manual every-few-days `PER_SERIES_D{0,1}_PRIMARY` recalibration with a daily cron that picks the lowest-MAE source per (station, days_out) cell. Same methodology as the manual 5/4 audit, automated.
+
+### How it works
+
+1. **Daily cron at 14:30 UTC** runs `tools/auto_select_per_series_primary.py`:
+   - Pulls last 14 days of (`mu_nbp`, `mu_hrrr`, `mu_nbm_om`) from candidate logs
+   - Pairs with actual rm via CLI (preferred) or `running_min` (fallback)
+   - Computes **exponentially-weighted MAE** per source (half-life=7d, recent days dominate)
+   - Picks the lowest-MAE source per cell with **hysteresis** (must beat current by ≥0.30°F AND ≥1.20× relative; min n=5; sanity floor 4°F MAE)
+   - Writes `data/auto_primary_selection.json`
+   - Appends a per-run summary to `data/auto_primary_log.jsonl`
+
+2. **Bot reads JSON each cycle** via `get_d0_primary(series)` / `get_d1_primary(series)`. Hot-reload on file mtime change. Cache invalidated if `computed_at` > 36h old.
+
+3. **Resolution chain (highest priority wins):**
+   1. `MANUAL_PRIMARY_OVERRIDES_D{0,1}` — operator pin in code (empty by default)
+   2. `auto_primary_selection.json` — daily cron
+   3. `PER_SERIES_D{0,1}_PRIMARY` — hardcoded baseline (still used as fallback)
+   4. `'hrrr'` (d-0) or `'nbp'` (d-1) — ultimate default
+
+### First-run effect
+
+The 5/6 first run flipped exactly **one cell**: KSEA d-0 NBP → HRRR (1.78°F → 1.16°F MAE, ratio 1.54×, n=9). Triggered by NBP's persistent +2°F warm bias at KSEA over the last 5 days (caused yesterday's SEA-B51.5 −$29.44 loss and today's open SEA-B50.5 −$15ish loss in progress). Every other cell stayed put.
+
+### Anti-flap protections
+
+| Risk | Mitigation |
+|---|---|
+| Source flap-flop on noise | Switch requires ≥0.30°F absolute AND ≥1.20× relative improvement |
+| Over-react to recent regime | 7-day half-life damps but emphasizes recent (today w=1.00, day-7 w=0.50, day-14 w=0.25) |
+| Brief data gap → spurious switch | min_samples=5 per source per cell; below that, keep current |
+| Cron fails / stale JSON | Bot falls back to hardcoded `PER_SERIES_D{0,1}_PRIMARY` if JSON age > 36h |
+| All sources broken (MAE > 4°F) | Sanity floor — keep current, don't switch |
+| Operator wants to pin a station | `MANUAL_PRIMARY_OVERRIDES_D{0,1}` dict in code wins over auto |
+
+### Tests
+
+- `tests/test_auto_primary.py`: 11 OK — fallback chain, mtime reload, staleness boundary, manual override priority, malformed JSON resilience.
+- `tests/test_paper_min.py`: 384 OK + 1 skip + 1 pre-existing unrelated failure (`TestBiasCorrectionWiring.test_no_applicable_min_cells_today`, marked "Remove this test" — fails on baseline too).
+
+### Verification (live, 20:17 UTC)
+
+Post-restart, `KXLOWTSEA-26MAY06` d-0 candidates show `mu_source=hrrr`, `mu=51.2` (HRRR's value) instead of `mu_source=nbp_d0_override`, `mu=53.0` (the previous NBP value). The auto-select chain is live.
+
+Backups: `paper_min_bot.py.bak.pre_autoselect_20260506-200615` + parallels.
+
+Re-evaluate ~2026-05-20.
+
+## Previous change (2026-05-06 mid-morning) — `MAX_EDGE` 0.50 → 0.70 after sweep audit
 
 Follow-up sweep on the same 8d resolved-candidate pool (n=2,125, deduped by ticker+action with outcomes attributed via `obs.sqlite running_min`). With the new `MIN_MODEL_PROB=[0.05, 0.85]` band already in place from the morning's deploy:
 
