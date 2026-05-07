@@ -31,7 +31,7 @@ class NbmOmCustomerApiTests(unittest.TestCase):
         """`refresh_nbm_om_forecasts` must use the paid customer-api host."""
         idx = self.src.find("def refresh_nbm_om_forecasts()")
         self.assertGreater(idx, 0)
-        block = self.src[idx:idx + 1200]
+        block = self.src[idx:idx + 1500]
         self.assertIn("customer-api.open-meteo.com", block,
             "refresh_nbm_om_forecasts must use customer-api endpoint")
         # And NOT the free endpoint
@@ -41,7 +41,7 @@ class NbmOmCustomerApiTests(unittest.TestCase):
     def test_nbm_om_loads_and_passes_apikey(self):
         """Must call _load_open_meteo_key() and pass the key as apikey."""
         idx = self.src.find("def refresh_nbm_om_forecasts()")
-        block = self.src[idx:idx + 1200]
+        block = self.src[idx:idx + 1500]
         self.assertIn("_load_open_meteo_key()", block,
             "refresh_nbm_om_forecasts must call _load_open_meteo_key()")
         self.assertIn("apikey=_OPEN_METEO_API_KEY", block,
@@ -51,7 +51,7 @@ class NbmOmCustomerApiTests(unittest.TestCase):
         """Must short-circuit (with a warn) when OPEN_METEO_API_KEY isn't
         in .env, so a misconfigured deploy doesn't 401 in a tight loop."""
         idx = self.src.find("def refresh_nbm_om_forecasts()")
-        block = self.src[idx:idx + 1200]
+        block = self.src[idx:idx + 1500]
         self.assertRegex(
             block,
             r"if not _OPEN_METEO_API_KEY:",
@@ -71,6 +71,20 @@ class NbmOmCustomerApiTests(unittest.TestCase):
         ):
             self.assertNotIn(live_form, self.src,
                 f"live free-endpoint URL string {live_form} must be gone")
+
+    def test_nbm_om_uses_real_nbm_model_not_best_match(self):
+        """2026-05-07: model identifier must be `ncep_nbm_conus`, NOT
+        `best_match`. Open-Meteo's `best_match` is an auto-picker that
+        returns HRRR for US short-range, so calling it under the NBM-OM
+        label silently aliased min_bot's third forecast source to its
+        second (HRRR). V1/V2 both use `ncep_nbm_conus` — same key here."""
+        idx = self.src.find("def refresh_nbm_om_forecasts()")
+        block = self.src[idx:idx + 1500]
+        self.assertIn('model="ncep_nbm_conus"', block,
+            "refresh_nbm_om_forecasts must use real NBM model identifier")
+        self.assertNotIn('model="best_match"', block,
+            "best_match auto-picker must not be used (returns HRRR for US "
+            "short-range, defeats the purpose of NBM as a third source)")
 
 
 if __name__ == "__main__":

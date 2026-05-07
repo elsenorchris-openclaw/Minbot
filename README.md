@@ -3,7 +3,19 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-07 early-morning) — `STALE_BRACKET` gate
+## Latest change (2026-05-07 early-morning) — `refresh_nbm_om_forecasts` model fix
+
+`refresh_nbm_om_forecasts()` was passing `model="best_match"` to Open-Meteo since min_bot's first commit. `best_match` is OM's auto-picker — for US points short-range it returns HRRR, longer-range GFS/ICON. So the function named "NBM-OM" was actually returning HRRR-equivalent data for d-0, never NBM. The bug was masked while the free endpoint throttled (cache-lag made the streams look different by accident); the 5/5 customer-api fix removed the throttle and exposed it. By 5/7 morning, `mu_nbm_om == mu_hrrr` 100% of the time across 34,764 candidate rows.
+
+**Impact:** the bot's "3-source consensus" was effectively 2 sources. `H_2_DISAGREE`, `MSG`, `mu_blended`, and the new auto-select cron all double-counted HRRR.
+
+**Fix:** one-line — `model="best_match"` → `model="ncep_nbm_conus"` (matches V1/V2). Plus a regression test that `'model="best_match"'` is not present in source.
+
+**Live-verified post-restart 05:12 UTC:** 0/120 candidates identical (vs 100% before). Real NBM is generally 2-6°F warmer than HRRR on tonight's mins — e.g. KMIA HRRR 71.2 / NBM 75.4, KMSP HRRR 32.0 / NBM 37.6.
+
+Auto-select cron at 14:30 UTC will now see real NBM-vs-HRRR MAE for the first time. Re-evaluate ~2026-05-21.
+
+## Previous change (2026-05-07 early-morning) — `STALE_BRACKET` gate
 
 `execute_opportunity` now refuses any opp where `_days_out_int(opp) < 0`. Kalshi keeps markets tradeable until CLI publishes, which can lag bracket settlement by days — saw 4 `ENTRY_FILLED` audit events at 04:10 UTC 2026-05-07 firing on `26APR28-B45.5` / `26MAY01-T46/T56` (`days_out=-5` to `-8`). They never actually filled on Kalshi, but the retry churn is wasted work and the audit log was misleading. Gate sits at the top of `execute_opportunity` (before addon-eligibility), so neither fresh entries nor add-ons fire on stale brackets. `days_out=None` (parse failure) falls through unchanged. Live-verified: 1 `STALE_BRACKET` row in bot_decisions within 2 min of restart.
 

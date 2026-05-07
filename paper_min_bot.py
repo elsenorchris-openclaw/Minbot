@@ -2190,14 +2190,19 @@ def _fetch_open_meteo_batched(url: str, model: str, daily_var: str,
 
 
 def refresh_nbm_om_forecasts() -> None:
-    """Fetch best_match daily min via Open-Meteo (batched, paid customer endpoint).
+    """Fetch real NBM (ncep_nbm_conus) daily min via Open-Meteo customer-api.
 
-    2026-05-05: switched from `api.open-meteo.com` (free tier, 10k/day cap)
-    to `customer-api.open-meteo.com` + apikey (paid commercial tier, same
-    key V1+V2 already use). Pre-fix the free endpoint exhausted its daily
-    quota at ~08:23 UTC and returned 429s for the rest of the day; min_bot
-    retried every ~17s for 6+ hours producing log spam and burning whatever
-    quota remained. Customer endpoint has no shared-IP daily cap.
+    2026-05-07: model identifier corrected from `best_match` to
+    `ncep_nbm_conus`. Open-Meteo's `best_match` is its auto-picker — for
+    US points short-range it returns HRRR, longer-range GFS/ICON.
+    `refresh_nbm_om_forecasts` had been calling `best_match` since
+    inception, so for d-0 it returned HRRR-equivalent data, making
+    `mu_nbm_om == mu_hrrr` 100% of the time once the 5/5 customer-api
+    fix removed the free-tier throttle that was masking it via cache lag.
+    V1/V2 use `ncep_nbm_conus` correctly — this aligns min_bot with them.
+
+    2026-05-05: switched URL from `api.open-meteo.com` (free, 10k/day cap)
+    to `customer-api.open-meteo.com` + apikey (paid commercial tier).
     """
     _load_open_meteo_key()
     if not _OPEN_METEO_API_KEY:
@@ -2205,7 +2210,7 @@ def refresh_nbm_om_forecasts() -> None:
         return
     _fetch_open_meteo_batched(
         "https://customer-api.open-meteo.com/v1/forecast",
-        model="best_match",
+        model="ncep_nbm_conus",
         daily_var="temperature_2m_min",
         cache=_nbm_om_cache,
         cache_lock=_nbm_om_cache_lock,
