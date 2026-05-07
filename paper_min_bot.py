@@ -1327,6 +1327,32 @@ def _get_metar_running_min(station: str, climate_date: str) -> Optional[float]:
         return None
 
 
+def _get_current_temp_f(station: Optional[str], window_sec: int = 1800) -> Optional[float]:
+    """Latest temp_f observation at `station` from any source within `window_sec`.
+
+    Used by OBS_CONFIRMED_LOSER (BUY_NO branch) as a sanity check: if the live
+    temperature is well below the bot's `running_min`, rm is stale or sourced
+    differently (cli-aligned RM occasionally lags raw METAR briefly during
+    cooling) and the LOSER signal is unreliable. Returns None when no fresh
+    obs are available — caller treats as "skip the sanity check"."""
+    if not station:
+        return None
+    cutoff = int(time.time() - window_sec)
+    try:
+        conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
+        row = conn.execute(
+            "SELECT temp_f FROM observations "
+            "WHERE station = ? AND temp_f IS NOT NULL AND obs_time >= ? "
+            "ORDER BY obs_time DESC LIMIT 1",
+            (station, cutoff),
+        ).fetchone()
+        conn.close()
+        return float(row[0]) if row else None
+    except sqlite3.Error as e:
+        log(f"  obs current-temp read error for {station}: {e}", "warn")
+        return None
+
+
 def _cli_aligned_rmin(running_min: Optional[float],
                      station: Optional[str] = None,
                      climate_date: Optional[str] = None) -> Optional[float]:
@@ -3072,6 +3098,16 @@ def _check_obs_confirmed_loser(opp_or_pos: dict) -> bool:
     rm_f = float(rm)
 
     if action == "BUY_NO":
+        # 2026-05-07: hygiene sanity check. If the latest observed temp is
+        # well below the bot's rm, rm is stale or sourced differently from
+        # live obs (cli-aligned RM can lag raw METAR briefly during active
+        # cooling). The LOSER signal is unreliable in that state — defer
+        # the entry block. Backtest 2026-04-23..05-07 (n=20 BUY_NO/B
+        # first-fires): 1 false-positive caught (KLAX-26MAY06-B56.5,
+        # cobs=55.4 < rm=57.0), 0 correct-blocks lost.
+        _cobs = _get_current_temp_f(_station)
+        if _cobs is not None and _cobs < rm_f - 0.5:
+            return False
         if floor is not None and cap is not None:
             if float(floor) <= rm_f <= float(cap):
                 return True

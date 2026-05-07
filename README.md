@@ -3,6 +3,18 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## Latest change (2026-05-07 evening) — `OBS_CONFIRMED_LOSER` hygiene check (BUY_NO)
+
+Added a `current_obs < running_min - 0.5°F → skip LOSER` sanity check in `_check_obs_confirmed_loser` BUY_NO branch. New helper `_get_current_temp_f(station)` reads the latest `temp_f` from `obs.sqlite.observations`.
+
+**Why:** when bot's rm is ABOVE the latest observed temp, rm is stale or sourced differently from live obs (cli-aligned RM occasionally lags raw METAR briefly during cooling). The LOSER block is unreliable in that state. Backtest 2026-04-23..05-07 (n=20 BUY_NO/B first-fires): 1 false-positive caught (`KLAX-26MAY06-B56.5`, cobs=55.4 < rm=57.0), **0 correct-blocks lost.**
+
+**Honest scope:** small fix. ~$25/14d ≈ $1.80/day expected lift. Below the standard "lift > $110" filter validation bar — but it's a *loosening* of an existing block (zero-hurt by construction), not a new gate, and the mechanism is interpretable. Other false positives in the gate (~4/14d) are unfilterable from real-time signals (cooling resumes after a stable window, METAR's 5–30-min sampling cadence misses brief sub-cycle dips).
+
+`tests/test_obs_loser_hygiene.py`: 10 OK.
+
+
+
 ## Latest change (2026-05-07 early-morning) — NBP fetcher: NCEP fallback + Last-Modified caching (V2 port)
 
 `_nbp_fetch_latest_bulletin()` was S3-only (`noaa-nbm-grib2-pds`). When the AWS S3 mirror lagged behind NCEP nomads (e.g. 5/7 01Z 4h+ late at S3 while nomads already had it), min_bot was forced onto a stale fallback cycle and fired Discord `STALE CACHE FALLBACK NBP` alerts. V1+V2 both already used NCEP-first parallel HEAD; this ports the same pattern to min_bot.
