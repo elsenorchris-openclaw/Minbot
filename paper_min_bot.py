@@ -235,6 +235,13 @@ MAX_BET_USD = 30.00                 # $30 cap per entry. $1 (live launch) → $3
 # bracket types: small wins (price ≤ 50c → max payout 50c per dollar),
 # full-cost losses on forecast misses.
 MAX_BET_BUY_YES_USD = 5.00
+# 2026-05-07: V2-port adverse-addon gate. Block addons if entry_price has
+# risen >= 5pp since first fill (action-agnostic; entry_price = what we pay,
+# whether BUY_NO or BUY_YES). V2 backtest (commit 4ebfa2b, 2026-05-06):
+# n=30, lift +$190, LOO min +$124, 0 negative LOO removals, h:hu 18:12.
+# Triggered by min_bot PHX-T66 catastrophe 5/7: 5 addons laddered as fill
+# price went 0.42 -> 0.69 (+27pp), now MTM -98% on $28.66.
+_FIRST_ENTRY_ADVERSE_ABS_THRESHOLD = 0.05
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
                                     # (2026-04-28) → $20 (2026-04-28 night, paired with bankroll
                                     # add to ~$279) → $30 (2026-04-29 evening, per Chris). Kelly
@@ -4459,6 +4466,19 @@ def execute_opportunity(opp: dict) -> bool:
             addon_intended = intended
             addon_filled = cur_count
             addon_existing_cost = cur_cost
+            # 2026-05-07: V2-port adverse-addon gate. Block if fill price has
+            # risen >= 5pp from first entry (BUY_NO/YES symmetric: entry_price
+            # is what we pay regardless of action).
+            _f1_first_px = existing.get("_first_entry_price")
+            _f1_now_px = opp.get("entry_price")
+            if (_f1_first_px is not None and _f1_now_px is not None
+                    and (_f1_now_px - _f1_first_px) >= _FIRST_ENTRY_ADVERSE_ABS_THRESHOLD):
+                _audit_skip(opp, "ADDON_ADVERSE_PRICE",
+                    "  skip {}: addon blocked — entry_price {:.2f} - first {:.2f} = {:+.2f} >= {:.2f} (V2-port)".format(
+                        ticker, _f1_now_px, _f1_first_px,
+                        _f1_now_px - _f1_first_px,
+                        _FIRST_ENTRY_ADVERSE_ABS_THRESHOLD))
+                return False
 
     # _obs_confirmed_alive: rm has decisively settled the bracket in our favor.
     # When True, bypass forecast-based gates (directional, abs_dist, F2A, MSG,
@@ -5015,6 +5035,7 @@ def execute_opportunity(opp: dict) -> bool:
                 position_record["_filled_count"] = filled
                 position_record["_n_orders"] = 1
                 position_record["_is_addon"] = False
+                position_record["_first_entry_price"] = float(price)
                 _open_positions[ticker] = position_record
             else:
                 # Weighted-avg entry_price, accumulated count + cost.
@@ -5044,6 +5065,9 @@ def execute_opportunity(opp: dict) -> bool:
             position_record["_intended_count"] = count
             position_record["_filled_count"] = filled
             position_record["_n_orders"] = 1
+            # 2026-05-07: stamp first-fill entry_price for adverse-addon gate.
+            # Never overwritten on addons (entry_price gets weighted-averaged).
+            position_record["_first_entry_price"] = float(price)
             _open_positions[ticker] = position_record
     _save_positions()
     if is_addon:
