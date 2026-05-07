@@ -4332,6 +4332,17 @@ def execute_opportunity(opp: dict) -> bool:
     edge = float(opp["edge"])
     ticker = opp["market_ticker"]
 
+    # Stale bracket gate — Kalshi keeps markets tradeable until CLI publishes,
+    # which can lag bracket settlement by days (saw 26APR28 / 26MAY01 still
+    # firing entries on 26MAY07). days_out < 0 means bracket date already
+    # passed in opp.tz; no real edge, only retry churn.
+    _do = _days_out_int(opp)
+    if _do is not None and _do < 0:
+        _audit_skip(opp, "STALE_BRACKET",
+            f"  skip {ticker}: STALE_BRACKET — bracket {opp.get('date_str')} "
+            f"already passed (days_out={_do}); awaiting CLI settlement")
+        return False
+
     # Per-ticker check: existing position may be eligible for ADD-ON, or
     # block (settled / exited / fully-filled).
     is_addon = False

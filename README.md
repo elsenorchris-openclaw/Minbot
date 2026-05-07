@@ -3,7 +3,13 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-06 afternoon) — auto-select per-series forecast source
+## Latest change (2026-05-07 early-morning) — `STALE_BRACKET` gate
+
+`execute_opportunity` now refuses any opp where `_days_out_int(opp) < 0`. Kalshi keeps markets tradeable until CLI publishes, which can lag bracket settlement by days — saw 4 `ENTRY_FILLED` audit events at 04:10 UTC 2026-05-07 firing on `26APR28-B45.5` / `26MAY01-T46/T56` (`days_out=-5` to `-8`). They never actually filled on Kalshi, but the retry churn is wasted work and the audit log was misleading. Gate sits at the top of `execute_opportunity` (before addon-eligibility), so neither fresh entries nor add-ons fire on stale brackets. `days_out=None` (parse failure) falls through unchanged. Live-verified: 1 `STALE_BRACKET` row in bot_decisions within 2 min of restart.
+
+`tests/test_stale_bracket_gate.py`: 6 OK. Re-evaluate ~2026-05-21.
+
+## Previous change (2026-05-06 afternoon) — auto-select per-series forecast source
 
 Replaces the manual every-few-days `PER_SERIES_D{0,1}_PRIMARY` recalibration with a daily cron that picks the lowest-MAE source per (station, days_out) cell. Same methodology as the manual 5/4 audit, automated.
 
