@@ -4285,6 +4285,18 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         return ("NO_THIGH",
                 f"BUY_NO on T-high market blocked (structurally fights "
                 f"nighttime cooling; backtest 6L:1W on n=7)")
+    # 2026-05-07: BUY_YES T-tail block. Backtest 4/30-5/7 on settled pool:
+    # 0W:6L net -$47.07 / -61% ROI (DC-T46, OKC-T47, ATL-T53 x2, OKC-T51,
+    # MIN-T38; PHIL-T52 today pending → likely 0:7). Mechanism: mu within
+    # 1-2F of threshold = effective coinflip, but asymmetric loss profile
+    # (pay 30-50c, lose 100% on miss). DIRECTIONAL_BUY_YES_MIN_MP tightening
+    # (2026-05-04: 0.60→0.65) did not fix — PHIL-T52 had mp=77%.
+    # B-band BUY_YES (3W:0L) and other B-bracket BUY_YES are NOT blocked.
+    if (action == "BUY_YES"
+            and opp.get("floor") is not None and opp.get("cap") is None):
+        return ("YES_TTAIL",
+                f"BUY_YES on T-tail market blocked (mu near threshold = "
+                f"coinflip with asymmetric loss; backtest 0W:6L, -$47/-61%)")
     # BUY_YES tail margin gate (2026-05-01). Live-pool losers had margin
     # ≤ +0.5°F into YES region; winners ≥ +0.9°F. Skip when < 1.0°F.
     # Triggered by today's DC-T46 stuck loss (μ=47.0, floor=46.5,
@@ -4601,6 +4613,14 @@ def execute_opportunity(opp: dict) -> bool:
             _audit_skip(opp, "NO_THIGH",
                 f"  skip {ticker}: NO_THIGH — BUY_NO on T-high market blocked "
                 f"(structurally fights nighttime cooling; backtest 6L:1W on n=7)")
+            return False
+        # 2026-05-07: BUY_YES T-tail block. See _evaluate_gates twin for backtest.
+        if (action == "BUY_YES"
+                and opp.get("floor") is not None and opp.get("cap") is None):
+            _audit_skip(opp, "YES_TTAIL",
+                f"  skip {ticker}: YES_TTAIL — BUY_YES on T-tail market blocked "
+                f"(mu near threshold = coinflip with asymmetric loss; "
+                f"backtest 0W:6L, -$47/-61% ROI)")
             return False
         # BUY_YES tail margin gate (2026-05-01). See _evaluate_gates twin.
         if action == "BUY_YES":
