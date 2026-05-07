@@ -171,7 +171,17 @@ MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
 # would need its own backtest. Bot's mp_range_bypass (NBP-CLI consistency)
 # does NOT bypass directional consistency — directional and mp_range are
 # independent gates.
-DIRECTIONAL_BUY_NO_MAX_MP = 0.20    # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night)
+DIRECTIONAL_BUY_NO_MAX_MP = 0.25    # 2026-05-07: 0.20 → 0.25. Backtest
+                                     # found mp bucket [0.20, 0.25) has 67%
+                                     # win rate / +$5.38 avg (n=3, includes
+                                     # LAX-26APR30-B56.5 +$16.20). Bucket
+                                     # [0.25, 0.30) is EMPTY — clean cliff at
+                                     # 0.25. Bucket >=0.30 is 0% win rate
+                                     # (4 trades, all losers, still blocked).
+                                     # Lift: +$1.83 minimum (4 cleanly caught
+                                     # losers) up to +$14 if outlier signal
+                                     # generalizes. Helps:hurts 4:0.
+                                     # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night) → 0.25 (2026-05-07)
 DIRECTIONAL_BUY_YES_MIN_MP = 0.65   # 2026-05-04 night: was 0.60. BUY_YES T-floor mp 60-65% bucket bled -$34.28 over 7 trades (2W:5L) Apr 25-May 4 — model systematically overconfident at the 0.60-0.65 calibration boundary. 4 of 6 most-recent BUY_YES losses (DC-T46 -$24, OKC-T47 -$4.68, ATL-T53 -$4.56, OKC-T51 -$4.68) were in this bucket. Tightening blocks 7 of 21 T-floor BUY_YES historical trades, sacrificing 1 small winner (ATL-T60 +$0.64) to prevent 6 losses. Net lift +$34.28/10d on small sample. 6:1 helps:hurts. Re-evaluate ~2026-05-18 with fresh data.
 
 # 2026-05-01: BUY_YES tail margin gate. Live-pool loser pattern:
