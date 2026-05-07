@@ -241,7 +241,14 @@ MAX_BET_BUY_YES_USD = 5.00
 # n=30, lift +$190, LOO min +$124, 0 negative LOO removals, h:hu 18:12.
 # Triggered by min_bot PHX-T66 catastrophe 5/7: 5 addons laddered as fill
 # price went 0.42 -> 0.69 (+27pp), now MTM -98% on $28.66.
-_FIRST_ENTRY_ADVERSE_ABS_THRESHOLD = 0.05
+# 2026-05-07: tightened from 0.05 -> 0.15 after min_bot-specific backtest.
+# 0.05 (V2 default): blocked 8 historical addons, 4 settled = 4W/0L = -$4.40
+# 0.10: blocked 5, 1W/0L = -$1.81
+# 0.15: blocked 3 (all 3 are today's PHX-T66 worst addons), 0W/0L = $0.00
+# Min_bot edge is wider than V2 — small adverse moves often still favor the bot
+# (SEA-B47.5 5/2: 4 winning addons at +0.07-0.15 rise). 0.15 still catches
+# catastrophic moves (PHX-T66 5/7: addons at +0.16, +0.17, +0.27, $28.98 saved).
+_FIRST_ENTRY_ADVERSE_ABS_THRESHOLD = 0.15
                                     # → $5 (2026-04-27 PM) → $10 (2026-04-27 evening) → $15
                                     # (2026-04-28) → $20 (2026-04-28 night, paired with bankroll
                                     # add to ~$279) → $30 (2026-04-29 evening, per Chris). Kelly
