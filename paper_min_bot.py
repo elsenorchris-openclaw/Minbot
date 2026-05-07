@@ -1777,6 +1777,24 @@ NBP_CYCLE_HOURS = (1, 7, 13, 19)        # NBP Probabilistic full cycles (TXNMN p
 NBP_PUBLISH_LATENCY_MIN = 70            # don't probe S3 before cycle+70min — model still running
 NBP_HARD_STALE_SEC = 8 * 3600           # safety net: refresh unconditionally if cache > 8h old
 
+# 2026-05-07: V2-port. NCEP publishes blend bulletins ~90s ahead of the AWS S3
+# mirror, and during S3 outages (like the 5/7 01Z gap) NCEP can have data S3
+# doesn't yet. We HEAD both endpoints in parallel and use whichever returns
+# 200 first.
+_NBP_S3_BASE = "https://noaa-nbm-grib2-pds.s3.amazonaws.com"
+_NBP_NCEP_BASE = "https://nomads.ncep.noaa.gov/pub/data/nccf/com/blend/prod"
+
+# Last-Modified header per URL — avoids re-downloading the same 33MB bulletin
+# when the cycle hasn't actually advanced (typical fall-through when the
+# next-expected cycle is overdue from upstream).
+_nbp_last_modified: dict[str, str] = {}
+
+# NCEP nomads serves blend bulletins behind a 302 redirect. httpx's
+# module-level functions and `httpx.request(...)` do NOT honor
+# follow_redirects=True (only `httpx.Client` does), so we need a dedicated
+# client for the NBP path. Used for both HEAD probes and bulletin GETs.
+_NBP_HTTP = httpx.Client(timeout=30.0, follow_redirects=True)
+
 def _load_nbp_cache_from_disk() -> None:
     global _nbp_cache, _nbp_cache_ts, _nbp_cache_cycle_dt
     try:
@@ -1902,13 +1920,54 @@ def _nbp_parse_bulletin(text: str, cycle_hour: int, bulletin_date: str) -> dict[
     return result
 
 
+def _nbp_parallel_head(ncep_url: str, s3_url: str) -> tuple[Optional[str], Optional[str]]:
+    """HEAD NCEP + S3 in parallel; first 200 wins. Returns (winner_url, last_modified)
+    or (None, None) if both fail. NCEP typically publishes ~90s before S3 mirror,
+    and during S3 outages NCEP can have data S3 doesn't yet.
+
+    Uses the module-level `_NBP_HTTP` client with follow_redirects=True. NCEP
+    nomads returns 302 for blend URLs and httpx's bare `httpx.head()` /
+    `httpx.request()` calls do NOT actually follow redirects — only
+    `httpx.Client` honors follow_redirects=True. Using bare functions here
+    silently 302s and falls back to S3-only."""
+    def _head(url):
+        try:
+            r = _NBP_HTTP.head(url, timeout=3.0)
+            if r.status_code in (200, 206):
+                return url, r.headers.get("last-modified", "")
+        except Exception:
+            pass
+        return None
+    tp = concurrent.futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="nbp-head")
+    try:
+        futs = {tp.submit(_head, u): u for u in (ncep_url, s3_url)}
+        try:
+            for fut in concurrent.futures.as_completed(futs, timeout=4):
+                res = fut.result()
+                if res:
+                    return res
+        except concurrent.futures.TimeoutError:
+            pass
+        return None, None
+    finally:
+        tp.shutdown(wait=False)
+
+
 def _nbp_fetch_latest_bulletin() -> Optional[tuple[str, int, str]]:
-    """Fetch the most recent NBP bulletin text from AWS S3.
-    Returns (text, cycle_hour, bulletin_date_YYYYMMDD) or None.
+    """Fetch the most recent NBP bulletin text. Tries NCEP first, falls back to S3.
+    Returns (text, cycle_hour, bulletin_date_YYYYMMDD) on new download, None
+    otherwise. Uses Last-Modified caching so a fall-through to an older cycle
+    that's already in cache doesn't redundantly re-download 33MB.
 
     Uses blend_nbptx (longer-range bulletin with TXNMN/TXNSD). NBM Probabilistic
     cycles run 01/07/13/19 UTC; 06z/18z are short-range and omit TXNMN.
+
+    2026-05-07: V2-port — added NCEP-primary fallback + Last-Modified caching.
+    Pre-port the function was S3-only and S3 mirror lag (e.g. 5/7 01Z late by
+    >4h) would force the bot to serve a stale fallback cycle even though NCEP
+    had the new data.
     """
+    global _nbp_cache_ts
     now = datetime.now(timezone.utc)
     today = now.strftime("%Y%m%d")
     yesterday = (now - timedelta(days=1)).strftime("%Y%m%d")
@@ -1917,22 +1976,36 @@ def _nbp_fetch_latest_bulletin() -> Optional[tuple[str, int, str]]:
         (yesterday, "19"), (yesterday, "13"), (yesterday, "07"),
     ]
     for d, h in cycle_order:
-        url = ("https://noaa-nbm-grib2-pds.s3.amazonaws.com/"
-               f"blend.{d}/{h}/text/blend_nbptx.t{h}z")
+        ncep_url = f"{_NBP_NCEP_BASE}/blend.{d}/{h}/text/blend_nbptx.t{h}z"
+        s3_url = f"{_NBP_S3_BASE}/blend.{d}/{h}/text/blend_nbptx.t{h}z"
+        winner_url, winner_lm = _nbp_parallel_head(ncep_url, s3_url)
+        if not winner_url:
+            continue
+
+        # Skip-if-unchanged: same Last-Modified means we already have this
+        # bulletin's data in cache. Bump cache_ts as proof-of-life so the
+        # stale-cache watcher doesn't false-alarm during the inter-cycle gap.
+        if _nbp_last_modified.get(winner_url) == winner_lm and winner_lm:
+            with _nbp_cache_lock:
+                _nbp_cache_ts = time.time()
+            return None
+
         try:
-            r = httpx.get(url, timeout=30.0)
+            r = _NBP_HTTP.get(winner_url, timeout=30.0)
             if r.status_code != 200:
                 continue
             data = r.text
-            # Sanity check: TXNMN present (present on 01/07/13/19 cycles).
-            if "TXNMN" not in data[:500000]:
-                continue
-            if len(data) < 1000000:
-                continue
-            log(f"  NBP: fetched blend.{d}/{h} ({len(data)//1024}KB)")
-            return data, int(h), d
         except Exception:
             continue
+        # Sanity check: TXNMN present (present on 01/07/13/19 cycles).
+        if "TXNMN" not in data[:500000]:
+            continue
+        if len(data) < 1000000:
+            continue
+        _nbp_last_modified[winner_url] = winner_lm
+        src = "NCEP" if "nomads" in winner_url else "S3"
+        log(f"  NBP: fetched blend.{d}/{h} ({len(data)//1024}KB) via {src}")
+        return data, int(h), d
     return None
 
 
@@ -2012,13 +2085,10 @@ def _nbp_next_cycle_available() -> bool:
 
     d = next_cycle.strftime("%Y%m%d")
     h = next_cycle.strftime("%H")
-    url = (f"https://noaa-nbm-grib2-pds.s3.amazonaws.com/"
-           f"blend.{d}/{h}/text/blend_nbptx.t{h}z")
-    try:
-        r = httpx.head(url, timeout=5.0)
-    except Exception:
-        return False
-    return r.status_code == 200
+    ncep_url = f"{_NBP_NCEP_BASE}/blend.{d}/{h}/text/blend_nbptx.t{h}z"
+    s3_url = f"{_NBP_S3_BASE}/blend.{d}/{h}/text/blend_nbptx.t{h}z"
+    winner_url, _ = _nbp_parallel_head(ncep_url, s3_url)
+    return winner_url is not None
 
 
 # Tick intervals for the background NBP poller daemon. 5s during the

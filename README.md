@@ -3,7 +3,23 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-07 early-morning) — `refresh_nbm_om_forecasts` model fix
+## Latest change (2026-05-07 early-morning) — NBP fetcher: NCEP fallback + Last-Modified caching (V2 port)
+
+`_nbp_fetch_latest_bulletin()` was S3-only (`noaa-nbm-grib2-pds`). When the AWS S3 mirror lagged behind NCEP nomads (e.g. 5/7 01Z 4h+ late at S3 while nomads already had it), min_bot was forced onto a stale fallback cycle and fired Discord `STALE CACHE FALLBACK NBP` alerts. V1+V2 both already used NCEP-first parallel HEAD; this ports the same pattern to min_bot.
+
+Three changes:
+
+1. **Parallel HEAD** against `https://nomads.ncep.noaa.gov/...` and S3 — first 200 wins. NCEP typically publishes ~90s ahead of S3 mirror, and S3 outages don't block NBP fetch entirely.
+2. **Last-Modified caching** — `_nbp_last_modified[url]` tracks each bulletin's LM header. When the cycle hasn't advanced (typical fall-through during the natural 6h inter-cycle gap), the bot doesn't re-download the 33MB bulletin.
+3. **Heartbeat on unchanged-bulletin** — bumps `_nbp_cache_ts` even when no new download happens, so the stale-cache watchdog doesn't false-alarm when the bot is healthy but no new cycle has dropped.
+
+**Subtle httpx quirk discovered:** `httpx.head(url, follow_redirects=True)` and `httpx.request("HEAD", url, follow_redirects=True)` both silently return 302 without following. Only `httpx.Client(follow_redirects=True).head(url)` actually follows. NCEP nomads returns 302 for blend URLs, so without a Client instance the helper would silently fall back to S3-only. Module-level `_NBP_HTTP = httpx.Client(timeout=30.0, follow_redirects=True)` is now used for all NBP HEAD probes and bulletin GETs.
+
+**Live-verified post-restart 06:15 UTC:** cold-start grabbed 5/6 19Z via S3 (most-recent-immediately-responsive cycle), then poller advanced to **5/7 01Z via NCEP** within ~3 min. Cache `cycle_dt` now `2026-05-07T01:00:00+00:00`. Same 2-step pattern V2 uses (cold-start grabs whatever returns first, poller catches up).
+
+`tests/test_nbp_ncep_fallback.py`: 9 OK. Re-evaluate ~2026-05-21.
+
+## Previous change (2026-05-07 early-morning) — `refresh_nbm_om_forecasts` model fix
 
 `refresh_nbm_om_forecasts()` was passing `model="best_match"` to Open-Meteo since min_bot's first commit. `best_match` is OM's auto-picker — for US points short-range it returns HRRR, longer-range GFS/ICON. So the function named "NBM-OM" was actually returning HRRR-equivalent data for d-0, never NBM. The bug was masked while the free endpoint throttled (cache-lag made the streams look different by accident); the 5/5 customer-api fix removed the throttle and exposed it. By 5/7 morning, `mu_nbm_om == mu_hrrr` 100% of the time across 34,764 candidate rows.
 
