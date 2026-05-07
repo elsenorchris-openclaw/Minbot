@@ -195,6 +195,18 @@ YES_TAIL_MIN_MARGIN_F = 1.0
 
 # Hard safety gates (HIGH-impact: prevent the patterns that lost money on the
 # 04:09 UTC live cycle and that V1/V2 had to fix in production).
+_DISAGREEMENT_ENABLED = False       # 2026-05-07: disabled. 30d audit found 9
+                                     # unique tickers blocked; 7 resolved via
+                                     # final running_min: 6 hurts (would have
+                                     # WON), 1 help — 1:6 helps:hurts, lift
+                                     # est −$22.98. Pattern: filter overrides
+                                     # high-confidence model_prob (all 6 hurt
+                                     # cases had mp ≤ 0.20 = model 80%+
+                                     # confident NO wins, model was right
+                                     # despite multi-source disagreement).
+                                     # Predicate preserved for fresh re-enable.
+                                     # Re-evaluate ~2026-05-21 if blocked
+                                     # ticker outcomes shift.
 MAX_DISAGREEMENT_F = 5.0            # skip if HRRR vs NBP / NBP vs NBM disagree > this
 MAX_SPREAD_CENTS = 10               # skip if (yes_ask − yes_bid) > 10c on the active side
 MAX_MU_VS_RM_DIFF_F = 5.0           # pre-sunrise sanity: skip if forecast μ disagrees with
@@ -4257,9 +4269,10 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         disag = float(opp.get("disagreement") or 0)
         if disag > H_2_0_DISAGREE_F:
             return ("H_2_0", f"disagreement {disag:.1f}°F > {H_2_0_DISAGREE_F}°F")
-    disag = float(opp.get("disagreement") or 0)
-    if disag > MAX_DISAGREEMENT_F:
-        return ("MAX_DISAGREEMENT", f"{disag:.1f}°F > {MAX_DISAGREEMENT_F}°F")
+    if _DISAGREEMENT_ENABLED:
+        disag = float(opp.get("disagreement") or 0)
+        if disag > MAX_DISAGREEMENT_F:
+            return ("MAX_DISAGREEMENT", f"{disag:.1f}°F > {MAX_DISAGREEMENT_F}°F")
     rm = opp.get("running_min")
     if rm is not None and not opp.get("post_sunrise_lock"):
         mu_check = float(opp.get("mu") or 0)
@@ -4585,11 +4598,12 @@ def execute_opportunity(opp: dict) -> bool:
                     f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
                     f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
                 return False
-        disagreement = float(opp.get("disagreement", 0.0))
-        if disagreement > MAX_DISAGREEMENT_F:
-            _audit_skip(opp, "DISAGREEMENT",
-                f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
-            return False
+        if _DISAGREEMENT_ENABLED:
+            disagreement = float(opp.get("disagreement", 0.0))
+            if disagreement > MAX_DISAGREEMENT_F:
+                _audit_skip(opp, "DISAGREEMENT",
+                    f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
+                return False
         # Mu-vs-running_min sanity: pre-sunrise, forecast μ vs observed lowest > 5°F = wrong.
         rm = opp.get("running_min")
         if rm is not None and not opp.get("post_sunrise_lock"):
