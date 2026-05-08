@@ -199,6 +199,21 @@ DIRECTIONAL_BUY_YES_MIN_MP = 0.65   # 2026-05-04 night: was 0.60. BUY_YES T-floo
 BUY_NO_EXTREME_SIGMA_THRESHOLD = 8.0
 BUY_NO_EXTREME_SIGMA_MAX_MP    = 0.10
 
+# 2026-05-08: KLAX-specific BUY_NO σ gate. Pacific coastal microclimate
+# (marine layer, fog) is poorly modeled by HRRR/NBP/NBM, manifesting as
+# elevated σ. PER_SERIES_SIGMA_MULT=2.5 captures the historical-MAE tax
+# but doesn't gate entries. Backtest 14d on extended pool (settled +
+# exited + locked-win + in-bracket, n=71): 4 KLAX BUY_NO B-bracket
+# entries, 1 won at σ=1.67 (+$16), 3 lost at σ=2.50/3.00/5.00 (−$70).
+# Threshold 2.5°F catches all 3 losers, preserves σ<2.5 winner.
+# n=3 below standard sample bar but: robust=+$40.74, helps:hurts=3:0,
+# lift=+$69.90, mechanism is structurally clean (LAX known-bad MAE
+# AND elevated σ at entry = Pacific-microclimate uncertainty regime
+# the bot's Gaussian model doesn't capture). KLAX-only because cross-
+# station σ>=2.5 is mixed (KMSP +$65/3W:0L, KDFW +$15/3W:1L), so
+# generalization would block winners.
+LAX_BUY_NO_HIGH_SIGMA_THRESHOLD = 2.5
+
 # 2026-05-01: BUY_YES tail margin gate. Live-pool loser pattern:
 # losers had margin median = -0.50°F (μ on wrong side / barely across the
 # threshold), winners had margin = +0.90°F. DC-T46 today (μ=47, floor=46.5,
@@ -4430,6 +4445,16 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
                 f"σ={opp.get('sigma'):.2f}≥{BUY_NO_EXTREME_SIGMA_THRESHOLD} "
                 f"AND mp={mp:.1%}<{BUY_NO_EXTREME_SIGMA_MAX_MP:.0%} "
                 f"(Gaussian-flattening artifact at high uncertainty)")
+    # 2026-05-08: KLAX_BUY_NO_HIGH_SIGMA. KLAX-specific: block BUY_NO
+    # B-bracket when σ ≥ 2.5°F. See constant block for mechanism + backtest.
+    if (action == "BUY_NO"
+            and "KXLOWTLAX" in (opp.get("market_ticker") or "")
+            and opp.get("floor") is not None and opp.get("cap") is not None
+            and (opp.get("sigma") or 0) >= LAX_BUY_NO_HIGH_SIGMA_THRESHOLD):
+        return ("KLAX_BUY_NO_HIGH_SIGMA",
+                f"KLAX BUY_NO B-bracket with σ={opp.get('sigma'):.2f}"
+                f"≥{LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} "
+                f"(Pacific microclimate uncertainty; backtest 0W:3L, lift +$70)")
     # Global BUY_NO T-high block (2026-05-01, was per-station LAX-only).
     # Backtest helps:hurts 6:1, net +$2.93 across n=7 historical entries.
     # Forward audit: candidate log records blocked_by="NO_THIGH" so future
@@ -4781,6 +4806,25 @@ def execute_opportunity(opp: dict) -> bool:
                 f"src=`{opp.get('mu_source')}`  "
                 f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}  "
                 f"disagree={(opp.get('disagreement') or 0):.1f}°F"
+            )
+            return False
+        # 2026-05-08: KLAX_BUY_NO_HIGH_SIGMA gate (live block + Discord notify).
+        # KLAX-specific σ floor; see constant block for mechanism + backtest.
+        if (action == "BUY_NO"
+                and "KXLOWTLAX" in ticker
+                and opp.get("floor") is not None and opp.get("cap") is not None
+                and (opp.get("sigma") or 0) >= LAX_BUY_NO_HIGH_SIGMA_THRESHOLD):
+            _audit_skip(opp, "KLAX_BUY_NO_HIGH_SIGMA",
+                f"  skip {ticker}: KLAX BUY_NO B-bracket "
+                f"σ={opp.get('sigma'):.2f}≥{LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} "
+                f"(Pacific microclimate; backtest 0W:3L on n=3)")
+            _discord_skip_send(ticker,
+                f"🌊 **BLOCKED KLAX BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
+                f"σ {opp.get('sigma'):.2f}°F ≥ {LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} threshold  "
+                f"μ {opp.get('mu'):.1f}°F  bracket [{opp.get('floor'):.1f},{opp.get('cap'):.1f}]\n"
+                f"src=`{opp.get('mu_source')}`  "
+                f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}\n"
+                f"backtest: 0W:3L on n=3 LAX entries, lift +$69.90, h:h 3:0"
             )
             return False
         # Global BUY_NO T-high block (2026-05-01, was LAX-only).

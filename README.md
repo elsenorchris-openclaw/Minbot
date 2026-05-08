@@ -3,7 +3,21 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-08 mid-day) — `BUY_NO_EXTREME_SIGMA` gate (live block + Discord notify)
+## Latest change (2026-05-08 late afternoon) — `KLAX_BUY_NO_HIGH_SIGMA` gate (live block + Discord notify)
+
+**Trigger:** KLAX is the single worst station in the 14d extended pool: 1W:3L, **−$53.70**. All 4 trades are BUY_NO B-bracket on `nbp`, three losers had σ ≥ 2.5°F (5/1 −$29 σ=3.0, 5/2 −$24 σ=2.5, 5/3 −$17 σ=5.0); the only winner had σ=1.67 (4/30 +$16). The pattern survives the existing `PER_SERIES_SIGMA_MULT=2.5` (which inflates Kelly-shrink but doesn't gate entries).
+
+**Filter:** block BUY_NO B-bracket when `series == "KXLOWTLAX" AND sigma >= 2.5°F`. Constant `LAX_BUY_NO_HIGH_SIGMA_THRESHOLD = 2.5` at `paper_min_bot.py:215`. Gate logic in both `_evaluate_gates` and `execute_opportunity`. Audit row `KLAX_BUY_NO_HIGH_SIGMA` to `bot_decisions.sqlite`; Discord notification to channel 1497464077608550570 (per-ticker 6h dedup).
+
+**Mechanism:** Pacific coastal microclimate (marine layer push, fog, advection) is poorly modeled by HRRR/NBP/NBM relative to inland stations. The auto_select picker confirms NBP is the lowest-MAE source for KLAX d-0 (1.42°F MAE) — but even the best source still has 1.4°F+ error, and σ ≥ 2.5°F flags entries where the bot's Gaussian model is operating in the regime where forecast uncertainty exceeds what NBP-calibrated σ captures alone (the 2.5x PER_SERIES multiplier already amplifies σ proportionally — when σ_final ≥ 2.5°F it means the underlying source σ was ≥ 1.0°F, which is poor).
+
+**Backtest** (extended pool n=71 decided): catches 3 records, **0W:3L**, lift +$69.90, robust +$40.74, helps:hurts 3:0. Below standard sample bar (n≥5) but mechanism is structurally clean and the cohort is narrowly station-targeted, so generalization risk is low. **Cross-station σ≥2.5 BUY_NO B-bracket rejected** because KMSP (3W:0L +$65), KDFW (3W:1L +$15), KPHX (3W:1L +$9) all show σ≥2.5 is a positive signal at non-Pacific-coastal stations. KLAX is the structural outlier.
+
+**Risk:** the σ=1.67 winner (KLAX-26APR30-B56.5 +$16.20) would NOT be blocked at the 2.5°F threshold. If a future 1.7-2.4°F-σ KLAX BUY_NO appears as a winner, it is preserved. False-positive cost ceiling is ~$16/winner.
+
+**Live-verified post-restart 18:35:32 UTC.** Commit pending.
+
+## Previous change (2026-05-08 mid-day) — `BUY_NO_EXTREME_SIGMA` gate (live block + Discord notify)
 
 **Trigger:** today's KXLOWTDEN-26MAY08-B41.5 BUY_NO loss (−$1.34, σ=8.34, mp=9.2%, mu=43.6 vs cap=42, actual 42 in bracket) — the only one of today's three losers with no existing filter coverage. CHI was caught structurally by the bias_corr disable; DAL was self-limited by thin-orderbook + market_stop. DEN stood alone.
 
