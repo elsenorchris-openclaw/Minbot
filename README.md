@@ -3,7 +3,21 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-07 evening) — `OBS_CONFIRMED_LOSER` hygiene check (BUY_NO)
+## Latest change (2026-05-08 early-morning) — `_get_metar_running_min` LST-window fix (CRITICAL)
+
+**Bug:** `_get_metar_running_min(station, climate_date)` used a `±12h pad` around UTC midnight, creating a **48-hour window** that pulled the PRIOR climate day's morning cooling cycle into today's query.
+
+For KHOU on 2026-05-08, the bug pulled in 5/7 09:53 CDT awc/ldm reading of 64.94°F. `_cli_aligned_rmin` half-up rounded to 65. `_check_obs_confirmed_alive` then evaluated `rm=65 < floor=70 - 3°F = 67` → **TRUE** → fired `OBS_CONFIRMED_ALIVE` on `KXLOWTHOU-26MAY08-B70.5`, bypassed all forecast gates, kelly×1.5 boost, entered 13 BUY_NO contracts at $11.61. **Today's actual rm was 73.4** — bracket [70, 71] was reachable. Same leak hit `KXLOWTDAL-26MAY08-B60.5` via `calc_bracket_probability_min`'s "bracket impossible" guard returning 0.0 on yesterday's KDFW morning low.
+
+**Fix:** new helper `_lst_climate_window_utc(station, climate_date)` computes the proper per-station LST climate-day window via the Jan-15 (standard-time-only) UTC offset trick. KHOU 5/8 = `[2026-05-08T06:00 UTC, 2026-05-09T06:00 UTC]` (24h, CST=UTC-6). `_get_metar_running_min` updated to use it.
+
+Failure mode documented in `memory/feedback_per_station_lst_climate_window.md`. Bug live since `USE_CLI_ALIGNED_RMIN = True` (2026-05-06).
+
+**Live-verified post-restart 07:07:34 UTC:** zero `OBS_CONFIRMED_ALIVE` firings across all stations. Pre-fix, HOU was firing every cycle. Commit `a7e5c9d`.
+
+`tests/test_lst_climate_window_fix.py`: 13 OK.
+
+## Previous change (2026-05-07 evening) — `OBS_CONFIRMED_LOSER` hygiene check (BUY_NO)
 
 Added a `current_obs < running_min - 0.5°F → skip LOSER` sanity check in `_check_obs_confirmed_loser` BUY_NO branch. New helper `_get_current_temp_f(station)` reads the latest `temp_f` from `obs.sqlite.observations`.
 
