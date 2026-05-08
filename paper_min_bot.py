@@ -1285,6 +1285,35 @@ def get_running_min(station: str, climate_date: str) -> Optional[float]:
 USE_CLI_ALIGNED_RMIN = True  # 2026-05-06: V1/V2-port. Aligns rm at model_prob calc + obs_confirmed_* checks via METAR-precision lookup, not just int-rounding.
 
 
+def _lst_climate_window_utc(station: str, climate_date: str) -> Optional[tuple[int, int]]:
+    """Return (start_utc_ts, end_utc_ts) for a station's LST climate day.
+
+    Kalshi settles weather brackets on LST climate days (no DST). Each station's
+    LST window has a different UTC offset (Pacific=UTC-8, Mountain=UTC-7,
+    Central=UTC-6, Eastern=UTC-5; KPHX is also Mountain no-DST). Using a
+    universal pad pulls the prior climate day's tail into next-day queries —
+    documented failure mode in `feedback_per_station_lst_climate_window.md`.
+
+    Returns None if station tz unknown or date_str unparseable; caller treats
+    as "skip the precision lookup, fall back to raw running_min."
+    """
+    tz_name = _STATION_TZ.get(station)
+    if not tz_name:
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+        # Jan-15 trick: standard time only (no DST) → matches LST.
+        y = int(climate_date.split("-")[0])
+        jan15 = datetime(y, 1, 15, tzinfo=tz)
+        lst_offset_h = jan15.utcoffset().total_seconds() / 3600.0
+        d = datetime.strptime(climate_date, "%Y-%m-%d")
+        start_utc = d.replace(tzinfo=timezone.utc) + timedelta(hours=-lst_offset_h)
+        end_utc = start_utc + timedelta(hours=24)
+        return int(start_utc.timestamp()), int(end_utc.timestamp())
+    except Exception:
+        return None
+
+
 def _get_metar_running_min(station: str, climate_date: str) -> Optional[float]:
     """METAR-text-only running_min from awc/ldm sources for (station, date).
 
@@ -1295,28 +1324,29 @@ def _get_metar_running_min(station: str, climate_date: str) -> Optional[float]:
 
     Returns None when no awc/ldm observations are present for the date,
     or on DB error. Caller falls back to the unaligned running_min.
+
+    2026-05-08 BUG FIX: previously used a ±12h pad on UTC-midnight bounds,
+    which created a 48-hour window that pulled in the PRIOR climate day's
+    morning low (cooling cycle). For KHOU on 2026-05-08 the window pulled
+    in 5/7 morning's 64.94°F low → cli_aligned_rmin returned 65 → false
+    OBS_CONFIRMED_ALIVE on B70.5 (true today rm was 73.4). Now uses proper
+    per-station LST climate window. See feedback_per_station_lst_climate_window.md.
     """
+    win = _lst_climate_window_utc(station, climate_date)
+    if win is None:
+        return None
+    start_ts, end_ts = win
     try:
-        # observations.obs_time is epoch seconds; climate_date is LST day.
-        # Filter using local midnight boundaries derived from station tz —
-        # but for simplicity (and matching obs-pipeline's seed semantics),
-        # use a 24h+12h window to capture the whole climate day robustly.
-        # The obs-pipeline running_min table itself uses LST climate-date
-        # tagging on the actual obs_time, so we approximate by date_str.
         conn = sqlite3.connect(f"file:{OBS_DB_PATH}?mode=ro", uri=True, timeout=2.0)
-        # Read min temp_f where source is METAR-text and obs is on the
-        # climate date. Climate day spans ~36h UTC for any timezone.
-        # Compare obs_time to a window that covers the full climate day:
-        # date_str at 00:00 UTC ± 12h is conservative.
         row = conn.execute(
             """
             SELECT MIN(temp_f) FROM observations
             WHERE station = ?
               AND source IN ('awc','ldm')
-              AND obs_time >= strftime('%s', ? || 'T00:00:00') - 43200
-              AND obs_time <  strftime('%s', ? || 'T23:59:59') + 43200
+              AND obs_time >= ?
+              AND obs_time <  ?
             """,
-            (station, climate_date, climate_date),
+            (station, start_ts, end_ts),
         ).fetchone()
         conn.close()
         if row and row[0] is not None:
