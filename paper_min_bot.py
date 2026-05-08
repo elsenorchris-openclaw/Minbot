@@ -75,7 +75,7 @@ try:
     import bias_correction as _bias_correction
 except Exception:
     _bias_correction = None  # bot operates normally without bias correction
-USE_BIAS_CORRECTION = True  # 2026-05-05: enabled (no applicable cells today
+USE_BIAS_CORRECTION = False  # 2026-05-08: disabled (n=4 trades, mechanism too weak to flip [0.05, 0.85] BUY_NO band — only nudges position size by a few %; cron table cont.refresh for re-enable)
                              # → zero behavioral impact; auto-activates as
                              # data accumulates).
 
