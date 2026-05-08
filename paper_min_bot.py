@@ -184,6 +184,21 @@ DIRECTIONAL_BUY_NO_MAX_MP = 0.25    # 2026-05-07: 0.20 → 0.25. Backtest
                                      # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night) → 0.25 (2026-05-07)
 DIRECTIONAL_BUY_YES_MIN_MP = 0.65   # 2026-05-04 night: was 0.60. BUY_YES T-floor mp 60-65% bucket bled -$34.28 over 7 trades (2W:5L) Apr 25-May 4 — model systematically overconfident at the 0.60-0.65 calibration boundary. 4 of 6 most-recent BUY_YES losses (DC-T46 -$24, OKC-T47 -$4.68, ATL-T53 -$4.56, OKC-T51 -$4.68) were in this bucket. Tightening blocks 7 of 21 T-floor BUY_YES historical trades, sacrificing 1 small winner (ATL-T60 +$0.64) to prevent 6 losses. Net lift +$34.28/10d on small sample. 6:1 helps:hurts. Re-evaluate ~2026-05-18 with fresh data.
 
+# 2026-05-08: BUY_NO_EXTREME_SIGMA gate. Block BUY_NO when bot's own
+# inflated sigma is >= 8.0°F AND model_prob < 10%. Mechanism: sigma is
+# inflated by PER_SERIES_SIGMA_MULT (KLAX/KPHX/KDEN/KLV) * disagreement
+# inflation * NBP staleness. When all three compound, sigma >= 8 marks
+# the WORST-known-MAE configuration — yet Gaussian CDF makes mp DROP as
+# sigma rises (probability mass spreads thin), so the bot becomes MORE
+# confident in BUY_NO precisely when uncertainty is highest. Pair with
+# mp<10% to catch the Gaussian-flattening artifact specifically.
+# Backtest n=2 (PHX-26MAY05 -$6.70 + DEN-26MAY08 -$1.34, 0W:2L, lift
+# +$8.04). Below sample-size playbook bar but mechanism is structurally
+# clean: σ inflation exists to FLAG uncertainty but propagates into mp
+# calc backwards. Re-evaluate at n>=5 firings.
+BUY_NO_EXTREME_SIGMA_THRESHOLD = 8.0
+BUY_NO_EXTREME_SIGMA_MAX_MP    = 0.10
+
 # 2026-05-01: BUY_YES tail margin gate. Live-pool loser pattern:
 # losers had margin median = -0.50°F (μ on wrong side / barely across the
 # threshold), winners had margin = +0.90°F. DC-T46 today (μ=47, floor=46.5,
@@ -858,6 +873,24 @@ def _log_skip(ticker: str, msg: str) -> None:
             return
         _skip_log_state[ticker] = (msg, now)
     log(msg)
+
+
+_discord_skip_state: dict[str, float] = {}
+_discord_skip_lock = threading.Lock()
+DISCORD_SKIP_RELOG_SEC = 21600.0  # 6h dedup; ticker lifetime is ~1 climate day
+
+
+def _discord_skip_send(ticker: str, msg: str) -> None:
+    """Discord version of _log_skip — dedup so the same (ticker) doesn't
+    spam the channel every 30s eval cycle. First fire goes through; repeats
+    within DISCORD_SKIP_RELOG_SEC are suppressed."""
+    now = time.time()
+    with _discord_skip_lock:
+        last = _discord_skip_state.get(ticker, 0.0)
+        if (now - last) < DISCORD_SKIP_RELOG_SEC:
+            return
+        _discord_skip_state[ticker] = now
+    discord_send(msg)
 
 
 def _audit_skip(opp: dict, decision: str, msg: str) -> None:
@@ -4388,6 +4421,15 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         return ("DIRECTIONAL_BUY_NO", f"mp {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%}")
     if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
         return ("DIRECTIONAL_BUY_YES", f"mp {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%}")
+    # 2026-05-08: BUY_NO_EXTREME_SIGMA. Block when σ ≥ 8 AND mp < 10% —
+    # see constant block above for mechanism.
+    if (action == "BUY_NO"
+            and (opp.get("sigma") or 0) >= BUY_NO_EXTREME_SIGMA_THRESHOLD
+            and (opp.get("model_prob") or 1.0) < BUY_NO_EXTREME_SIGMA_MAX_MP):
+        return ("BUY_NO_EXTREME_SIGMA",
+                f"σ={opp.get('sigma'):.2f}≥{BUY_NO_EXTREME_SIGMA_THRESHOLD} "
+                f"AND mp={mp:.1%}<{BUY_NO_EXTREME_SIGMA_MAX_MP:.0%} "
+                f"(Gaussian-flattening artifact at high uncertainty)")
     # Global BUY_NO T-high block (2026-05-01, was per-station LAX-only).
     # Backtest helps:hurts 6:1, net +$2.93 across n=7 historical entries.
     # Forward audit: candidate log records blocked_by="NO_THIGH" so future
@@ -4718,6 +4760,28 @@ def execute_opportunity(opp: dict) -> bool:
         if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
             _audit_skip(opp, "DIRECTIONAL_YES_DISAGREE",
                 f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
+            return False
+        # 2026-05-08: BUY_NO_EXTREME_SIGMA gate (live block + Discord notify).
+        # See constant block above for full mechanism. Backtest 0W:2L.
+        if (action == "BUY_NO"
+                and (opp.get("sigma") or 0) >= BUY_NO_EXTREME_SIGMA_THRESHOLD
+                and (opp.get("model_prob") or 1.0) < BUY_NO_EXTREME_SIGMA_MAX_MP):
+            _audit_skip(opp, "BUY_NO_EXTREME_SIGMA",
+                f"  skip {ticker}: σ={opp.get('sigma'):.2f}≥{BUY_NO_EXTREME_SIGMA_THRESHOLD} "
+                f"AND mp={mp:.1%}<{BUY_NO_EXTREME_SIGMA_MAX_MP:.0%} "
+                f"(Gaussian-flattening at high uncertainty)")
+            _floor = opp.get("floor"); _cap = opp.get("cap")
+            _bracket = (f"[{_floor},{_cap}]" if _floor is not None and _cap is not None
+                        else f"≥{_floor}" if _cap is None else f"≤{_cap}")
+            _discord_skip_send(ticker,
+                f"🛡️ **BLOCKED BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
+                f"extreme-σ filter: σ {opp.get('sigma'):.2f}°F ≥ {BUY_NO_EXTREME_SIGMA_THRESHOLD}  "
+                f"mp {mp:.1%} < {BUY_NO_EXTREME_SIGMA_MAX_MP:.0%}  "
+                f"μ {opp.get('mu'):.1f}°F  bracket {_bracket}\n"
+                f"src=`{opp.get('mu_source')}`  "
+                f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}  "
+                f"disagree={(opp.get('disagreement') or 0):.1f}°F"
+            )
             return False
         # Global BUY_NO T-high block (2026-05-01, was LAX-only).
         if (action == "BUY_NO"

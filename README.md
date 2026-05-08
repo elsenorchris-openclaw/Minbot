@@ -3,7 +3,37 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-08 early-morning) — `_get_metar_running_min` LST-window fix (CRITICAL)
+## Latest change (2026-05-08 mid-day) — `BUY_NO_EXTREME_SIGMA` gate (live block + Discord notify)
+
+**Trigger:** today's KXLOWTDEN-26MAY08-B41.5 BUY_NO loss (−$1.34, σ=8.34, mp=9.2%, mu=43.6 vs cap=42, actual 42 in bracket) — the only one of today's three losers with no existing filter coverage. CHI was caught structurally by the bias_corr disable; DAL was self-limited by thin-orderbook + market_stop. DEN stood alone.
+
+**Filter:** block BUY_NO when `sigma >= 8.0°F AND model_prob < 10%`. Constants in `paper_min_bot.py:199-200`. Gate logic in both `_evaluate_gates` (eval-only) and `execute_opportunity` (live). When live gate fires, `_audit_skip` writes a `BUY_NO_EXTREME_SIGMA` row to `bot_decisions.sqlite` AND a per-ticker-deduped Discord notification is sent to channel 1497464077608550570 via new helper `_discord_skip_send` (6h re-log window).
+
+**Mechanism (the actual reason high-σ BUY_NO loses):**
+
+1. min_bot's σ starts at NBP-calibrated ~2-4°F, then compounds three multipliers:
+   - `PER_SERIES_SIGMA_MULT`: KLAX=2.5×, KPHX=2.0×, **KDEN=1.5×**, KLV=1.5× (the 4 known-poor-MAE stations)
+   - Disagreement inflation up to 1.5× when sources spread >2°F
+   - NBP staleness up to 1.3× after 1h+
+2. `σ ≥ 8` requires the compound case — i.e. **a known-bad-MAE station AND active source disagreement.** It marks the bot's WORST-known-uncertainty configuration.
+3. The bot's `mp = Φ((cap-mu)/σ) - Φ((floor-mu)/σ)` is a Gaussian CDF. **As σ rises, P(in any narrow bracket far from mu) DECREASES** (the bell flattens, mass spreads). The bot reads the lower mp as "even safer to BUY_NO" — exactly the wrong direction.
+4. Concrete: DEN today σ=8.34, mu=43.6, bracket [41,42]. Gaussian gives mp=4.6% with σ=8.34 vs 8.7% with base σ=4.0 — the inflation made the bot 47% MORE confident. Same with PHX-26MAY05 (σ=9.32, mp shifted from 5.2%→3.8%, also lost).
+
+**Backtest (extended pool n=71 decided):** σ≥8 AND mp<10% on BUY_NO catches 2 historical records (PHX-26MAY05-B65.5 −$6.70, DEN-26MAY08-B41.5 −$1.34), 0W:2L, lift +$8.04. Below standard sample bar (n≥5) but mechanism is structurally clean and the cohort is so narrow that false-positive risk is small (~1-2 firings/month). Re-evaluate at n≥5 firings.
+
+**Risk:** this WILL block some winners eventually. The σ ≥ 6 cohort is 4W:3L — wins exist when actual lands far from mu by chance. The threshold at 8 is calibrated to the rare compound-multiplier configuration where mp distortion is largest. Discord notification means each block is reviewable in real time.
+
+**Why ship despite low n:** alternative ("wait for more samples") would let the next σ≥8 BUY_NO trade, which a structurally clean argument predicts is −EV due to Gaussian-in-fat-tailed-regime mismatch. Cost of a hard block on a winner: forfeit a few dollars. Cost of letting one through: full bracket loss ($30+).
+
+**Forward audit:** Discord channel 1497464077608550570 receives one notification per ticker per filter trigger (6h dedup). `bot_decisions.sqlite` gets a `BUY_NO_EXTREME_SIGMA` decision row at every firing for backtest aggregation.
+
+**Live-verified post-restart 17:33:44 UTC.** Commit pending.
+
+## Previous change (2026-05-08 mid-day) — `USE_BIAS_CORRECTION = False`
+
+`paper_min_bot.py:78`. n=4 bias_corr trades since 2026-05-05 deploy: 0 had entry decision flipped (Δmp 1-6pp can't escape [0.05, 0.85] BUY_NO band). Net pnl −$43 (W:L 2:2), dominated by forecast misses too big for bias to fix (CHI cluster 44°F vs actual 42°F). Position-sizing nudge of a few % is symmetric across W/L → near-zero net effect. Cron table refresh kept; re-enable trivial. Commit `53ec38a`.
+
+## Previous change (2026-05-08 early-morning) — `_get_metar_running_min` LST-window fix (CRITICAL)
 
 **Bug:** `_get_metar_running_min(station, climate_date)` used a `±12h pad` around UTC midnight, creating a **48-hour window** that pulled the PRIOR climate day's morning cooling cycle into today's query.
 
