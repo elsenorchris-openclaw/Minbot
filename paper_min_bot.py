@@ -211,6 +211,17 @@ MAX_DISAGREEMENT_F = 5.0            # skip if HRRR vs NBP / NBP vs NBM disagree 
 MAX_SPREAD_CENTS = 10               # skip if (yes_ask − yes_bid) > 10c on the active side
 MAX_MU_VS_RM_DIFF_F = 5.0           # pre-sunrise sanity: skip if forecast μ disagrees with
                                     # observed running_min by more than this — model is wrong
+# 2026-05-08: positions with actual_cost below this threshold don't count toward
+# MAX_OPEN_PER_EVENT. KXLOW markets often only fill 1 contract ($0.40-$1.50)
+# at the maker bid in thin orderbooks; without the exemption, those tiny first
+# fills lock the entire (city,date) event slot, blocking legit entries on
+# better brackets within the same event for the rest of the day. Backtest
+# (14d, n=8 event_cap blocks): 2 tiny-blocker cases would be unblocked, 5
+# moderate-blocker cases ($4-7) untouched, 1 full-blocker case ($29.58)
+# correlated-bet protection preserved. Threshold $3 mirrors V1's NO_CASCADE
+# under-fill exemption philosophy (kept tighter for min_bot's smaller bet sizes).
+EVENT_CAP_UNDERFILL_THRESHOLD_USD = 3.0
+
 MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per event_ticker.
                                     # Lifetime cap (counts against _open_positions, not just
                                     # this cycle). Prior per-cycle version let CHI-26APR25
@@ -3622,14 +3633,49 @@ def _reset_cycle_budget() -> None:
 
 
 def _open_count_for_event(event_ticker: str) -> int:
-    """Count currently-open (non-settled) positions on a given event."""
+    """Count currently-open (non-settled) positions on a given event.
+
+    2026-05-08: under-fill exemption. Positions with actual_cost below
+    EVENT_CAP_UNDERFILL_THRESHOLD_USD don't count toward the cap. KXLOW
+    markets are often thin enough that bot's first fill on a bracket is
+    only $0.40-$1.50 (single-contract market depth at the maker bid).
+    Without the exemption, that tiny first fill locks the entire (city,
+    date) event slot, blocking better entries on different brackets in
+    the same event for the rest of the day.
+
+    Backtest n=8 unique event_cap blocks in 14d:
+      - 2 tiny-blocker cases (existing <$3): TDAL-MAY08-T61 today
+        (blocker $0.41), DAL-MAY05-B64.5 (blocker $1.16). Exemption
+        would allow these entries.
+      - 5 moderate-blocker cases (existing $4-$7): partial-fill scenarios
+        where bot got a moderate position. Exemption at $3 leaves these
+        untouched.
+      - 1 full-blocker case (existing $29.58): correlated-bet protection
+        as intended. Exemption preserves this.
+
+    Threshold $3 matches V1's NO_CASCADE under-fill exemption (>$5 +
+    50% under-filled), kept tighter for min_bot's smaller bet sizes.
+    """
     if not event_ticker:
         return 0
     with _positions_lock:
-        return sum(
-            1 for tk, pos in _open_positions.items()
-            if not pos.get("settled") and tk.rsplit("-", 1)[0] == event_ticker
-        )
+        n = 0
+        for tk, pos in _open_positions.items():
+            if pos.get("settled"):
+                continue
+            if tk.rsplit("-", 1)[0] != event_ticker:
+                continue
+            cost = pos.get("actual_cost")
+            if cost is None:
+                cost = pos.get("cost", 0)
+            try:
+                cost_f = float(cost)
+            except (TypeError, ValueError):
+                cost_f = 0.0
+            if cost_f < EVENT_CAP_UNDERFILL_THRESHOLD_USD:
+                continue
+            n += 1
+        return n
 
 
 def _budget_can_take(cost_usd: float, event_ticker: str = "",
