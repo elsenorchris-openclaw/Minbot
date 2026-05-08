@@ -144,5 +144,101 @@ class RegressionForHOUBug(unittest.TestCase):
         self.assertLess(today_ts, end_ts)
 
 
+class MetarRminQueryRegression(unittest.TestCase):
+    """End-to-end regression: `_get_metar_running_min` must NEVER return a
+    value derived from observations timestamped outside the LST climate-day
+    window. Catches reintroductions of the ±12h-pad bug (or any future widen).
+
+    Setup: writes a temp obs.sqlite with two awc rows for KHOU 2026-05-08:
+      - LEAK row at 5/7 09:53 CDT (= 5/7 14:53 UTC) with temp_f=55.0  ← BEFORE LST window start
+      - REAL row at 5/8 06:30 UTC                       with temp_f=73.0  ← INSIDE window
+
+    Pre-fix behavior (48h window): MIN would return 55.0 (the leak).
+    Post-fix behavior (24h LST window): MIN returns 73.0.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import sqlite3
+        from datetime import datetime, timezone
+        cls._tmp_db = Path(_TMPDIR) / "obs_regression.sqlite"
+        if cls._tmp_db.exists():
+            cls._tmp_db.unlink()
+        conn = sqlite3.connect(str(cls._tmp_db))
+        conn.execute("""
+            CREATE TABLE observations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                station TEXT NOT NULL,
+                obs_time INTEGER NOT NULL,
+                received_time INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                temp_f REAL,
+                temp_c_raw REAL,
+                raw_message TEXT
+            )
+        """)
+        # The exact leak timestamp from the original bug report
+        leak_ts = int(datetime(2026, 5, 7, 14, 53, tzinfo=timezone.utc).timestamp())
+        # An in-window observation
+        real_ts = int(datetime(2026, 5, 8, 6, 30, tzinfo=timezone.utc).timestamp())
+        # A NEXT-day leak (post-window) — also must be excluded
+        next_day_ts = int(datetime(2026, 5, 9, 12, 0, tzinfo=timezone.utc).timestamp())
+        conn.executemany(
+            "INSERT INTO observations(station, obs_time, received_time, source, temp_f) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                ("KHOU", leak_ts,     leak_ts,     "awc", 55.0),  # leak (prior day morning)
+                ("KHOU", real_ts,     real_ts,     "awc", 73.0),  # real in-window
+                ("KHOU", next_day_ts, next_day_ts, "awc", 50.0),  # post-window leak
+                # A different station shouldn't influence the query
+                ("KDFW", real_ts,     real_ts,     "awc", 40.0),
+                # An in-window non-METAR source must be excluded too (only awc/ldm)
+                ("KHOU", real_ts + 60, real_ts + 60, "madis_fsl2", 40.0),
+            ],
+        )
+        conn.commit()
+        conn.close()
+
+        cls._orig_db_path = pb.OBS_DB_PATH
+        pb.OBS_DB_PATH = str(cls._tmp_db)
+
+    @classmethod
+    def tearDownClass(cls):
+        pb.OBS_DB_PATH = cls._orig_db_path
+
+    def test_returns_in_window_value_not_leak(self):
+        rm = pb._get_metar_running_min("KHOU", "2026-05-08")
+        self.assertIsNotNone(rm, "function must return a value when in-window data exists")
+        self.assertEqual(rm, 73.0,
+            "must return the in-window 73.0F, not the 55.0F prior-day leak "
+            "or the 50.0F next-day leak")
+        # Stronger: must NEVER equal the leak value
+        self.assertNotEqual(rm, 55.0,
+            "REGRESSION: prior-day leak temp returned — LST window is too wide")
+        self.assertNotEqual(rm, 50.0,
+            "REGRESSION: next-day leak temp returned — LST window extends too far")
+
+    def test_madis_source_excluded(self):
+        """The madis_fsl2 row at 40.0 is INSIDE the LST window but is not
+        an awc/ldm source — must NOT be returned as the min."""
+        rm = pb._get_metar_running_min("KHOU", "2026-05-08")
+        self.assertNotEqual(rm, 40.0,
+            "non-METAR source (madis_fsl2) must be excluded — only awc/ldm count")
+
+    def test_returns_none_when_no_in_window_obs(self):
+        """A different climate_date with no in-window obs must return None,
+        NOT silently fall through to the leak data from neighboring days."""
+        rm = pb._get_metar_running_min("KHOU", "2026-05-10")  # no obs for this date
+        self.assertIsNone(rm,
+            "function must return None when no awc/ldm obs exist in the "
+            "target LST window — must NOT pull from prior/next day")
+
+    def test_other_station_isolated(self):
+        """Querying KHOU must not be polluted by KDFW data even if same ts."""
+        rm = pb._get_metar_running_min("KHOU", "2026-05-08")
+        self.assertNotEqual(rm, 40.0,
+            "KDFW's 40.0F must not leak into KHOU's query")
+
+
 if __name__ == "__main__":
     unittest.main()
