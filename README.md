@@ -3,7 +3,25 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
-## Latest change (2026-05-08 late afternoon) — `KLAX_BUY_NO_HIGH_SIGMA` gate (live block + Discord notify)
+## Latest change (2026-05-09) — Vegas series-name typo fix (`KXLOWTLAS` → `KXLOWTLV`)
+
+**Trigger:** thorough audit of "do all forecast fetchers use the exact Kalshi settlement station for every city" found min_bot had `KXLOWTLAS` (a non-existent series) hardcoded in 4 places where the real Kalshi ticker is `KXLOWTLV` (Vegas low-temp). Same bug class as the 2026-05-08 `KXLOWTDAL→KDAL` fix.
+
+**Locations fixed:**
+1. `paper_min_bot.py:413` in `_SERIES_TO_ICAO`
+2. `paper_min_bot.py:600` in `PER_SERIES_D0_PRIMARY`
+3. `tools/auto_select_per_series_primary.py:37` in `HARDCODED_D0_PRIMARY`
+4. `tools/auto_select_per_series_primary.py:65` in `SERIES_TO_ICAO`
+
+**Impact:** because the typo broke the ICAO lookup AND the d-0 hardcoded fallback, Vegas silently fell through `get_d0_primary` to the universal default `'hrrr'`. Live confirmation pre-fix on 2026-05-09 08:12 UTC: KXLOWTLV-26MAY09-B66.5 candidate had `mu_source='hrrr'` (mu=72.4) instead of the auto-selected `'nbp'` (mu=72.0). NBP is calibrated to be 0.18°F MAE better at d-0 (1.50°F vs 1.68°F, n=10) and 2.01°F MAE better at d-1 (1.50°F vs 3.51°F, n=10) — the bot was eating that whole gap on every Vegas decision.
+
+**Fix verification:** post-restart at 08:12:40 UTC, next KXLOWTLV-26MAY09-T64 candidate had `mu_source='nbp_d0_override'` (mu=72.0). `get_d0_primary("KXLOWTLV")` returns `'nbp'`, `_SERIES_TO_ICAO["KXLOWTLV"]` returns `'KLAS'`.
+
+**Regression test:** `tests/test_canonical_series_names.py` (10 tests) — verifies every per-series dict in the bot and the auto-select tool has only canonical KXLOWT* names with no typos, and that Vegas resolves end-to-end through the auto-primary chain. Future audits run on every PR.
+
+**Audit also confirmed (no fix needed):** V1 + V2 high-temp bots, all 20 cities, every forecast fetcher (NWS, NBM, HRRR, MOS, NAM-MOS, WETHR, NBP, ECMWF, GFS), every primary-source override dict (`V1_PRIMARY_SRC_BY_SERIES`, `V2_PRIMARY_SRC_BY_SERIES`, manual overrides). Lat/lon distance from CITIES coords to ICAO airport coords ≤2 mi for all 60 (city, bot) cells (max 1.87 mi for Miami, all within HRRR/NBM 3 km grid resolution).
+
+## Previous change (2026-05-08 late afternoon) — `KLAX_BUY_NO_HIGH_SIGMA` gate (live block + Discord notify)
 
 **Trigger:** KLAX is the single worst station in the 14d extended pool: 1W:3L, **−$53.70**. All 4 trades are BUY_NO B-bracket on `nbp`, three losers had σ ≥ 2.5°F (5/1 −$29 σ=3.0, 5/2 −$24 σ=2.5, 5/3 −$17 σ=5.0); the only winner had σ=1.67 (4/30 +$16). The pattern survives the existing `PER_SERIES_SIGMA_MULT=2.5` (which inflates Kelly-shrink but doesn't gate entries).
 

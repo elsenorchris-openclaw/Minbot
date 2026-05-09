@@ -410,7 +410,7 @@ _SERIES_TO_ICAO: dict[str, str] = {
     "KXLOWTLAX": "KLAX", "KXLOWTMIA": "KMIA", "KXLOWTHOU": "KHOU",
     "KXLOWTPHX": "KPHX", "KXLOWTPHIL": "KPHL", "KXLOWTOKC": "KOKC",
     "KXLOWTBOS": "KBOS", "KXLOWTCHI": "KMDW", "KXLOWTMIN": "KMSP",
-    "KXLOWTDEN": "KDEN", "KXLOWTLAS": "KLAS", "KXLOWTATL": "KATL",
+    "KXLOWTDEN": "KDEN", "KXLOWTLV":  "KLAS", "KXLOWTATL": "KATL",
     "KXLOWTDC": "KDCA", "KXLOWTDAL": "KDFW", "KXLOWTAUS": "KAUS",
     "KXLOWTSATX": "KSAT", "KXLOWTNOLA": "KMSY",
 }
@@ -597,7 +597,7 @@ PER_SERIES_D0_PRIMARY: dict[str, str] = {
     # 2026-04-29 cohort (still STILL nbp-better at d-0 per 14d audit):
     "KXLOWTBOS":  "nbp",  # NBP MAE=0.87 vs HRRR=1.86 (gap −0.99°F)
     # 2026-05-01 cohort (still NBP-better at d-0):
-    "KXLOWTLAS":  "nbp",  # NBP MAE=0.88 vs HRRR=1.46 (gap −0.58°F)
+    "KXLOWTLV":   "nbp",  # NBP MAE=0.88 vs HRRR=1.46 (gap −0.58°F) [Vegas]
     "KXLOWTLAX":  "nbp",  # NBP MAE=1.37 vs HRRR=1.90 (gap −0.53°F)
     "KXLOWTPHIL": "nbp",  # NBP MAE=0.97 vs HRRR=1.76 (gap −0.79°F)
     "KXLOWTSEA":  "nbp",  # NBP MAE=1.23 vs HRRR=1.57 (gap −0.34°F, marginal)

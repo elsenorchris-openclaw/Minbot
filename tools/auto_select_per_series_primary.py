@@ -34,7 +34,7 @@ SANITY_MAE_CEILING_F = 4.0              # if all sources MAE > this, don't switc
 # Hardcoded defaults (mirrors current paper_min_bot.py state — 2026-05-06)
 HARDCODED_D0_PRIMARY = {
     "KXLOWTBOS":  "nbp",
-    "KXLOWTLAS":  "nbp",
+    "KXLOWTLV":   "nbp",  # Vegas (real Kalshi series is KXLOWTLV, not KXLOWTLAS)
     "KXLOWTLAX":  "nbp",
     "KXLOWTPHIL": "nbp",
     "KXLOWTSEA":  "nbp",
@@ -62,7 +62,7 @@ SERIES_TO_ICAO = {
     "KXLOWTLAX": "KLAX", "KXLOWTMIA": "KMIA", "KXLOWTHOU": "KHOU",
     "KXLOWTPHX": "KPHX", "KXLOWTPHIL": "KPHL", "KXLOWTOKC": "KOKC",
     "KXLOWTBOS": "KBOS", "KXLOWTCHI": "KMDW", "KXLOWTMIN": "KMSP",
-    "KXLOWTDEN": "KDEN", "KXLOWTLAS": "KLAS", "KXLOWTATL": "KATL",
+    "KXLOWTDEN": "KDEN", "KXLOWTLV":  "KLAS", "KXLOWTATL": "KATL",
     "KXLOWTDC": "KDCA", "KXLOWTDAL": "KDFW", "KXLOWTAUS": "KAUS",
     "KXLOWTSATX": "KSAT", "KXLOWTNOLA": "KMSY",
 }
