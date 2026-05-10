@@ -25,15 +25,15 @@ class TestDirectionalBuyNoMaxMpRaised(unittest.TestCase):
     def test_constant_value_025(self):
         s = src()
         m = re.search(
-            r"^DIRECTIONAL_BUY_NO_MAX_MP\s*=\s*0\.25\b",
+            r"^DIRECTIONAL_BUY_NO_MAX_MP\s*=\s*0\.30\b",
             s, re.MULTILINE)
         self.assertIsNotNone(m,
-            "DIRECTIONAL_BUY_NO_MAX_MP must be 0.25 (was 0.20).")
+            "DIRECTIONAL_BUY_NO_MAX_MP must be 0.30 (was 0.25).")
 
     def test_constant_history_documented(self):
         s = src()
         # Comment must mention the deploy chain (history is helpful for future audits)
-        self.assertIn("0.40 (2026-04-27) → 0.20 (2026-04-29 night) → 0.25 (2026-05-07)", s,
+        self.assertIn("0.25 (2026-05-07) → 0.30 (2026-05-10)", s,
             "Constant history chain must be documented in the comment.")
 
     def test_filter_logic_present(self):
@@ -46,27 +46,27 @@ class TestDirectionalBuyNoMaxMpRaised(unittest.TestCase):
 
 
 class TestBucketBoundaryBehavior(unittest.TestCase):
-    """Functional: import the module and verify the threshold actually accepts
-    mp 0.22 (was blocked) and still blocks mp 0.27 (always blocked)."""
+    """Functional: threshold raised to 0.30 on 2026-05-10. Accepts mp 0.28
+    (was blocked at 0.25) and still blocks mp 0.32 (above new threshold)."""
 
     def test_module_imports_without_error(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
         if "paper_min_bot" in sys.modules:
             del sys.modules["paper_min_bot"]
         import paper_min_bot as m
-        self.assertEqual(m.DIRECTIONAL_BUY_NO_MAX_MP, 0.25)
+        self.assertEqual(m.DIRECTIONAL_BUY_NO_MAX_MP, 0.30)
 
-    def test_threshold_accepts_022_blocks_027(self):
+    def test_threshold_accepts_028_blocks_032(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
         if "paper_min_bot" in sys.modules:
             del sys.modules["paper_min_bot"]
         import paper_min_bot as m
-        # mp 0.22 must NOT be blocked by directional gate (was blocked at 0.20)
-        self.assertFalse(0.22 > m.DIRECTIONAL_BUY_NO_MAX_MP)
-        # mp 0.27 must STILL be blocked (above threshold)
-        self.assertTrue(0.27 > m.DIRECTIONAL_BUY_NO_MAX_MP)
-        # mp 0.20 must NOT be blocked (boundary case still safe)
-        self.assertFalse(0.20 > m.DIRECTIONAL_BUY_NO_MAX_MP)
+        # mp 0.28 must NOT be blocked by directional gate (was blocked at 0.25)
+        self.assertFalse(0.28 > m.DIRECTIONAL_BUY_NO_MAX_MP)
+        # mp 0.32 must STILL be blocked (above threshold)
+        self.assertTrue(0.32 > m.DIRECTIONAL_BUY_NO_MAX_MP)
+        # mp 0.25 must NOT be blocked (boundary case still safe)
+        self.assertFalse(0.25 > m.DIRECTIONAL_BUY_NO_MAX_MP)
 
 
 if __name__ == "__main__":
