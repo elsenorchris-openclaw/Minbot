@@ -678,6 +678,18 @@ SIGMA_REF_F = 2.5                   # reference σ for full-Kelly sizing
 # Count how many of {NBP, HRRR, NBM} forecasts predict YES wins. Block if
 # consensus is too strong against us. Per-city tiers: WORST cities require
 # unanimity (no source predicting YES). Bypassed when _obs_confirmed_alive.
+# 2026-05-10: DISABLED. 14d audit (n=9 settled): 4 helps : 5 hurts (44%
+# accuracy, below random). Net +$26 raw / +$9 adj — in noise band. All
+# fires concentrated in WORST tier; default tier (max_consensus=2) never
+# fired in 14 days. Per-city detail: NYC 2:0 (+$59), PHIL 1:0 (+$30),
+# DEN 1:1 (+$17) carried by NYC; NOLA 0:3 (-$46) and SEA 0:1 (-$33)
+# completely dragged the filter. Top would-win blocked: NOLA-MAY07-B73.5
+# mp=10% edge=29% ($19 missed), SEA-MAY09-B49.5 mp=14% edge=39% ($33
+# missed). These are exactly the high-conviction BUY_NO setups MSG was
+# supposed to validate; cross-source consensus was anti-predictive on
+# them. Predicate preserved for fresh re-enable. Re-evaluate ~2026-05-31
+# at n>=20 firings.
+MSG_ENABLED = False
 MSG_MAX_CONSENSUS_DEFAULT = 2       # block if > this many sources predict YES
 MSG_MAX_CONSENSUS_WORST = 0         # WORST cities: any source predicting YES blocks
 MSG_WORST_CITIES = {                # cities with historical poor MIN calibration (mirror V2's WORST_7)
@@ -3279,7 +3291,12 @@ def _check_msg_gate(opp: dict) -> Optional[str]:
     on BUY_NO). Per-city tiers: WORST cities require unanimity; standard
     cities allow up to MSG_MAX_CONSENSUS_DEFAULT sources to predict YES.
     Outlier-margin sub-check: any source > MSG_MARGIN_F into YES territory
-    triggers a separate block. Bypassed by caller when _obs_confirmed_alive."""
+    triggers a separate block. Bypassed by caller when _obs_confirmed_alive.
+
+    2026-05-10: gated by MSG_ENABLED. Disabled per audit (44% block
+    accuracy, n=9 settled). Predicate preserved for fresh re-enable."""
+    if not MSG_ENABLED:
+        return None
     if opp.get("action") != "BUY_NO":
         return None
     sources = []
