@@ -260,7 +260,7 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 45.00                 # $45 cap per entry (raised 30->45 on 2026-05-10 per Chris). $1 (live launch) → $3 (2026-04-26)
+MAX_BET_USD = 60.00                 # 2026-05-10 PM: $45 -> $60 (per Chris). History: $1 (live launch) → $3 (2026-04-26)
                                     # → ... → $30 (2026-04-29 evening). Default cap.
 
 # 2026-05-01: BUY_YES entries get a tighter $5 cap (was tail-only originally).
@@ -276,7 +276,7 @@ MAX_BET_USD = 45.00                 # $45 cap per entry (raised 30->45 on 2026-0
 # the cap matters going forward. BUY_YES asymmetry holds across all
 # bracket types: small wins (price ≤ 50c → max payout 50c per dollar),
 # full-cost losses on forecast misses.
-MAX_BET_BUY_YES_USD = 5.00
+MAX_BET_BUY_YES_USD = 1.00       # 2026-05-10 PM: $5 -> $1 (per Chris). YES held to tiny exploratory bets.
 # 2026-05-07: V2-port adverse-addon gate. Block addons if entry_price has
 # risen >= 5pp since first fill (action-agnostic; entry_price = what we pay,
 # whether BUY_NO or BUY_YES). V2 backtest (commit 4ebfa2b, 2026-05-06):

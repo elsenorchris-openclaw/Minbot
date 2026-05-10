@@ -3,6 +3,23 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-10 PM — cap retune: BUY_NO $45 → $60, BUY_YES $5 → $1
+
+Per Chris. min_bot v1 cap pair brought into line with the new sizing thinking:
+lift the BUY_NO ceiling so full Kelly can run on high-edge B-bracket entries
+(at `BANKROLL_REF_USD=$500`, `KELLY_FRACTION=0.25`, a 40% edge wants $50 —
+$45 was clipping that), and tighten BUY_YES to exploratory-tiny $1 because of
+the asymmetric blast radius (full-cost loss on miss vs ≤0.50 max payout per
+dollar). Mirrors the min_bot v2 retune from earlier today.
+
+Constants:
+- `MAX_BET_USD = 60.00` (was 45.00, paper_min_bot.py L263)
+- `MAX_BET_BUY_YES_USD = 1.00` (was 5.00, paper_min_bot.py L279)
+
+Backup: `paper_min_bot.py.bak.pre_caps_*`.
+
+---
+
 ## Latest change (2026-05-09) — Vegas series-name typo fix (`KXLOWTLAS` → `KXLOWTLV`)
 
 **Trigger:** thorough audit of "do all forecast fetchers use the exact Kalshi settlement station for every city" found min_bot had `KXLOWTLAS` (a non-existent series) hardcoded in 4 places where the real Kalshi ticker is `KXLOWTLV` (Vegas low-temp). Same bug class as the 2026-05-08 `KXLOWTDAL→KDAL` fix.
@@ -299,7 +316,7 @@ Three companion changes addressing thin-orderbook fill problems and adding a fin
 
 **1. `LADDER_MAX_RETRIES`: 3 → 5.** PHX/AUS/SEA orderbooks were too thin for 3 walks to clear meaningful intended counts. Real audit on today's open positions: PHX-MAY04-B64.5 filled 1/34 (3%), SEA-MAY04-B53.5 filled 10/62 (16%), AUS-MAY04-B55.5 filled 1/9 (11%). Five walks gives the bot more headroom before edge drops below `MIN_EDGE` and ladder gives up.
 
-**2. Ladder extended from BUY_NO-only to BUY_YES.** AUS-MAY04 BUY_YES showed the same 89% orphan rate as BUY_NO cases, but the 2026-05-03 ladder deploy was BUY_NO-only. Now action-aware: BUY_NO chases `no_ask_dollars` against `MAX_BET_USD` ($30) cap with edge `1 − mp_yes − price`; BUY_YES chases `yes_ask_dollars` against `MAX_BET_BUY_YES_USD` ($5) cap with edge `mp_yes − price`. Add-ons still iterate via the existing scan loop, unchanged.
+**2. Ladder extended from BUY_NO-only to BUY_YES.** AUS-MAY04 BUY_YES showed the same 89% orphan rate as BUY_NO cases, but the 2026-05-03 ladder deploy was BUY_NO-only. Now action-aware: BUY_NO chases `no_ask_dollars` against `MAX_BET_USD` ($60) cap with edge `1 − mp_yes − price`; BUY_YES chases `yes_ask_dollars` against `MAX_BET_BUY_YES_USD` ($1) cap with edge `mp_yes − price`. Add-ons still iterate via the existing scan loop, unchanged.
 
 **3. New `MARKET_STOP_BID_CEIL_C = 1`.** Hard-stop is sentinel-disabled; this is the final safety net. When the position's bid (no_bid for BUY_NO, yes_bid for BUY_YES) is ≤ 1¢, market consensus is ~99% the other side wins — the position is essentially worthless. Exits with `reason="market_stop"`. The obs-winner override still fires FIRST and blocks this exit on positions where rm confirms a recovery path (e.g., BUY_NO with rm < floor − 1°F), so genuine recovery cases ride to settlement.
 
