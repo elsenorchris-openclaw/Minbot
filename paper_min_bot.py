@@ -259,7 +259,7 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 30.00                 # $30 cap per entry. $1 (live launch) → $3 (2026-04-26)
+MAX_BET_USD = 45.00                 # $45 cap per entry (raised 30->45 on 2026-05-10 per Chris). $1 (live launch) → $3 (2026-04-26)
                                     # → ... → $30 (2026-04-29 evening). Default cap.
 
 # 2026-05-01: BUY_YES entries get a tighter $5 cap (was tail-only originally).
