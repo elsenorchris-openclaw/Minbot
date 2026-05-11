@@ -140,9 +140,11 @@ def _directional_buy_yes_min_mp(t):
 
 
 def _h_2_disagree(t):
-    """H_2_DISAGREE — d-1+ BUY_NO with HRRR-vs-NBM disagreement >= 2.0°F
-    (paper_min_bot.py:536). Approximated using mu_hrrr_at_entry vs
-    mu_nbm_om_at_entry; only fires for d-1+ entries."""
+    """H_2_DISAGREE — d-1+ BUY_NO with HRRR-vs-NBM disagreement >= 4.5°F.
+    Threshold raised from 2.0 on 2026-05-10 per stack-aware audit + threshold
+    sweep (see H_2_0_DISAGREE_F constant comment in paper_min_bot.py).
+    Approximated using mu_hrrr_at_entry vs mu_nbm_om_at_entry; only fires
+    for d-1+ entries."""
     if t.get("action") != "BUY_NO":
         return False
     if t.get("is_today_at_entry"):
@@ -151,7 +153,7 @@ def _h_2_disagree(t):
     nbm = t.get("mu_nbm_om_at_entry")
     if h is None or nbm is None:
         return False
-    return abs(float(h) - float(nbm)) >= 2.0
+    return abs(float(h) - float(nbm)) >= 4.5
 
 
 def _obs_confirmed_loser(t):
@@ -204,7 +206,7 @@ SCENARIOS = {
     ),
     "h_2_disagree": (
         _h_2_disagree,
-        "H_2_DISAGREE: d-1+ BUY_NO HRRR-vs-NBM gap >= 2.0F — DEPLOYED",
+        "H_2_DISAGREE: d-1+ BUY_NO HRRR-vs-NBM gap >= 4.5F — DEPLOYED (raised 2026-05-10)",
     ),
     "obs_confirmed_loser": (
         _obs_confirmed_loser,

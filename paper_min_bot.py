@@ -805,10 +805,29 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 # ─── H_2.0 disagreement skip (V2-inspired, d-1+ BUY_NO only) ─────────────
 # V2's H_2.0 skips d-1 BUY_NO when NWS-HRRR diverge >2°F. min_bot has no NWS
 # integration; we use the existing `disagreement` field (max pairwise diff
-# among NBP/HRRR/NBM) as a proxy. Tighter than MAX_DISAGREEMENT_F=5.0 and
-# scoped to d-1+ where forecast uncertainty is the only error signal (d-0
-# has running_min). Bypassed when _obs_confirmed_alive.
-H_2_0_DISAGREE_F = 2.0              # d-1+ BUY_NO disagreement ceiling
+# among NBP/HRRR/NBM) as a proxy. Scoped to d-1+ where forecast uncertainty
+# is the only error signal (d-0 has running_min). Bypassed when
+# _obs_confirmed_alive.
+#
+# 2026-05-10: 2.0 → 4.5. Stack-aware audit (12d, n=109 historical blocks
+# → 81 resolved unique kills after netting overlap with MU_NEAR_BELOW_BRACKET
+# / BUY_NO_EXTREME_SIGMA / SPREAD / KLAX_HIGH_SIGMA) showed the gate at 2.0°F
+# was blocking 52W:29L (64% winners) with net +$0.43/c (≈ +$30 over 12d at
+# $45 bet) BUT LOO-1 robust was −$1.60/c — one bad week wiped the lift.
+# Threshold sweep stratified by disag bin:
+#   [2.0, 2.5):  6W:1L  +$1.52/c  ← clearly over-blocking
+#   [3.0, 3.5): 10W:3L  +$1.74/c  ← clearly over-blocking
+#   [3.5, 4.0):  4W:0L  +$1.60/c  ← clearly over-blocking
+#   [4.0, 5.0): 11W:7L  −$0.40/c  ← gate breaking even
+#   [5.0, 6.0):  7W:6L  −$1.48/c  ← gate working
+#   [6.0,  ∞):  10W:8L  −$1.90/c  ← gate working
+# T=4.5 passes all 5 playbook bars (n=39, net +$3.73/c ≈ +$280, robust
+# +$2.23/c ≈ +$167, helps:hurts 7:3, mechanism = "only block at very high
+# disagreement where models genuinely diverge"). 2-4°F is noise; only 5°F+
+# is signal. The asymmetric loss profile of d-1+ BUY_NO B-brackets (avg win
+# +$0.35, avg loss -$0.65) means even 57% wr at the high-disag tail is net
+# negative, so the gate still earns its keep there.
+H_2_0_DISAGREE_F = 4.5              # d-1+ BUY_NO disagreement ceiling
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -4960,9 +4979,9 @@ def execute_opportunity(opp: dict) -> bool:
         # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
         # have no obs to break ties between forecasts; pairwise disagreement
-        # > 2°F = forecast uncertainty too high for this BUY_NO. Tighter than
-        # MAX_DISAGREEMENT_F=5.0; only fires on day-1+ where there's no rm
-        # safety net.
+        # > H_2_0_DISAGREE_F (4.5°F, raised from 2.0 on 2026-05-10 per audit)
+        # = forecast uncertainty too high for this BUY_NO. Only fires on
+        # day-1+ where there's no rm safety net.
         if action == "BUY_NO" and not opp.get("is_today", False):
             disag = float(opp.get("disagreement", 0.0))
             if disag > H_2_0_DISAGREE_F:

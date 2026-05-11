@@ -2140,13 +2140,13 @@ class TestQuickWinGates(unittest.TestCase):
                          "yes_bid=33 in former PRICE_ZONE should pass post-removal")
 
     def test_h_2_0_blocks_d1_buy_no_when_disagree(self):
-        """D-1+ BUY_NO with disagreement 2.5°F > H_2_0_DISAGREE_F=2.0°F → block."""
-        pb.execute_opportunity(self._opp(is_today=False, disagreement=2.5))
+        """D-1+ BUY_NO with disagreement 5.0°F > H_2_0_DISAGREE_F=4.5°F → block."""
+        pb.execute_opportunity(self._opp(is_today=False, disagreement=5.0))
         self.assertEqual(self._captured, [])
 
     def test_h_2_0_does_not_block_d0(self):
         """D-0 (is_today=True) NOT subject to H_2.0 — running_min handles it."""
-        pb.execute_opportunity(self._opp(is_today=True, disagreement=2.5))
+        pb.execute_opportunity(self._opp(is_today=True, disagreement=5.0))
         # Should pass all forecast gates including H_2.0
         self.assertEqual(len(self._captured), 1)
 
@@ -2165,7 +2165,7 @@ class TestQuickWinGates(unittest.TestCase):
 
     def test_h_2_0_at_threshold_passes(self):
         """Disagreement = H_2_0_DISAGREE_F exactly — strict greater-than blocks."""
-        pb.execute_opportunity(self._opp(is_today=False, disagreement=2.0))
+        pb.execute_opportunity(self._opp(is_today=False, disagreement=4.5))
         self.assertEqual(len(self._captured), 1)
 
     def test_obs_alive_bypasses_h_2_0(self):
@@ -2754,7 +2754,7 @@ class TestEvaluateGates(unittest.TestCase):
         self.assertEqual(gate, "MSG")
 
     def test_h_2_0_d_minus_1_disagreement(self):
-        gate, _ = pb._evaluate_gates(self._opp(is_today=False, disagreement=2.5))
+        gate, _ = pb._evaluate_gates(self._opp(is_today=False, disagreement=5.0))
         self.assertEqual(gate, "H_2_0")
 
 
