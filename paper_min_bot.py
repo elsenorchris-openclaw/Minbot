@@ -738,8 +738,24 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 # overpays NO vs model → BUY_YES likely loses. min_bot LIVE pool
 # (n=24, 4/29-5/02): catches DC-T46 BUY_YES (-$24, biggest live loss),
 # 1:0 helps:hurts. Bypassed by caller when _obs_confirmed_alive.
+#
+# 2026-05-11: GAP_MIN tightened 0.25 → 0.20 after KSEA-26MAY11-B50.5 loss
+# (-$50.89 paper). Entry-cycle mp=0.267 yes_bid=47 → gap=0.203, just below
+# 0.25 → gate didn't fire. 13-day audit (4/29-5/11, n_resolved=8 settled +
+# 9 unresolved-today firings) at GAP_MIN=0.20 MP_FLOOR=0.22:
+#   resolved W:L = 2:6, helps:hurts 6:2 (3:1), gate_lift +$13.17,
+#   LOO-1 robust (drop largest |-16.20| LAX-MAY08 chunk) → +$29.37.
+# Unresolved-today firings (will settle 5/11-5/12): KSEA × 6 (market
+# 97% YES → likely 6L caught, ~+$51), MIN × 1 (market 1% YES → likely 1W
+# blocked, ~-$5), SFO-26MAY12 × 2 (coinflip). Projected post-settle
+# helps:hurts ≈ 12:3, gate_lift ≈ +$59. n_resolved=8 below standard
+# n≥20 playbook bar but mechanism is unchanged (same gate, tighter
+# threshold) and LOO-1 robust positive. MP_FLOOR untouched (0.22):
+# audit showed MP_FLOOR=0.10 catches KDC-class but kills 88 winners vs
+# 29 losers (gate_lift -$164) — confident-NO trades are usually right.
+# Audit script: /tmp/v1_mmd_tighten_audit.py.
 SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR = 0.22
-SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25
+SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.20
 
 # ─── SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror) ──────────
 # 2026-05-06 night port from V1 SKIP_MU_NEAR_BELOW_BRACKET (commit 39670d1)
