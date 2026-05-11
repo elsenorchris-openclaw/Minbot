@@ -28,17 +28,6 @@ def src():
 class TestLadderNoFillContinues(unittest.TestCase):
     """The ladder must walk to the next price level when a rung returns 0 fill."""
 
-    @unittest.skip(
-        "LIKELY REAL REGRESSION — DO NOT BLINDLY ENABLE. Option B "
-        "(commit 5013a93, 2026-05-04 16:02 UTC) replaced 'stopping'+break "
-        "with 'trying next rung'. Commit db6168c (PER_SERIES routing audit, "
-        "2026-05-04 16:05 UTC — three minutes later) reverted ladder log "
-        "back to 'stopping'+break in its diff, with no mention in the "
-        "commit message. Looks like a rebase/merge mishap that silently "
-        "undid Option B. The bot has been running with the OLD (broken) "
-        "behavior since 2026-05-04. Recommend: cherry-pick the Option B "
-        "diff back in, re-enable this test, ship as a proper commit."
-    )
     def test_no_fill_branch_does_not_break(self):
         """Find the ladder's `if _r_filled > 0: ... else: ...` block and
         verify the else branch does NOT contain `break` (the bug we fixed)."""

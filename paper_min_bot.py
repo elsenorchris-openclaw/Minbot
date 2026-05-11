@@ -5156,8 +5156,23 @@ def execute_opportunity(opp: dict) -> bool:
                 except Exception as _cx:
                     log(f"  ladder cancel failed for {_retry_id} on {ticker}: "
                         f"{type(_cx).__name__}: {_cx}", "warn")
-                log(f"  ladder no-fill on {ticker} @ {_new_ask_c}c — stopping")
-                break
+                # 2026-05-04 OPTION B (originally commit 5013a93, silently
+                # reverted by db6168c PER_SERIES routing-audit commit 3 min
+                # later — rebase/merge mishap; re-applied 2026-05-10):
+                # don't stop on first 0-fill price level. Kalshi can have 0
+                # contracts at one cent and >0 at the next. Canonical case:
+                # PHX-26MAY04-B64.5 filled 1 at 50c on 5/3 20:39, ladder
+                # fetched ask=51c, got 0 fill, broke, left 33 contracts
+                # orphaned and the position stuck at 1/34 for 10+ hours while
+                # the market re-priced toward NO=94c (rendering all subsequent
+                # addons unprofitable). Removing this break lets the ladder
+                # walk the ask up to LADDER_MAX_RETRIES cents above initial
+                # fill, with the existing edge-floor + MAX_BET-cap +
+                # remainder-zero terminators still bounding the loop. Risk is
+                # bounded: max walk is LADDER_MAX_RETRIES (now 5) cents above
+                # the initial fill price, so worst-case extra cost per
+                # contract is ~5c at the same edge requirement.
+                log(f"  ladder no-fill on {ticker} @ {_new_ask_c}c — trying next rung")
             last_ask_c = _new_ask_c
         # Update fill totals after ladder. _budget_record below uses these,
         # and trade_record records weighted-avg price (matches addon convention).
