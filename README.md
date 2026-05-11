@@ -3,6 +3,46 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-11 eve — REVERT both `DIRECTIONAL_BUY_NO_MAX_MP` 0.30 → 0.25 AND `MMD GAP_MIN` 0.20 → 0.25
+
+**Trigger:** KXLOWTSEA-26MAY11-B50.5 BUY_NO (-$49.91 MTM) entered at mp=0.267,
+disag=3.4°F. Yesterday evening's same-session `H_2_0 2.0→4.5` (commit `78f66a4`) +
+`DIRECTIONAL_BUY_NO_MAX_MP 0.25→0.30` (commit `6da9eba`) simultaneously removed
+both protective layers on the BUY_NO `mp 0.25-0.30 + disag 2-4.5°F` band. SEA
+slipped through both gates. Today's earlier MMD tighten (commit `847d18e`,
+GAP 0.25→0.20) was a same-day reactive fix to the SEA bleeding.
+
+**Comparison on n=4 currently-at-risk entries** (mp 0.22-0.30 BUY_NO, all open):
+
+| Candidate | n_inc | helps:hurts | lift |
+|-----------|-------|-------------|------|
+| MMD GAP 0.25→0.20 (today shipped) | 4 | 3:1 | +$47.72 |
+| **DIRECTIONAL 0.30→0.25 revert** | **3** | **3:0** | **+$52.76** |
+
+DIRECTIONAL revert is strictly better: same 3 losers caught (SEA, SFO-12,
+MIA-12), MIN-B37.5 winner (mp=0.227, +$5.04) preserved. MMD-tighten kills
+the MIN winner because gap=0.203 just barely clears the new 0.20 threshold
+even though the model isn't directionally inconsistent.
+
+**Reverted both as a bundled change** — restore the chain to its pre-2026-05-10
+state on this dimension. The DIRECTIONAL 0.30 raise shipped without a stack-aware
+audit that included MMD; V2 audit of the same change had REJECTED it as 95%
+redundant with NO_THIGH/F2A/H_2_0. The MMD tighten was sub-bar (n_resolved=8 <
+playbook 20) and the SEA case it targeted is now caught by DIRECTIONAL anyway.
+
+**Constants:**
+- `DIRECTIONAL_BUY_NO_MAX_MP = 0.25` (was 0.30, paper_min_bot.py L174)
+- `SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25` (was 0.20, paper_min_bot.py L755)
+
+Tests:
+- `tests/test_buy_no_mp_025_20260507.py` — boundary cases re-pinned to 0.25
+- `tests/test_model_market_disagree.py` — GAP_MIN string-match + small-gap
+  boundary test reverted; removed today's `test_blocks_at_new_0_20_boundary`
+
+676 tests pass, 46 skipped, 0 failed.
+
+---
+
 ## 2026-05-10 PM — cap retune: BUY_NO $45 → $60, BUY_YES $5 → $1
 
 Per Chris. min_bot v1 cap pair brought into line with the new sizing thinking:

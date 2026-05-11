@@ -57,7 +57,7 @@ class TestSourceWiringMMD(unittest.TestCase):
     def test_constants_defined(self):
         s = _src()
         self.assertIn("SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR = 0.22", s)
-        self.assertIn("SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.20", s)
+        self.assertIn("SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25", s)
 
     def test_helper_defined(self):
         self.assertTrue(hasattr(pb, "_check_model_market_disagree"))
@@ -96,15 +96,9 @@ class TestMMDHelperBuyNo(unittest.TestCase):
         self.assertIsNone(pb._check_model_market_disagree(opp))
 
     def test_passes_small_gap(self):
-        # mp=0.30, yes_bid=49c → gap=0.19 < 0.20 (was 0.25 pre-2026-05-11)
-        opp = dict(action="BUY_NO", model_prob=0.30, yes_bid=49, no_bid=51)
+        # mp=0.30, yes_bid=50c → gap=0.20 < 0.25
+        opp = dict(action="BUY_NO", model_prob=0.30, yes_bid=50, no_bid=50)
         self.assertIsNone(pb._check_model_market_disagree(opp))
-
-    def test_blocks_at_new_0_20_boundary(self):
-        # 2026-05-11: GAP_MIN tightened 0.25 → 0.20. KSEA-26MAY11-B50.5
-        # entry pattern (mp=0.267, yes_bid=47, gap=0.203) must now block.
-        opp = dict(action="BUY_NO", model_prob=0.267, yes_bid=47, no_bid=53)
-        self.assertIsNotNone(pb._check_model_market_disagree(opp))
 
     def test_boundary_exact_thresholds_blocks(self):
         # mp=0.22 EXACTLY, yes_bid 48c gives gap 0.26 (≥ 0.25 with margin

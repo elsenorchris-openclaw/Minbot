@@ -171,18 +171,23 @@ MAX_MODEL_PROB_MINUS_MARKET_FLOOR = 0.30  # sanity check on edge magnitude
 # would need its own backtest. Bot's mp_range_bypass (NBP-CLI consistency)
 # does NOT bypass directional consistency — directional and mp_range are
 # independent gates.
-DIRECTIONAL_BUY_NO_MAX_MP = 0.30    # 2026-05-10: 0.25 → 0.30 (Chris approved).
-                                     # 7d sweep n=70 settled DIRECTIONAL_NO_DISAGREE
-                                     # blocks. At 0.30: 16:10 helps:hurts (62%),
-                                     # +$273 raw / +$90 adj lift (×0.33 fill realism).
-                                     # Marginal steps 0.25→0.30 each show 3:1 to 3:2
-                                     # helps:hurts; 0.31-0.33 marginal 0:2, 0:1, 1:2
-                                     # (gate value returns). 0.30 = inflection point.
-                                     # Re-evaluate ~2026-05-24 with fresh data; if
-                                     # 0.34-0.35 zone still shows positive marginal
-                                     # ratio with n>=8, consider second step.
+DIRECTIONAL_BUY_NO_MAX_MP = 0.25    # 2026-05-11 eve: 0.30 → 0.25 REVERT.
+                                     # Stack-interaction failure surfaced today:
+                                     # same-session H_2_0 2.0→4.5 + DIRECTIONAL
+                                     # 0.25→0.30 removed both layers protecting the
+                                     # BUY_NO mp 0.25-0.30 + disag 2-4.5°F band.
+                                     # KSEA-26MAY11-B50.5 (-$50 MTM) and 2 others
+                                     # entered through the gap. Compared MMD GAP
+                                     # tighten 0.25→0.20 (commit 847d18e earlier
+                                     # today) vs revert here on n=4 today: revert
+                                     # strictly better (h:h 3:0 vs 3:1, lift +$52.76
+                                     # vs +$47.72 — MMD-tighten kills MIN-B37.5
+                                     # winner mp=0.227 that this revert preserves).
+                                     # MMD was reverted same commit. V2 audit of the
+                                     # 0.25→0.30 change had REJECTED it.
                                      # was 0.40 (2026-04-27) → 0.20 (2026-04-29 night)
                                      # → 0.25 (2026-05-07) → 0.30 (2026-05-10)
+                                     # → 0.25 (2026-05-11 eve REVERT)
 DIRECTIONAL_BUY_YES_MIN_MP = 0.65   # 2026-05-04 night: was 0.60. BUY_YES T-floor mp 60-65% bucket bled -$34.28 over 7 trades (2W:5L) Apr 25-May 4 — model systematically overconfident at the 0.60-0.65 calibration boundary. 4 of 6 most-recent BUY_YES losses (DC-T46 -$24, OKC-T47 -$4.68, ATL-T53 -$4.56, OKC-T51 -$4.68) were in this bucket. Tightening blocks 7 of 21 T-floor BUY_YES historical trades, sacrificing 1 small winner (ATL-T60 +$0.64) to prevent 6 losses. Net lift +$34.28/10d on small sample. 6:1 helps:hurts. Re-evaluate ~2026-05-18 with fresh data.
 
 # 2026-05-08: BUY_NO_EXTREME_SIGMA gate. Block BUY_NO when bot's own
@@ -739,23 +744,15 @@ MSG_MARGIN_F = 3.0                  # outlier source > this many °F into YES te
 # (n=24, 4/29-5/02): catches DC-T46 BUY_YES (-$24, biggest live loss),
 # 1:0 helps:hurts. Bypassed by caller when _obs_confirmed_alive.
 #
-# 2026-05-11: GAP_MIN tightened 0.25 → 0.20 after KSEA-26MAY11-B50.5 loss
-# (-$50.89 paper). Entry-cycle mp=0.267 yes_bid=47 → gap=0.203, just below
-# 0.25 → gate didn't fire. 13-day audit (4/29-5/11, n_resolved=8 settled +
-# 9 unresolved-today firings) at GAP_MIN=0.20 MP_FLOOR=0.22:
-#   resolved W:L = 2:6, helps:hurts 6:2 (3:1), gate_lift +$13.17,
-#   LOO-1 robust (drop largest |-16.20| LAX-MAY08 chunk) → +$29.37.
-# Unresolved-today firings (will settle 5/11-5/12): KSEA × 6 (market
-# 97% YES → likely 6L caught, ~+$51), MIN × 1 (market 1% YES → likely 1W
-# blocked, ~-$5), SFO-26MAY12 × 2 (coinflip). Projected post-settle
-# helps:hurts ≈ 12:3, gate_lift ≈ +$59. n_resolved=8 below standard
-# n≥20 playbook bar but mechanism is unchanged (same gate, tighter
-# threshold) and LOO-1 robust positive. MP_FLOOR untouched (0.22):
-# audit showed MP_FLOOR=0.10 catches KDC-class but kills 88 winners vs
-# 29 losers (gate_lift -$164) — confident-NO trades are usually right.
-# Audit script: /tmp/v1_mmd_tighten_audit.py.
+# 2026-05-11 eve REVERT: GAP_MIN 0.20 → 0.25. Today's earlier tighten
+# (commit 847d18e) targeted the same SEA-class entry that DIRECTIONAL
+# 0.30→0.25 revert handles cleaner. Comparison on today's n=4 at-risk
+# entries: DIRECTIONAL revert h:h 3:0 lift +$52.76 vs MMD tighten h:h
+# 3:1 lift +$47.72 (MMD kills MIN-B37.5 winner mp=0.227 that DIRECTIONAL
+# skips). Both reverts together restore the pre-2026-05-10 chain on this
+# band.
 SKIP_MODEL_MARKET_DISAGREE_MP_FLOOR = 0.22
-SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.20
+SKIP_MODEL_MARKET_DISAGREE_GAP_MIN = 0.25
 
 # ─── SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror) ──────────
 # 2026-05-06 night port from V1 SKIP_MU_NEAR_BELOW_BRACKET (commit 39670d1)
