@@ -3649,8 +3649,6 @@ class TestNBPHeadPollTrigger(unittest.TestCase):
             pb.httpx.head = orig_head
 
 
-    @unittest.skip("Function refactored to _nbp_parallel_head (commit c1bda8f, NBP NCEP-primary fallback). Test mock targets the old pb.httpx.head call site that no longer exists.")
-
     def test_head_200_returns_true(self):
         now = dt.datetime.now(dt.timezone.utc)
         # Make next_cycle 80 min in the past (past the 70min wait).
@@ -3659,12 +3657,13 @@ class TestNBPHeadPollTrigger(unittest.TestCase):
 
         class FakeResp:
             status_code = 200
-        orig_head = pb.httpx.head
-        pb.httpx.head = lambda *a, **kw: FakeResp()
+            headers = {}
+        orig_head = pb._NBP_HTTP.head
+        pb._NBP_HTTP.head = lambda *a, **kw: FakeResp()
         try:
             self.assertTrue(pb._nbp_next_cycle_available())
         finally:
-            pb.httpx.head = orig_head
+            pb._NBP_HTTP.head = orig_head
 
     def test_head_404_returns_false(self):
         now = dt.datetime.now(dt.timezone.utc)
@@ -3673,26 +3672,27 @@ class TestNBPHeadPollTrigger(unittest.TestCase):
 
         class FakeResp:
             status_code = 404
-        orig_head = pb.httpx.head
-        pb.httpx.head = lambda *a, **kw: FakeResp()
+            headers = {}
+        orig_head = pb._NBP_HTTP.head
+        pb._NBP_HTTP.head = lambda *a, **kw: FakeResp()
         try:
             self.assertFalse(pb._nbp_next_cycle_available())
         finally:
-            pb.httpx.head = orig_head
+            pb._NBP_HTTP.head = orig_head
 
     def test_head_exception_returns_false(self):
         now = dt.datetime.now(dt.timezone.utc)
         pb._nbp_cache_cycle_dt = now - dt.timedelta(hours=6) - dt.timedelta(minutes=80)
         pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
 
-        orig_head = pb.httpx.head
+        orig_head = pb._NBP_HTTP.head
         def boom(*a, **kw):
             raise RuntimeError("network down")
-        pb.httpx.head = boom
+        pb._NBP_HTTP.head = boom
         try:
             self.assertFalse(pb._nbp_next_cycle_available())
         finally:
-            pb.httpx.head = orig_head
+            pb._NBP_HTTP.head = orig_head
 
     def test_future_cycle_returns_false(self):
         # Pointer was somehow set in the future (clock skew). Don't probe.
@@ -3701,41 +3701,49 @@ class TestNBPHeadPollTrigger(unittest.TestCase):
         pb._nbp_cache_ts = pb.time.time()
         # Even if HEAD would return 200, we shouldn't reach it.
         called = {"n": 0}
-        orig_head = pb.httpx.head
+        orig_head = pb._NBP_HTTP.head
         def watcher(*a, **kw):
             called["n"] += 1
-            class R: status_code = 200
+            class R:
+                status_code = 200
+                headers = {}
             return R()
-        pb.httpx.head = watcher
+        pb._NBP_HTTP.head = watcher
         try:
             self.assertFalse(pb._nbp_next_cycle_available())
             self.assertEqual(called["n"], 0)
         finally:
-            pb.httpx.head = orig_head
-
-
-    @unittest.skip("Same: function uses _nbp_parallel_head; test mock targets old call site.")
+            pb._NBP_HTTP.head = orig_head
 
     def test_head_url_matches_next_cycle(self):
         # Bot must probe blend.{YYYYMMDD}/{HH}/text/blend_nbptx.t{HH}z for
-        # last_cycle + 6h (not last_cycle itself).
+        # last_cycle + 6h (not last_cycle itself). _nbp_parallel_head HEADs
+        # NCEP and S3 URLs in parallel — both end with the same path, so
+        # capturing the first URL that fires is sufficient to verify the
+        # next-cycle path is correct.
         last = dt.datetime(2026, 4, 29, 19, tzinfo=dt.timezone.utc)
         pb._nbp_cache_cycle_dt = last
         pb._nbp_cache_ts = pb.time.time() - (6 * 3600 + 80 * 60)
 
-        captured = {}
-        orig_head = pb.httpx.head
+        captured = []
+        orig_head = pb._NBP_HTTP.head
         def grab(url, *a, **kw):
-            captured["url"] = url
-            class R: status_code = 200
+            captured.append(url)
+            class R:
+                status_code = 200
+                headers = {}
             return R()
-        pb.httpx.head = grab
+        pb._NBP_HTTP.head = grab
         try:
             pb._nbp_next_cycle_available()
         finally:
-            pb.httpx.head = orig_head
-        # next cycle is 2026-04-30 01z
-        self.assertIn("blend.20260430/01/text/blend_nbptx.t01z", captured["url"])
+            pb._NBP_HTTP.head = orig_head
+        # next cycle is 2026-04-30 01z. Both NCEP + S3 URLs encode it.
+        self.assertTrue(captured, "expected at least one HEAD call")
+        self.assertTrue(
+            any("blend.20260430/01/text/blend_nbptx.t01z" in u for u in captured),
+            f"no captured URL matched next-cycle path; got {captured}",
+        )
 
 
 class TestNBPCacheCycleDtPersistence(unittest.TestCase):
