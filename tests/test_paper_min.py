@@ -1597,6 +1597,11 @@ class TestF2AGate(unittest.TestCase):
         # mp=0.20, sigma=2.5, mu=40 → dist to floor=44 = 4°F. All pass.
         self.assertIsNone(pb._check_f2a_gate(self._opp()))
 
+    @unittest.skip("F2A rule A (mp<F2A_PROB_LO) disabled 2026-05-10: "
+                   "F2A_PROB_LO 0.05 → 0.0. Stack-aware audit found 15W:1L "
+                   "(94% wr, +$3.36/c) unique kills on this branch; V2 made "
+                   "the same call 11 days earlier (commit 84c7878). "
+                   "Re-enable if F2A_PROB_LO ever raised above 0.")
     def test_blocks_prob_too_low(self):
         r = pb._check_f2a_gate(self._opp(model_prob=0.04))
         self.assertIsNotNone(r)
@@ -2591,10 +2596,6 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
             "series": "KXLOWTATL", "is_today": False,
         }
 
-    @unittest.skip("2026-05-06: MIN_MODEL_PROB=0.05 == F2A_PROB_LO=0.05 — "
-                   "the MP_RANGE bypass can no longer salvage low-mp BUY_NO "
-                   "(F2A blocks at the same threshold). Re-enable after F2A "
-                   "audit if F2A_PROB_LO is lowered.")
     def test_low_mp_passes_when_nbp_consistent(self):
         """mp=3% < MIN_MODEL_PROB=5% but μ=62 fits recent [44, 66] →
         bypass mp-range → trade placed."""

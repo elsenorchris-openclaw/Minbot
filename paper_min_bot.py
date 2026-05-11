@@ -656,11 +656,29 @@ OBS_ALIVE_MIN_EDGE = 0.05           # bypass-mode edge floor (vs MIN_EDGE for no
 SIGNAL_KELLY_MULT = 1.5             # Kelly boost when obs confirms (matches V2's recent retune)
 
 # ─── F2A asymmetry gate (V2 port, BUY_NO only) ────────────────────────────
-# Four sub-checks on BUY_NO entries. Bypassed when _obs_confirmed_alive.
-# V2 backtest: tightening these bands swung era P&L +$30 → +$74.
-F2A_PROB_LO = 0.05                  # mp < this is a price-asymmetry trap (97c contracts, low WR)
-F2A_PROB_HI = 0.30                  # mp ≥ this is calibration cliff (model says YES too likely)
-F2A_SIGMA_MIN = 1.5                 # sigma < this is over-confident model (tight-σ zones lost in V2)
+# Three sub-checks on BUY_NO entries. Bypassed when _obs_confirmed_alive.
+# V2 backtest (original): tightening these bands swung era P&L +$30 → +$74.
+#
+# 2026-05-10: F2A_PROB_LO 0.05 → 0.0 (sub-rule A effectively off). Stack-aware
+# audit + sub-rule split on 12d showed sub-rule A blocked 16 unique trades
+# (other gates passed) with W:L = 15:1 (94% wr), net +$3.36/c (~+$168/12d
+# at $45 bet), LOO-1 robust +$2.22/c, helps:hurts 7:0 every day. n=16 is
+# below the playbook n≥20 bar, but binomial p<0.001 and there's a direct
+# V2 precedent: V2 max bot ran the IDENTICAL sub-rule audit on 2026-04-30
+# (commit 84c7878, 13d pool n=248, narrowed F2A to sigma-only), found
+# "prob (mp not in [0.05, 0.30)): 9 sole, 9W:0L, +$42.53 freed" and
+# removed all prob branches. V2 has been running narrowed F2A for 11+
+# days with no revert. Min_bot was carrying un-narrowed code by accident
+# of the port-back never happening. Mechanism: bot's mp<5% on BUY_NO is
+# the deep-conviction sweet spot (wide μ-vs-bracket gap on cold tails);
+# the "price-asymmetry trap" framing assumes mp is well-calibrated at
+# extremes — empirically it's conservative, so true WR >> mp. Sub-rule
+# B (mp≥0.30) is dead code on min_bot — DIRECTIONAL_BUY_NO at mp>0.30
+# fires first. Sub-rule C (σ<1.5°F) kept: only 6 unique kills, 4W:2L,
+# LOO-1 −$0.22, marginal — same call V2 made on the same evidence.
+F2A_PROB_LO = 0.0                   # rule A disabled 2026-05-10; mp<0 never true
+F2A_PROB_HI = 0.30                  # mp ≥ this is calibration cliff (dead code: DIRECTIONAL_BUY_NO catches mp>0.30 first)
+F2A_SIGMA_MIN = 1.5                 # sigma < this is over-confident model (kept; LOO-1 borderline, V2 also retained)
 
 # ─── σ-aware Kelly sizing (2026-04-30) ────────────────────────────────────
 # Quadratic shrink as σ grows above SIGMA_REF_F: at σ=2.5 (typical NBP), no
