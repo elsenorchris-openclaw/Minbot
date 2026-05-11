@@ -305,6 +305,18 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
                                     # 96% sub-$1 fills on 2026-04-25/26 (avg $0.45). Capped by
                                     # MAX_BET_USD downstream so the floor can't blow the ceiling.
 
+# 2026-05-10: DISABLED. 14d audit (n=16 settled): 5 helps / 11 hurts (31%
+# accuracy, well below random). Net -$93 raw / -$31 adj. Today (May 10)
+# stack-aware re-audit on n=10 fires showed 7 would actually buy if gate
+# off (other gates pass): 4 confirmed winners + 1 confirmed loser + 2 TBD
+# = 80% W:L. The 3 obvious losers (MIA-78.5, PHX-74.5, AUS-65.5) were
+# already caught by OBS_CONFIRMED_LOSER, BUY_NO_EXTREME_SIGMA, and
+# MU_NEAR_BELOW_BRACKET — ABS_DIST was redundant on those. Mechanism
+# was "μ near bracket center means low will land in bracket" but the
+# bot.s σ accounts for that and the bracket is only 1°F wide; reality
+# came in 1-3°F colder than μ on most blocked tickers. Predicate
+# preserved for fresh re-enable. Re-evaluate ~2026-05-31 at n>=20.
+ABS_DISTANCE_ENABLED = False
 MIN_ABS_DISTANCE_F = 0.5            # BUY_NO only: floor for |mu − bracket_mid|.
                                     # 1.0 → 1.5 (2026-04-27 AM) → reverted to 0.5 (2026-04-27 PM)
                                     # after Kalshi-truth audit on n=15: at 1.5°F we'd block 9
@@ -4522,7 +4534,7 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
             bracket_mid = float(cp)
         else:
             bracket_mid = None
-        if bracket_mid is not None:
+        if bracket_mid is not None and ABS_DISTANCE_ENABLED:
             mu_val = float(opp.get("mu", 0.0))
             sigma_v = float(opp.get("sigma") or 0)
             abs_dist = abs(mu_val - bracket_mid)
@@ -4887,7 +4899,7 @@ def execute_opportunity(opp: dict) -> bool:
                 bracket_mid = float(cp)
             else:
                 bracket_mid = None
-            if bracket_mid is not None:
+            if bracket_mid is not None and ABS_DISTANCE_ENABLED:
                 mu_val = float(opp.get("mu", 0.0))
                 sigma_v = float(opp.get("sigma") or 0)
                 abs_dist = abs(mu_val - bracket_mid)

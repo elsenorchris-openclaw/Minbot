@@ -897,6 +897,8 @@ class TestDirectionalConsistency(unittest.TestCase):
         self.assertEqual(self._order_calls, [])
 
 
+@unittest.skipUnless(getattr(pb, 'ABS_DISTANCE_ENABLED', True),
+                     'ABS_DISTANCE disabled per 2026-05-10 audit')
 class TestAbsDistanceGate(unittest.TestCase):
     """ABS DISTANCE GATE (BUY_NO only): skip when |mu − bracket_mid| < 1.5°F.
     Ported from V2 max-bot at 1.0°F; tightened to 1.5°F on 2026-04-27.
@@ -2723,6 +2725,7 @@ class TestEvaluateGates(unittest.TestCase):
                                                entry_price=0.25, yes_ask=25))
         self.assertEqual(gate, "DIRECTIONAL_BUY_YES")
 
+    @unittest.skip("ABS_DISTANCE disabled (2026-05-10 audit, 31% accuracy n=16).")
     def test_abs_dist(self):
         # BUY_NO with mu at bracket midpoint
         gate, _ = pb._evaluate_gates(self._opp(mu=45.5, floor=45.0, cap=46.0))
@@ -4833,6 +4836,8 @@ class TestHardStopSkipsBuyYesTHigh(unittest.TestCase):
         self.assertEqual(n, 0, "BUY_NO B-bracket must hold to settlement (hard-stop disabled)")
 
 
+@unittest.skipUnless(getattr(pb, 'ABS_DISTANCE_ENABLED', True),
+                     'ABS_DISTANCE disabled per 2026-05-10 audit')
 class TestAbsDistanceSigmaRelative(unittest.TestCase):
     """σ-relative tightening on MIN_ABS_DISTANCE_F (2026-04-30 PM): the
     BUY_NO B-bracket gate now uses `max(0.5°F, 0.25 × σ)`. Wider σ requires
