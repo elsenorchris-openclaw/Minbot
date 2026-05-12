@@ -3,6 +3,48 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-12 eve — `MAX_BET_USD` $80 → $60 REVERT
+
+Reverts commit `c5ee961` (2026-05-12 02:19 UTC, $60 → $80). Today's NYC,
+DC, and Austin BUY_NO entries combined for −$194.55 MTM; NYC alone was
+$74.57 cost because the new $80 cap allowed 3 ADDON orders (47x + 34x +
+41x at 61¢) to stack into a single max-Kelly position. Pre-bump $60 cap
+would have clipped at the second ADDON (≈$59.78 cost). The other two
+losses (DC, AUS) entered yesterday under the $60 cap and would have been
+unaffected.
+
+| Ticker | actual cost | cap @ entry | at $60 | at $45 (pre-relax) |
+|--------|-------------|-------------|--------|---------------------|
+| NYC-B46.5 BUY_NO | $74.57 | $80 | ≈$59.78 | ≈$44.83 |
+| DC-B45.5 BUY_NO | $60.35 | $60 | $60.35 | ≈$44.83 |
+| AUS-T59 BUY_NO | $59.63 | $60 | $59.63 | ≈$44.83 |
+
+Holding `MAX_BET_BUY_YES_USD` at $1 (unchanged). Sizing trajectory: $45
+(2026-05-05) → $60 (2026-05-10) → $80 (2026-05-12 02:19) → **$60
+(2026-05-12 eve)**. Re-bump deferred until cleaner win-rate signal lands.
+
+Two adjacent gate recommendations were **REJECTED** at the same audit:
+
+- **H_2_0 d-0 mirror** (apply 4.5°F disag gate to `is_today=True`): n=4 in
+  is_today BUY_NO pool, lift +$72 dominated by NYC ($74.57). LOO-1 robust
+  = −$2.57 once NYC is dropped; the other 3 kills are 2W:1L. NYC is
+  already caught by `COLD_SOURCE_OUTLIER` (same commit). Fails playbook
+  bars 1, 3, 4.
+- **BRACKET_OVERLAP** (block BUY_NO if any NWP source predicts μ inside
+  [floor−0.5, cap+0.5]): n=16 B-bracket pool, 14W:2L. Bot's
+  cold-source-pick + bracket-overlap entries are winning trades on
+  history; lift −$79.29, kills Chicago +$59 and Miami +$35 winners.
+  Narrow variants (is_today + rm=None, cold-pick + warmer-in-bracket) all
+  failed n≥20 or robust ≥+$15. `COLD_SOURCE_OUTLIER` at the targeted
+  gap<−4°F is the right narrow-cut of this pattern.
+
+Constants:
+- `MAX_BET_USD = 60.00` (was 80.00, paper_min_bot.py L269)
+
+689 tests pass, 46 skipped, 0 failed.
+
+---
+
 ## 2026-05-12 — `COLD_SOURCE_OUTLIER` gate (new, BUY_NO d-0 + d-1+)
 
 **Trigger:** KXLOWTNYC-26MAY12-B46.5 BUY_NO entered overnight at 05:03-05:05

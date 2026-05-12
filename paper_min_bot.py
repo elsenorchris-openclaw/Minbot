@@ -266,8 +266,11 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 80.00                 # 2026-05-11 eve: $60 -> $80 (per Chris). History: $1 (live launch) → $3 (2026-04-26)
-                                    # → ... → $30 (2026-04-29 evening) → $45 (2026-05-05) → $60 (2026-05-10) → $80 (2026-05-11). Default cap.
+MAX_BET_USD = 60.00                 # 2026-05-12: $80 → $60 REVERT. The 02:19 UTC bump to $80 (c5ee961) enabled
+                                    # NYC-26MAY12-B46.5 to stack 3 ADDON orders into a $74.57 BUY_NO that lost full $74.57
+                                    # (low landed AT 46, in-bracket). Pre-bump $60 cap would have clipped at ~$59.78.
+                                    # History: $1 (live launch) → $3 (2026-04-26)
+                                    # → ... → $30 (2026-04-29 evening) → $45 (2026-05-05) → $60 (2026-05-10) → $80 (2026-05-12) → $60 (2026-05-12 eve). Default cap.
 
 # 2026-05-01: BUY_YES entries get a tighter $5 cap (was tail-only originally).
 # Asymmetric blast-radius limit. Historical wins on these were ALL ≤ $4.90
