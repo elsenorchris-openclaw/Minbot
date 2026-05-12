@@ -36,6 +36,7 @@ import os
 import re
 import signal
 import sqlite3
+import statistics
 import sys
 import threading
 import time
@@ -859,6 +860,25 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 # +$0.35, avg loss -$0.65) means even 57% wr at the high-disag tail is net
 # negative, so the gate still earns its keep there.
 H_2_0_DISAGREE_F = 4.5              # d-1+ BUY_NO disagreement ceiling
+
+# 2026-05-12: COLD_SOURCE_OUTLIER — d-0 + d-1+ BUY_NO gate. Block when the
+# bot's picked mu source predicts COLDER than the median of {NBP, NBM-OM,
+# HRRR} by > COLD_SOURCE_OUTLIER_F. Closes the d-0 hole in H_2_0 (which is
+# d-1+ only) for the specific pattern that hurt KXLOWTNYC-26MAY12-B46.5
+# (-$72.74 MTM): bot picked HRRR=41.1, NBP=48, NBM-OM=47 → picked is 5.9°F
+# cold-outlier from median=47, mp=0.055 → max-Kelly position into a bracket
+# the warmer sources said was in-play. Mechanism: when bot picks the cold
+# model and others say warmer, the cold-side conviction rests on a single
+# dissenting source — don't trust it.
+# Backtest (V1 min lifecycle pool n=95 settled + 10 open MTM since 2026-04-28):
+# T=4°F: n=1 block (NYC today, +$72.74 lift, 1:0 helps:hurts). At T=3°F: n=4,
+# 1:3 h:h (kills 3 winners — too aggressive). Asymmetric variant chosen over
+# symmetric |μ-med|>T (which at T=4 also kills DEN-26MAY12 warm-outlier
+# winner +$6.17). Sub-bar by playbook n>=20 but mechanism structurally clean
+# and asymmetric scope bounds false-positive risk. Audit script:
+# /tmp/v1_min_h20_outlier_backtest.py.
+COLD_SOURCE_OUTLIER_ENABLED = True
+COLD_SOURCE_OUTLIER_F = 4.0
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3407,6 +3427,37 @@ def _check_msg_gate(opp: dict) -> Optional[str]:
     return None
 
 
+# ─── COLD_SOURCE_OUTLIER gate (BUY_NO only, d-0 + d-1+) ───────────────────
+def _check_cold_source_outlier(opp: dict) -> Optional[str]:
+    """Block BUY_NO when picked μ is colder than median(NBP, NBM-OM, HRRR)
+    by > COLD_SOURCE_OUTLIER_F. Closes the d-0 hole in H_2_0_DISAGREE_F (which
+    is d-1+ only) for the specific pattern where the bot picks the cold-outlier
+    source while warmer sources keep the bracket in-play. Bypassed by caller
+    when _obs_confirmed_alive. See COLD_SOURCE_OUTLIER_* constants for
+    backtest evidence + 2026-05-12 KNYC trigger case."""
+    if not COLD_SOURCE_OUTLIER_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    mu = opp.get("mu")
+    if mu is None:
+        return None
+    sources = []
+    for k in ("mu_nbp", "mu_nbm_om", "mu_hrrr"):
+        v = opp.get(k)
+        if v is not None:
+            sources.append(float(v))
+    if len(sources) < 2:
+        return None  # insufficient sources to compute median
+    med = statistics.median(sources)
+    gap = float(mu) - med  # negative = picked colder than median
+    if gap < -COLD_SOURCE_OUTLIER_F:
+        return (f"COLD_SOURCE_OUTLIER: picked μ={float(mu):.1f} vs "
+                f"median({len(sources)} sources)={med:.1f} "
+                f"gap={gap:+.1f}°F < -{COLD_SOURCE_OUTLIER_F:.1f}°F")
+    return None
+
+
 # ─── SKIP_MODEL_MARKET_DISAGREE gate (V2 port, both sides) ────────────────
 def _check_model_market_disagree(opp: dict) -> Optional[str]:
     """Block when model and market disagree by GAP_MIN with model assigning at
@@ -4625,6 +4676,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     msg_block = _check_msg_gate(opp)
     if msg_block:
         return ("MSG", msg_block)
+    cold_block = _check_cold_source_outlier(opp)
+    if cold_block:
+        return ("COLD_SOURCE_OUTLIER", cold_block)
     if action == "BUY_NO" and not opp.get("is_today", False):
         disag = float(opp.get("disagreement") or 0)
         if disag > H_2_0_DISAGREE_F:
@@ -5006,6 +5060,14 @@ def execute_opportunity(opp: dict) -> bool:
         msg_block = _check_msg_gate(opp)
         if msg_block:
             _audit_skip(opp, "MSG", f"  skip {ticker}: {msg_block}")
+            return False
+        # COLD_SOURCE_OUTLIER gate (2026-05-12). Covers d-0 + d-1+ for the
+        # cold-outlier-pick pattern that H_2_0 misses on d-0. See constant
+        # docstring for backtest + 2026-05-12 KNYC trigger case.
+        cold_block = _check_cold_source_outlier(opp)
+        if cold_block:
+            _audit_skip(opp, "COLD_SOURCE_OUTLIER",
+                f"  skip {ticker}: {cold_block}")
             return False
         # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we

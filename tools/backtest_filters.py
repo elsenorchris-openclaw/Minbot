@@ -187,6 +187,28 @@ def _no_thigh(t):
     return (float(mu) - float(fl)) < 1.5
 
 
+def _cold_source_outlier(t):
+    """COLD_SOURCE_OUTLIER — BUY_NO with picked μ colder than median of
+    {NBP, NBM-OM, HRRR} by > 4.0°F. Fires on d-0 + d-1+ (no is_today scope).
+    Settlement records use the _at_entry suffix; live opp dicts use bare keys.
+    Approximate from settlement fields here."""
+    if t.get("action") != "BUY_NO":
+        return False
+    mu = t.get("mu")
+    if mu is None:
+        return False
+    import statistics as _stat
+    sources = []
+    for k in ("mu_nbp_at_entry", "mu_nbm_om_at_entry", "mu_hrrr_at_entry"):
+        v = t.get(k)
+        if v is not None:
+            sources.append(float(v))
+    if len(sources) < 2:
+        return False
+    med = _stat.median(sources)
+    return float(mu) - med < -4.0
+
+
 SCENARIOS = {
     "model_prob_oor": (
         _model_prob_out_of_range,
@@ -216,6 +238,10 @@ SCENARIOS = {
         _no_thigh,
         "NO_THIGH: T-high BUY_NO mu - floor < 1.5F — DEPLOYED",
     ),
+    "cold_source_outlier": (
+        _cold_source_outlier,
+        "COLD_SOURCE_OUTLIER: BUY_NO picked μ < median(NBP,NBM-OM,HRRR) - 4.0F — DEPLOYED 2026-05-12",
+    ),
 }
 
 # 2026-05-06: `live` meta-scenario — the canonical full-live entry filter
@@ -232,6 +258,7 @@ LIVE_CHAIN = [
     "h_2_disagree",
     "obs_confirmed_loser",
     "no_thigh",
+    "cold_source_outlier",
 ]
 SCENARIOS["live"] = (
     lambda t: any(SCENARIOS[name][0](t) for name in LIVE_CHAIN),

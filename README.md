@@ -3,6 +3,52 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-12 — `COLD_SOURCE_OUTLIER` gate (new, BUY_NO d-0 + d-1+)
+
+**Trigger:** KXLOWTNYC-26MAY12-B46.5 BUY_NO entered overnight at 05:03-05:05
+UTC for today's bracket. Entry features:
+```
+bracket:   low ∈ [46, 47]°F
+forecasts: NBP=48.0  NBM-OM=47.0  HRRR=41.1   (median=47.0)
+picked:    mu_source=hrrr, mu=41.1            (cold outlier, gap −5.9°F)
+mp:        0.055  →  max-Kelly → 3 fills $74.57 cost
+disag:     6.9°F   ← would have triggered H_2_0 at any sane threshold
+is_today:  True    ← but H_2_0 only applies to d-1+
+```
+Currently -$72.74 MTM (market priced 99% YES → low landing in 46-47°F
+bracket, exactly where NBM-OM's 47.0 predicted, between NBP and HRRR).
+
+**New gate:** block `BUY_NO` when `picked_mu < median(NBP, NBM-OM, HRRR) -
+COLD_SOURCE_OUTLIER_F` (4.0°F). Fires on d-0 + d-1+ (no `is_today` scope).
+Asymmetric — only cold-outlier picks block; warm-outlier picks pass (audit
+showed warm-side blocks kill winners 2:0).
+
+**Backtest** (V1 min lifecycle pool n=95 settled + 10 open MTM, since
+2026-04-28):
+- T=4°F: **n=1 block** (today's NYC, +$72.74 lift, 1:0 helps:hurts)
+- T=3°F: n=4 blocks, 1:3 h:h (too aggressive, kills winners)
+- Symmetric |μ-med|>4: n=2, 1:1 (kills DEN-26MAY12 warm-outlier winner)
+
+Sub-bar by playbook n≥20, but mechanism structurally clean and the
+asymmetric scope bounds false-positive risk to the historical cold-pick rate
+(0 false positives in 14d at T=4°F). Helper function
+`_check_cold_source_outlier`. Audit + Discord notification via standard
+`_audit_skip` path.
+
+**Constants:**
+- `COLD_SOURCE_OUTLIER_ENABLED = True` (paper_min_bot.py L863)
+- `COLD_SOURCE_OUTLIER_F = 4.0` (paper_min_bot.py L864)
+
+Wired into both `_evaluate_gates` and `execute_opportunity`. Added to
+`tools/backtest_filters.py` SCENARIOS + LIVE_CHAIN as `cold_source_outlier`.
+
+Tests: `tests/test_cold_source_outlier.py` (9 tests). 689 pass, 46 skip, 0
+failed.
+
+Audit script: `/tmp/v1_min_h20_outlier_backtest.py`.
+
+---
+
 ## 2026-05-11 eve — `MAX_BET_USD` $60 → $80
 
 Per Chris. Continuing the sizing-up trajectory: $45 (2026-05-05) → $60
