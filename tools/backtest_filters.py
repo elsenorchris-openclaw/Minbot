@@ -209,6 +209,27 @@ def _cold_source_outlier(t):
     return float(mu) - med < -4.0
 
 
+def _high_conviction_disag_trap(t):
+    """HIGH_CONVICTION_DISAG_TRAP — BUY_NO with mp < 0.075 AND disag >= 2.0°F.
+    Catches the max-Kelly-trap pattern: low mp triggers max bet size while
+    active NWP source disagreement signals σ may not capture true uncertainty.
+    DEPLOYED 2026-05-12 eve. n=3 in 14d pool, W:L 0:3, lift +$164, robust(-1)
+    +$89.56. Unique catches beyond COLD_SOURCE_OUTLIER: AUS-MAY12 + ATL-MAY07."""
+    if t.get("action") != "BUY_NO":
+        return False
+    mp = t.get("model_prob")
+    if mp is None:
+        return False
+    if float(mp) >= 0.075:
+        return False
+    disag = t.get("disagreement_at_entry")
+    if disag is None:
+        disag = t.get("disagreement")
+    if disag is None:
+        return False
+    return float(disag) >= 2.0
+
+
 SCENARIOS = {
     "model_prob_oor": (
         _model_prob_out_of_range,
@@ -242,6 +263,10 @@ SCENARIOS = {
         _cold_source_outlier,
         "COLD_SOURCE_OUTLIER: BUY_NO picked μ < median(NBP,NBM-OM,HRRR) - 4.0F — DEPLOYED 2026-05-12",
     ),
+    "high_conviction_disag_trap": (
+        _high_conviction_disag_trap,
+        "HIGH_CONVICTION_DISAG_TRAP: BUY_NO mp < 0.075 AND disag >= 2.0F — DEPLOYED 2026-05-12 eve",
+    ),
 }
 
 # 2026-05-06: `live` meta-scenario — the canonical full-live entry filter
@@ -259,6 +284,7 @@ LIVE_CHAIN = [
     "obs_confirmed_loser",
     "no_thigh",
     "cold_source_outlier",
+    "high_conviction_disag_trap",
 ]
 SCENARIOS["live"] = (
     lambda t: any(SCENARIOS[name][0](t) for name in LIVE_CHAIN),

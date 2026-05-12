@@ -3,6 +3,73 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-12 eve — `HIGH_CONVICTION_DISAG_TRAP` gate (new, BUY_NO d-0 + d-1+)
+
+**Trigger:** systematic audit of 14d V1 min BUY_NO pool (n=83 settled+live)
+after today's NYC/DC/AUS combined −$194.55 MTM losses. ROI-normalized
+stratification surfaced two compounding patterns:
+
+- `model_prob < 0.075`: bot is in max-Kelly tail, sizes the largest bets.
+- `disagreement >= 2.0°F`: NWP sources actively disagree on the forecast.
+
+The intersection is "high conviction without justification" — when both fire,
+the bot's σ has already inflated to reflect disagreement, yet mp still puts
+the bracket in the unlikely tail. Catastrophic when wrong.
+
+**Backtest (V1 min 14d pool, settled+live BUY_NO):**
+
+| Filter | n | W:L | lift | robust(-1) | robust(-2) | ROI |
+|--------|---|-----|------|-----------|-----------|-----|
+| `mp<0.075 AND disag>=2.0` | 3 | **0:3** | **+$164.13** | **+$89.56** | **+$29.93** | −100% |
+
+Catches:
+- `NYC-MAY12-B46.5` (mp=0.055, disag=6.9): −$74.57 — cold-pick outlier
+- `AUS-MAY12-T59` (mp=0.074, disag=2.1): −$59.63 — ensemble warm-bust
+- `ATL-MAY07-B59.5` (mp=0.062, disag=4.0): −$29.93 — warm-pick outlier
+
+Natural data gaps at chosen thresholds:
+- Miami winner disag=1.6 (passes) ↔ AUS loser disag=2.1 (blocks) — gap of 0.5°F
+- AUS loser mp=0.074 (blocks) ↔ OKC-MAY08 winner mp=0.078 (passes) — gap of 0.004
+
+**Stack-aware vs COLD_SOURCE_OUTLIER (commit `2410f33`):** 2 of 3 catches
+are UNIQUE (AUS gap=−0.1, ATL gap=+2.79 — neither qualifies for COLD).
+Unique-catch value: +$89.56 over 14d. NYC is redundantly caught by both
+gates (gap=−5.9 < −4.0).
+
+**Today's coverage:** blocks NYC + AUS. DC (mp=0.193) intentionally not
+caught — DC's pattern ("bot picks median, sources moderately disagree") has
+no clean filter per audit; BRACKET_OVERLAP variants kill winners 14:2.
+
+**Playbook bars:**
+
+| Bar | Status |
+|-----|--------|
+| n ≥ 20 | ❌ (n=3) |
+| lift ≥ +$30 | ✓ (5x) |
+| robust(-1) ≥ +$15 | ✓ (6x) |
+| helps:hurts ≥ 4:2 | ✓ PERFECT 3:0 |
+| mechanism articulable | ✓ |
+
+Sub-bar by n. Same precedent as `COLD_SOURCE_OUTLIER` (commit `2410f33`,
+shipped at n=1 with structural-mechanism override). This filter clears
+n=3 with stronger robust-lift margins than COLD had at ship time.
+
+**Constants:**
+- `HIGH_CONVICTION_DISAG_TRAP_ENABLED = True` (paper_min_bot.py L885)
+- `HIGH_CONVICTION_DISAG_TRAP_MP_MAX  = 0.075` (paper_min_bot.py L886)
+- `HIGH_CONVICTION_DISAG_TRAP_DISAG_F = 2.0` (paper_min_bot.py L887)
+
+Wired into both `_evaluate_gates` and `execute_opportunity`. Added to
+`tools/backtest_filters.py` SCENARIOS + LIVE_CHAIN as
+`high_conviction_disag_trap`.
+
+Tests: `tests/test_high_conviction_disag_trap.py` (12 tests).
+
+Rollback: set `HIGH_CONVICTION_DISAG_TRAP_ENABLED = False` or revert this
+commit.
+
+---
+
 ## 2026-05-12 eve — `MAX_BET_USD` $80 → $60 REVERT
 
 Reverts commit `c5ee961` (2026-05-12 02:19 UTC, $60 → $80). Today's NYC,

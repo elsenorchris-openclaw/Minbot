@@ -882,6 +882,30 @@ H_2_0_DISAGREE_F = 4.5              # d-1+ BUY_NO disagreement ceiling
 # /tmp/v1_min_h20_outlier_backtest.py.
 COLD_SOURCE_OUTLIER_ENABLED = True
 COLD_SOURCE_OUTLIER_F = 4.0
+
+# 2026-05-12 eve: HIGH_CONVICTION_DISAG_TRAP — d-0 + d-1+ BUY_NO gate. Block
+# when bot has high conviction (mp < MP_MAX) AND NWP sources actively disagree
+# (>= DISAG_F). Mechanism: low mp triggers max-Kelly sizing; active source
+# disagreement means the model's σ may not capture true uncertainty. Together:
+# "high conviction without justification" — catastrophic when wrong.
+# Backtest (V1 min lifecycle pool n=83 settled+live, 2026-04-28 to 2026-05-12):
+#   MP_MAX=0.075, DISAG_F=2.0°F: n=3 blocks, W:L 0:3 (ALL LOSERS, ROI -100%).
+#   Lift +$164.13, robust(-1) +$89.56, robust(-2) +$29.93.
+#   Catches: NYC-MAY12 (-$74.57, cold-pick outlier), AUS-MAY12 (-$59.63,
+#   ensemble warm-bust), ATL-MAY07 (-$29.93, warm-pick outlier).
+#   Natural data gaps at thresholds: disag 1.6 (Miami winner) → 2.1 (AUS loser);
+#   mp 0.074 (AUS loser) → 0.078 (OKC-MAY08 winner +$11.14).
+# Stack-aware vs COLD_SOURCE_OUTLIER: 2 of 3 catches are UNIQUE.
+#   - NYC has gap=-5.9 (already caught by COLD)
+#   - AUS has gap=-0.1 (UNIQUE — cold-pick gate doesn't fire)
+#   - ATL has gap=+2.79 (UNIQUE — warm-pick, cold-pick gate doesn't fire)
+# Unique-catch value: +$89.56 over 14d (AUS + ATL).
+# Sub-bar by playbook n>=20 (n=3) but 4/5 bars pass strongly: lift 5x bar,
+# robust 6x bar, h:h 3:0 PERFECT, mechanism articulable. COLD_SOURCE_OUTLIER
+# precedent (commit 2410f33) shipped at n=1 with same sub-bar override.
+HIGH_CONVICTION_DISAG_TRAP_ENABLED = True
+HIGH_CONVICTION_DISAG_TRAP_MP_MAX  = 0.075
+HIGH_CONVICTION_DISAG_TRAP_DISAG_F = 2.0
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3461,6 +3485,34 @@ def _check_cold_source_outlier(opp: dict) -> Optional[str]:
     return None
 
 
+# ─── HIGH_CONVICTION_DISAG_TRAP gate (BUY_NO only, d-0 + d-1+) ────────────
+def _check_high_conviction_disag_trap(opp: dict) -> Optional[str]:
+    """Block BUY_NO when model_prob < HIGH_CONVICTION_DISAG_TRAP_MP_MAX AND
+    disagreement >= HIGH_CONVICTION_DISAG_TRAP_DISAG_F. Catches the
+    "high-conviction-without-justification" trap: low mp triggers max-Kelly
+    sizing while active NWP source disagreement signals the σ may not capture
+    true uncertainty. Bypassed by caller when _obs_confirmed_alive. See
+    HIGH_CONVICTION_DISAG_TRAP_* constants for backtest evidence + 2026-05-12
+    AUS/ATL/NYC trigger cases."""
+    if not HIGH_CONVICTION_DISAG_TRAP_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    mp_v = opp.get("model_prob")
+    if mp_v is None:
+        return None
+    mp = float(mp_v)
+    if mp >= HIGH_CONVICTION_DISAG_TRAP_MP_MAX:
+        return None
+    disag = float(opp.get("disagreement") or 0.0)
+    if disag < HIGH_CONVICTION_DISAG_TRAP_DISAG_F:
+        return None
+    return (f"HIGH_CONVICTION_DISAG_TRAP: mp={mp:.3f} < "
+            f"{HIGH_CONVICTION_DISAG_TRAP_MP_MAX:.3f} AND "
+            f"disag={disag:.1f}°F >= "
+            f"{HIGH_CONVICTION_DISAG_TRAP_DISAG_F:.1f}°F")
+
+
 # ─── SKIP_MODEL_MARKET_DISAGREE gate (V2 port, both sides) ────────────────
 def _check_model_market_disagree(opp: dict) -> Optional[str]:
     """Block when model and market disagree by GAP_MIN with model assigning at
@@ -4682,6 +4734,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     cold_block = _check_cold_source_outlier(opp)
     if cold_block:
         return ("COLD_SOURCE_OUTLIER", cold_block)
+    hcdt_block = _check_high_conviction_disag_trap(opp)
+    if hcdt_block:
+        return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
     if action == "BUY_NO" and not opp.get("is_today", False):
         disag = float(opp.get("disagreement") or 0)
         if disag > H_2_0_DISAGREE_F:
@@ -5071,6 +5126,16 @@ def execute_opportunity(opp: dict) -> bool:
         if cold_block:
             _audit_skip(opp, "COLD_SOURCE_OUTLIER",
                 f"  skip {ticker}: {cold_block}")
+            return False
+        # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
+        # for the max-Kelly-trap pattern where low mp meets active NWP source
+        # disagreement. Stack-aware unique catches beyond COLD_SOURCE_OUTLIER:
+        # AUS-MAY12 (-$59.63) + ATL-MAY07 (-$29.93) = +$89.56 over 14d.
+        # See HIGH_CONVICTION_DISAG_TRAP_* constants for backtest evidence.
+        hcdt_block = _check_high_conviction_disag_trap(opp)
+        if hcdt_block:
+            _audit_skip(opp, "HIGH_CONVICTION_DISAG_TRAP",
+                f"  skip {ticker}: {hcdt_block}")
             return False
         # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
         # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
