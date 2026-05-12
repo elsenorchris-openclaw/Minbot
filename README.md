@@ -3,6 +3,19 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-11 eve — `MAX_BET_USD` $60 → $80
+
+Per Chris. Continuing the sizing-up trajectory: $45 (2026-05-05) → $60
+(2026-05-10) → $80 (2026-05-11). Lifts the Kelly ceiling so high-edge
+B-bracket entries can fill at full Kelly without clipping.
+
+Constants:
+- `MAX_BET_USD = 80.00` (was 60.00, paper_min_bot.py L268)
+
+676 tests pass, 46 skipped, 0 failed.
+
+---
+
 ## 2026-05-11 eve — REVERT both `DIRECTIONAL_BUY_NO_MAX_MP` 0.30 → 0.25 AND `MMD GAP_MIN` 0.20 → 0.25
 
 **Trigger:** KXLOWTSEA-26MAY11-B50.5 BUY_NO (-$49.91 MTM) entered at mp=0.267,
