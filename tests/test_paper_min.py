@@ -2156,13 +2156,14 @@ class TestQuickWinGates(unittest.TestCase):
         self.assertEqual(len(self._captured), 1)
 
     def test_h_2_0_does_not_block_buy_yes(self):
-        """H_2.0 is BUY_NO-only. BUY_YES with disagreement 3°F passes.
+        """H_2.0 is BUY_NO-only. BUY_YES with disagreement 1.5°F passes
+        (below both H_2_0_DISAGREE_F=4.5 and BUY_YES_DISAGREE_MAX_F=2.0).
 
         Quotes tightened 2026-05-04 to avoid triggering the new
         MODEL_MARKET_DISAGREE gate: mp=0.70 → mp_no=0.30; no_bid=50c →
         gap = 0.50 − 0.30 = 0.20 < SKIP_MODEL_MARKET_DISAGREE_GAP_MIN (0.25)."""
         opp = self._opp(action="BUY_YES", model_prob=0.70, mu=45.5,
-                        is_today=False, disagreement=3.0,
+                        is_today=False, disagreement=1.5,
                         entry_price=0.30, edge=0.30,
                         yes_bid=45, yes_ask=50, no_bid=50, no_ask=55)
         pb.execute_opportunity(opp)
@@ -2171,6 +2172,42 @@ class TestQuickWinGates(unittest.TestCase):
     def test_h_2_0_at_threshold_passes(self):
         """Disagreement = H_2_0_DISAGREE_F exactly — strict greater-than blocks."""
         pb.execute_opportunity(self._opp(is_today=False, disagreement=4.5))
+        self.assertEqual(len(self._captured), 1)
+
+    def test_buy_yes_disagree_blocks_at_threshold(self):
+        """BUY_YES with disagreement = BUY_YES_DISAGREE_MAX_F (2.0°F) → block.
+        Backtest n=11 blocked / +$50 lift / +$30 robust / 4:2 helps:hurts on
+        the 32-trade BUY_YES cohort (apr 24 - may 11). Below playbook n>=20
+        bar; user shipped on mechanism + forward-watch."""
+        opp = self._opp(action="BUY_YES", model_prob=0.70, mu=45.5,
+                        is_today=False, disagreement=2.0,
+                        entry_price=0.30, edge=0.30,
+                        yes_bid=45, yes_ask=50, no_bid=50, no_ask=55)
+        pb.execute_opportunity(opp)
+        self.assertEqual(self._captured, [])
+
+    def test_buy_yes_disagree_blocks_above_threshold(self):
+        """BUY_YES with disagreement > BUY_YES_DISAGREE_MAX_F → block."""
+        opp = self._opp(action="BUY_YES", model_prob=0.70, mu=45.5,
+                        is_today=False, disagreement=3.5,
+                        entry_price=0.30, edge=0.30,
+                        yes_bid=45, yes_ask=50, no_bid=50, no_ask=55)
+        pb.execute_opportunity(opp)
+        self.assertEqual(self._captured, [])
+
+    def test_buy_yes_disagree_passes_below_threshold(self):
+        """BUY_YES with disagreement < BUY_YES_DISAGREE_MAX_F → pass."""
+        opp = self._opp(action="BUY_YES", model_prob=0.70, mu=45.5,
+                        is_today=False, disagreement=1.9,
+                        entry_price=0.30, edge=0.30,
+                        yes_bid=45, yes_ask=50, no_bid=50, no_ask=55)
+        pb.execute_opportunity(opp)
+        self.assertEqual(len(self._captured), 1)
+
+    def test_buy_yes_disagree_does_not_block_buy_no(self):
+        """BUY_YES_DISAGREE_MAX_F is BUY_YES-only — BUY_NO at 2.0 stays
+        controlled by H_2_0_DISAGREE_F (4.5) and passes."""
+        pb.execute_opportunity(self._opp(is_today=False, disagreement=2.0))
         self.assertEqual(len(self._captured), 1)
 
     def test_obs_alive_bypasses_h_2_0(self):
@@ -3524,9 +3561,11 @@ class TestPerCityD0PrimarySource(unittest.TestCase):
 
 class TestCliIsFinal(unittest.TestCase):
     """2026-04-29 phantom-settlement fix: only treat CLI as final after
-    climate_date_end_LST + 6h. Prevents settling on intra-day partial CLI
+    climate_date_end_LST + 1h. Prevents settling on intra-day partial CLI
     reports (4 PM "VALID AS OF 0400 PM LOCAL TIME") that miss late-evening
-    cooling-driven new daily mins."""
+    cooling-driven new daily mins. Buffer reduced from 6h to 1h on 2026-05-13
+    because NWS publishes the morning-after climate summary at 01-03 AM LST,
+    not 07 AM as initially assumed; 6h blocked every morning-after CLI."""
 
     def setUp(self):
         # Build a fresh DB with cli_reports schema for this test
@@ -3567,19 +3606,27 @@ class TestCliIsFinal(unittest.TestCase):
     def test_partial_4pm_cli_is_not_final(self):
         # SATX 04-29: 4 PM CDT partial = 21:40 UTC.
         # climate_date_end_LST = 2026-04-30 00:00 CDT = 2026-04-30 05:00 UTC
-        # threshold = 05:00 + 6h = 11:00 UTC 04-30
-        # 21:40 UTC 04-29 < 11:00 UTC 04-30 → NOT final
+        # threshold (buffer=1h) = 06:00 UTC 04-30
+        # 21:40 UTC 04-29 < 06:00 UTC 04-30 → NOT final
         partial_4pm_utc = int(dt.datetime(2026,4,29,21,40, tzinfo=dt.timezone.utc).timestamp())
         self._insert("KSAT", "2026-04-29", 77, partial_4pm_utc)
         self.assertFalse(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
 
     def test_morning_after_cli_is_final(self):
-        # SATX morning-after CLI: 07:00 UTC 04-30 (= 02:00 AM CDT)
-        # threshold = 11:00 UTC 04-30 — 07:00 still < 11:00, NOT final
-        # Use 12:00 UTC 04-30 (= 07:00 CDT) which IS past threshold
-        morning_after_utc = int(dt.datetime(2026,4,30,12,0, tzinfo=dt.timezone.utc).timestamp())
+        # SATX morning-after CLI: real NWS timing is 01-03 AM LST.
+        # 07:00 UTC 04-30 (= 02:00 AM CDT) is the typical issuance.
+        # threshold (buffer=1h) = 06:00 UTC 04-30 — 07:00 >= 06:00 → IS final
+        morning_after_utc = int(dt.datetime(2026,4,30,7,0, tzinfo=dt.timezone.utc).timestamp())
         self._insert("KSAT", "2026-04-29", 65, morning_after_utc)
         self.assertTrue(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
+
+    def test_pre_climate_day_end_cli_still_not_final(self):
+        # Defense-in-depth: a CLI issued BEFORE climate_date_end_LST (e.g., a
+        # 10 PM CDT same-day reading) must not pass even with the 1h buffer.
+        # 10 PM CDT 04-29 = 03:00 UTC 04-30 (before climate_date_end 05:00).
+        late_evening_utc = int(dt.datetime(2026,4,30,3,0, tzinfo=dt.timezone.utc).timestamp())
+        self._insert("KSAT", "2026-04-29", 71, late_evening_utc)
+        self.assertFalse(pb._cli_is_final("KSAT", "2026-04-29", "America/Chicago"))
 
     def test_no_cli_returns_not_final(self):
         # No row inserted → _cli_is_final returns False

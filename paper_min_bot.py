@@ -936,6 +936,15 @@ NARROW_MARGIN_TP_STATIONS     = frozenset(['KLAX', 'KMDW', 'KMIA', 'KSEA'])
 # negative, so the gate still earns its keep there.
 H_2_0_DISAGREE_F = 4.5              # d-1+ BUY_NO disagreement ceiling
 
+# 2026-05-13: BUY_YES_DISAGREE_MAX_F — BUY_YES disagreement ceiling. Backtest
+# of 123 settled trades (apr 24 - may 11), BUY_YES cohort only (n_yes ≈ 32):
+# disagreement >= 2.0 blocks 11 trades, lift +$50 vs baseline, robust +$30
+# (drop biggest-day delta), helps:hurts 4:2 across dates. Walk-forward both
+# halves positive. n_blk=11 is below the playbook's n>=20 bar but mechanism
+# is conservative (only blocks the model-disagree tail on the smaller cohort
+# where every loss matters) and the user wants forward-watch data, so ship.
+BUY_YES_DISAGREE_MAX_F = 2.0
+
 # 2026-05-12: COLD_SOURCE_OUTLIER — d-0 + d-1+ BUY_NO gate. Block when the
 # bot's picked mu source predicts COLDER than the median of {NBP, NBM-OM,
 # HRRR} by > COLD_SOURCE_OUTLIER_F. Closes the d-0 hole in H_2_0 (which is
@@ -1890,11 +1899,15 @@ def get_cli_low(station: str, climate_date: str) -> Optional[int]:
 
 
 # Buffer (hours) after climate-day end before we trust an obs-pipeline CLI as
-# final. NWS issues a "morning-after" CLI ~07:00 LST that summarizes the full
-# midnight-to-midnight climate day; intermediate (noon, 4 PM, 5 PM, 10 PM)
-# reports cover the day SO FAR and can be wildly off for min-temp markets when
-# late-evening cooling drives a new daily min. 6 h covers the ~7 AM LST window.
-CLI_FINAL_BUFFER_H = 6
+# final. NWS publishes the morning-after climate summary at ~01:00-03:00 LST,
+# covering the full midnight-to-midnight climate day; intermediate (noon, 4 PM,
+# 5 PM, 10 PM) reports cover the day SO FAR and can be wildly off for min-temp
+# markets when late-evening cooling drives a new daily min. The 4 PM partial is
+# issued 8+ hours BEFORE climate-day end (negative offset from threshold), so a
+# 1 h buffer keeps phantoms blocked while admitting the 01-03 AM morning-after.
+# Was 6 h pre-2026-05-13 which blocked every morning-after CLI and routed 100%
+# of settlements through the kalshi fallback (losing cli_low metadata).
+CLI_FINAL_BUFFER_H = 1
 
 
 def _cli_is_final(station: str, climate_date: str, tz_str: Optional[str]) -> bool:
@@ -4813,6 +4826,11 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
         disag = float(opp.get("disagreement") or 0)
         if disag > H_2_0_DISAGREE_F:
             return ("H_2_0", f"disagreement {disag:.1f}°F > {H_2_0_DISAGREE_F}°F")
+    if action == "BUY_YES":
+        disag = float(opp.get("disagreement") or 0)
+        if disag >= BUY_YES_DISAGREE_MAX_F:
+            return ("BUY_YES_DISAGREE",
+                    f"BUY_YES disagreement {disag:.1f}°F ≥ {BUY_YES_DISAGREE_MAX_F}°F")
     if _DISAGREEMENT_ENABLED:
         disag = float(opp.get("disagreement") or 0)
         if disag > MAX_DISAGREEMENT_F:
@@ -5221,6 +5239,17 @@ def execute_opportunity(opp: dict) -> bool:
                 _audit_skip(opp, "H_2_DISAGREE",
                     f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
                     f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
+                return False
+        # 2026-05-13: BUY_YES_DISAGREE — BUY_YES disagreement ceiling.
+        # See BUY_YES_DISAGREE_MAX_F constant block for backtest evidence.
+        # Mirror of _evaluate_gates twin (kept in sync for shadow-log parity).
+        if action == "BUY_YES":
+            disag = float(opp.get("disagreement", 0.0))
+            if disag >= BUY_YES_DISAGREE_MAX_F:
+                _audit_skip(opp, "BUY_YES_DISAGREE",
+                    f"  skip {ticker}: BUY_YES_DISAGREE — disagreement "
+                    f"{disag:.1f}°F ≥ {BUY_YES_DISAGREE_MAX_F:.1f}°F "
+                    f"(backtest n=11 blocked, +$50 lift / +$30 robust / 4:2 h:h)")
                 return False
         if _DISAGREEMENT_ENABLED:
             disagreement = float(opp.get("disagreement", 0.0))
