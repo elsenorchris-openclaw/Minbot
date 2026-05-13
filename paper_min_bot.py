@@ -825,6 +825,38 @@ HARD_STOP_TAIL_LOSS_PCT = 999.0     # disabled (was 0.70) — sentinel
 # when bid is 1c.
 MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-winner override
 
+# ─── SHADOW exit activation gate (2026-05-13 ship) ────────────────────────
+# Graduates _check_position_obs_confirmed_loser_for_exit from logging-only
+# (Stage 1 since 2026-05-04) to actual exit, scoped to BUY_NO B-bracket
+# only (the case the audit covers — all 11 historical fires were BUY_NO
+# B-brackets) and conditional on bid concurrence.
+#
+# Mechanism: SHADOW alone fires on rm in [floor+1, cap] for B-brackets, but
+# at 1°F-wide brackets the rm=floor+1=cap edge is fundamentally ambiguous
+# (CLI rounding can land actual low above or in bracket). SEA-26MAY11
+# (rm=51.0, lost) and DC-26MAY11 (rm=51.08, won +$14.52) had ~same rm and
+# opposite outcomes. Adding `bid <= SHADOW_EXIT_MAX_BID_C` requires the
+# market to also concur the position is doomed — concurrence of obs-loser
+# AND market-loser is a much stronger joint signal than either alone.
+#
+# Audit: n=11 SHADOW fires over 8d (2026-05-04 → 2026-05-12), all BUY_NO
+# B-bracket. At bid<=25c:
+#   - 6 activations, all true positives
+#   - $37.55 saved (TP exits at 21-25c bid vs eventual 1c market_stop)
+#   - 0 false positives (all 4 historical FPs had bid 36-59c, gated out
+#     including the DC-26MAY11 +$27.28 swing)
+# Threshold sweep: clean plateau bid in {25,30,35}c (no fires in 26-35c
+# gap); FPs slip in at 40c+. n is sub-bar (playbook n>=20) but mechanism is
+# articulable and gate is strictly tighter than current logging-only
+# behavior — same precedent override as COLD_SOURCE_OUTLIER (n=1).
+#
+# Other action/bracket combos (BUY_YES, T-cap, T-floor) stay Stage 1
+# log-only — no backtest evidence to ship Stage 2 there yet.
+#
+# Reversible: set to 0 to disable activation (returns to log-only Stage 1).
+# Audit script: /tmp/shadow_gate_design.py
+SHADOW_EXIT_MAX_BID_C = 25
+
 # ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
 # V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").
 # Removed after all-gate audit on min_bot historical candidates: 2/2
@@ -5925,24 +5957,49 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                 log(f"  HOLD {ticker}: obs-winning check raised {type(_winx).__name__}: {_winx}; "
                     f"falling through to MTM stop", "warn")
 
-        # 2026-05-04 night SHADOW: OBS_CONFIRMED_LOSER detection (logging only).
-        # When obs definitively show position will lose, we COULD sell at
-        # current bid to recover residual value before MARKET_STOP catches
-        # it at ≤1c. BUT — false positive at exit-time = sell a winner =
-        # bad. Stage 1 logs would-fire events without selling so we can
-        # measure false-positive rate vs settlement outcomes for 7-14
-        # days. Stage 2 activation requires 0 false positives observed.
+        # 2026-05-04 night SHADOW: OBS_CONFIRMED_LOSER detection.
+        # 2026-05-13: Stage 2 activation, scoped to BUY_NO B-bracket only.
+        # Fires actual exit when (a) obs confirm loser via
+        # _check_position_obs_confirmed_loser_for_exit, (b) action is
+        # BUY_NO with both floor and cap (the case the n=11 / 8d audit
+        # covers), AND (c) bid <= SHADOW_EXIT_MAX_BID_C (market concurs).
+        # All other action/bracket combos (BUY_YES, T-cap, T-floor) stay
+        # Stage 1 log-only — no backtest evidence to ship Stage 2 there.
+        # Above the bid gate we also fall back to log-only.
         if rm is not None:
             try:
                 if _check_position_obs_confirmed_loser_for_exit(pos, float(rm)):
-                    log(f"  SHADOW OBS_CONFIRMED_LOSER {ticker}: "
-                        f"rm={rm} bracket=[{pos.get('floor')},{pos.get('cap')}] "
-                        f"action={action} entry={entry_price:.2f} "
-                        f"current_bid={int(current_bid_c)}c "
-                        f"would-recover ${(int(current_bid_c)/100.0 - entry_price) * pos.get('count', 0):+.2f} "
-                        f"vs hold-to-loss ${-entry_price * pos.get('count', 0):+.2f}", "warn")
+                    _is_buy_no_b = (
+                        action == "BUY_NO"
+                        and pos.get("floor") is not None
+                        and pos.get("cap") is not None
+                    )
+                    if _is_buy_no_b and int(current_bid_c) <= SHADOW_EXIT_MAX_BID_C:
+                        log(f"  SHADOW_EXIT trigger {ticker}: rm={rm} "
+                            f"bracket=[{pos.get('floor')},{pos.get('cap')}] "
+                            f"action={action} entry={entry_price:.2f} "
+                            f"current_bid={int(current_bid_c)}c "
+                            f"≤ {SHADOW_EXIT_MAX_BID_C}c — execute "
+                            f"(would-recover ${(int(current_bid_c)/100.0 - entry_price) * pos.get('count', 0):+.2f} "
+                            f"vs hold-to-loss ${-entry_price * pos.get('count', 0):+.2f})")
+                        if _execute_exit(ticker, pos, sell_side, int(current_bid_c), "shadow_obs_loser"):
+                            n_exits += 1
+                        continue
+                    else:
+                        # Stage 1 log-only path: BUY_YES, T-* brackets, OR
+                        # BUY_NO B-bracket with bid above the gate.
+                        _gate_reason = ("not BUY_NO B-bracket"
+                                        if not _is_buy_no_b
+                                        else f"bid > {SHADOW_EXIT_MAX_BID_C}c")
+                        log(f"  SHADOW OBS_CONFIRMED_LOSER {ticker}: "
+                            f"rm={rm} bracket=[{pos.get('floor')},{pos.get('cap')}] "
+                            f"action={action} entry={entry_price:.2f} "
+                            f"current_bid={int(current_bid_c)}c "
+                            f"would-recover ${(int(current_bid_c)/100.0 - entry_price) * pos.get('count', 0):+.2f} "
+                            f"vs hold-to-loss ${-entry_price * pos.get('count', 0):+.2f} "
+                            f"({_gate_reason} — log-only)", "warn")
             except Exception as _lex:
-                # Conservative: any error in shadow logging is non-fatal.
+                # Conservative: any error in shadow logic is non-fatal.
                 log(f"  SHADOW obs-loser check raised {type(_lex).__name__}: {_lex}", "warn")
 
         # 2026-05-04: very-loose value-dead market stop. Hard-stop (below) is

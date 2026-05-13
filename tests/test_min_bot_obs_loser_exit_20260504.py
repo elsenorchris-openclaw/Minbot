@@ -84,16 +84,32 @@ class TestSourcePresence(unittest.TestCase):
         self.assertIn("SHADOW OBS_CONFIRMED_LOSER", src(),
             "Shadow log line must be present in check_open_positions_for_exit")
 
-    def test_shadow_does_not_call_execute_exit(self):
-        """Stage 1 must NOT call _execute_exit on obs-loser path."""
+    def test_shadow_stage2_executes_under_bid_gate(self):
+        """Stage 2 (shipped 2026-05-13): SHADOW must call _execute_exit
+        with reason='shadow_obs_loser' AND only when bid <=
+        SHADOW_EXIT_MAX_BID_C. Above the bid gate, fall back to log-only."""
         s = src()
         idx = s.find("# 2026-05-04 night SHADOW: OBS_CONFIRMED_LOSER")
         self.assertNotEqual(idx, -1, "shadow block comment must exist")
         end = s.find("# 2026-05-04: very-loose value-dead market stop", idx)
         self.assertNotEqual(end, -1, "shadow block must end before MARKET_STOP comment")
         shadow_block = s[idx:end]
-        self.assertNotIn("_execute_exit", shadow_block,
-            "STAGE 1 SHADOW: must not call _execute_exit; only log.")
+        # Must call _execute_exit for activation
+        self.assertIn("_execute_exit", shadow_block,
+            "STAGE 2 SHADOW: must call _execute_exit on activation path")
+        self.assertIn('"shadow_obs_loser"', shadow_block,
+            "STAGE 2 SHADOW: exit reason must be 'shadow_obs_loser' "
+            "(distinct from 'market_stop' for telemetry separation)")
+        # Activation must be gated on SHADOW_EXIT_MAX_BID_C
+        self.assertIn("SHADOW_EXIT_MAX_BID_C", shadow_block,
+            "STAGE 2 SHADOW: activation must be gated on bid threshold")
+        # Constant must be defined
+        self.assertRegex(s, r"SHADOW_EXIT_MAX_BID_C\s*=\s*\d+",
+            "Constant SHADOW_EXIT_MAX_BID_C must be defined")
+        # Above-gate path must still log (preserve Stage 1 telemetry)
+        self.assertIn("log-only", shadow_block,
+            "STAGE 2 SHADOW: above bid gate must still log "
+            "for ongoing audit data collection")
 
     def test_uses_post_sunrise_gate(self):
         """Function must reference _is_post_sunrise for the post-lock gate."""
