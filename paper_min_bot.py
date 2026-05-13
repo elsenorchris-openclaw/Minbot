@@ -857,6 +857,46 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 # Audit script: /tmp/shadow_gate_design.py
 SHADOW_EXIT_MAX_BID_C = 25
 
+# ─── NARROW_MARGIN_TP — take-profit on edge-of-bracket positions ───────────
+# Companion to SHADOW exit Stage 2. SHADOW catches losers when rm enters
+# the bracket; NMTP catches the EARLIER risk window when rm is just above
+# the cap (still nominally a winner, but late-day radiative cooling can
+# push rm into the bracket and crash the bid before SHADOW can fire).
+#
+# Mechanism: when rm is within MARGIN_F of cap (at-risk zone for late-day
+# cooling on radiative-cooling-prone stations) AND we're in profit (bid
+# in [MIN_BID_C, MAX_BID_C], MTM ≥ MIN_MTM), take profit at current bid.
+#
+# The station whitelist is the key discriminator. Cross-validation:
+# the 4 whitelist stations have the worst BUY_NO B-bracket WR over 14d
+# (KSEA 20%, KLAX 0%, KMDW 50%, KMIA 60%), meaning they're empirically
+# losing positions in this regime. Climate-physical: KMIA/KLAX/KSEA
+# Pacific/Mediterranean coastal with calm-clear-night radiative cooling;
+# KMDW has lake-effect inversion potential. Continental humid stations
+# (KATL 50%, KHOU 100%, KMSP 100%, KDFW 80%) excluded — NMTP would net-
+# hurt there by selling their reliable BUY_NO B-bracket winners.
+#
+# Audit (14d, 2026-04-29 → 2026-05-12, n=10 fires under combo gate):
+#   Helps: 7  Hurts: 3  Ratio: 7:3 = 2.33:1  (PASSES playbook 2:1 bar)
+#   Net lift: $+176.34 / 14d ≈ $88/wk  (PASSES $30/wk bar)
+#   LOO-1 (drop 2026-05-12): $+123.86  (PASSES $15 bar)
+#   LOO-2 (drop 2 best days): $+71.80  (still positive)
+#   LOO-station (drop any 1 station): $+94.20 to $+177.44  (all positive)
+# Catches today's MIA bust (+$53.58 swing vs SHADOW Stage 2's $3.96 save)
+# and SEA-MAY11 bust (+$52.06 swing).
+#
+# n=10 sub-bar (playbook ≥20) but mechanism articulable + same precedent
+# override as COLD_SOURCE_OUTLIER (n=1) and HCDT (n=3) shipped earlier today.
+#
+# Reversible: NARROW_MARGIN_TP_ENABLED = False to disable.
+# Audit script: /tmp/nmtp_robustness.py
+NARROW_MARGIN_TP_ENABLED      = True
+NARROW_MARGIN_TP_MARGIN_F     = 1.5      # rm within this many °F of cap
+NARROW_MARGIN_TP_MIN_BID_C    = 65       # bid floor (real profit to capture)
+NARROW_MARGIN_TP_MAX_BID_C    = 80       # bid ceiling (avoid extreme-MTM hurters)
+NARROW_MARGIN_TP_MIN_MTM      = 0.20     # MTM floor
+NARROW_MARGIN_TP_STATIONS     = frozenset(['KLAX', 'KMDW', 'KMIA', 'KSEA'])
+
 # ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
 # V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").
 # Removed after all-gate audit on min_bot historical candidates: 2/2
@@ -5752,6 +5792,45 @@ def _check_position_obs_confirmed_loser_for_exit(pos: dict, rm: float) -> bool:
     return False
 
 
+def _check_narrow_margin_tp(pos: dict, rm: Optional[float],
+                             current_bid_c: Optional[int]) -> bool:
+    """NARROW_MARGIN_TP gate: take profit on at-risk-zone BUY_NO B-bracket
+    positions. Fires iff ALL of:
+      - NARROW_MARGIN_TP_ENABLED (kill switch)
+      - action == BUY_NO + B-bracket (both floor and cap)
+      - station ∈ NARROW_MARGIN_TP_STATIONS (radiative-cooling-prone)
+      - rm in (cap, cap + NARROW_MARGIN_TP_MARGIN_F]  — at-risk zone
+      - bid in [NARROW_MARGIN_TP_MIN_BID_C, NARROW_MARGIN_TP_MAX_BID_C]
+      - MTM ≥ NARROW_MARGIN_TP_MIN_MTM
+    See NARROW_MARGIN_TP_* constant block for audit + rationale."""
+    if not NARROW_MARGIN_TP_ENABLED:
+        return False
+    if pos.get("action") != "BUY_NO":
+        return False
+    floor = pos.get("floor")
+    cap = pos.get("cap")
+    if floor is None or cap is None:
+        return False
+    if pos.get("station") not in NARROW_MARGIN_TP_STATIONS:
+        return False
+    if rm is None or current_bid_c is None:
+        return False
+    try:
+        margin = float(rm) - float(cap)
+    except (TypeError, ValueError):
+        return False
+    if margin <= 0 or margin > NARROW_MARGIN_TP_MARGIN_F:
+        return False
+    bid = int(current_bid_c)
+    if bid < NARROW_MARGIN_TP_MIN_BID_C or bid > NARROW_MARGIN_TP_MAX_BID_C:
+        return False
+    entry = float(pos.get("entry_price", 0) or 0)
+    if entry <= 0:
+        return False
+    mtm = (bid / 100.0 - entry) / entry
+    return mtm >= NARROW_MARGIN_TP_MIN_MTM
+
+
 def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
                    reason: str) -> bool:
     """Place a SELL order for an existing position at sell_price_c. Polls for
@@ -5956,6 +6035,28 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                 # a position the obs may already have confirmed as winner.
                 log(f"  HOLD {ticker}: obs-winning check raised {type(_winx).__name__}: {_winx}; "
                     f"falling through to MTM stop", "warn")
+
+        # 2026-05-13: NARROW_MARGIN_TP — take profit on at-risk-zone BUY_NO
+        # B-bracket positions BEFORE late-day cooling can crash the bid.
+        # Fires only on whitelist stations (KLAX/KMDW/KMIA/KSEA — those
+        # with worst BUY_NO B-bracket WR over 14d). Placed AFTER winner
+        # override (don't TP on confirmed winners) and BEFORE SHADOW
+        # (NMTP catches the rm-just-above-cap zone, SHADOW catches rm-in-
+        # bracket zone — non-overlapping rm ranges by construction).
+        # See NARROW_MARGIN_TP_* constant block for audit + rationale.
+        try:
+            if _check_narrow_margin_tp(pos, rm, current_bid_c):
+                log(f"  NMTP_EXIT trigger {ticker}: station={pos.get('station')} "
+                    f"rm={rm} bracket=[{pos.get('floor')},{pos.get('cap')}] "
+                    f"margin={(float(rm) - float(pos.get('cap'))):+.2f}°F "
+                    f"bid={int(current_bid_c)}c entry={entry_price:.2f} "
+                    f"mtm={(int(current_bid_c)/100.0 - entry_price)/entry_price*100:+.0f}% — execute "
+                    f"(would-realize ${(int(current_bid_c)/100.0 - entry_price) * pos.get('count', 0):+.2f})")
+                if _execute_exit(ticker, pos, sell_side, int(current_bid_c), "narrow_margin_tp"):
+                    n_exits += 1
+                continue
+        except Exception as _nmtpx:
+            log(f"  NMTP check raised {type(_nmtpx).__name__}: {_nmtpx}", "warn")
 
         # 2026-05-04 night SHADOW: OBS_CONFIRMED_LOSER detection.
         # 2026-05-13: Stage 2 activation, scoped to BUY_NO B-bracket only.
