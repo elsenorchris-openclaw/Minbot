@@ -4869,7 +4869,12 @@ def record_candidate(opp: dict) -> None:
     2026-04-29: also writes `blocked_by` + `block_reason` fields via
     `_evaluate_gates` so downstream analysis can identify which gate is
     blocking winners (V2-style shadow logging). `blocked_by=None` means the
-    candidate would have been entered (subject to dedupe + budget caps)."""
+    candidate would have been entered (subject to dedupe + budget caps).
+
+    2026-05-13 PM: added cohort fields days_out, entry_local_hour,
+    entry_local_dow so candidate-pool backtests can split by d-0 vs d-1+
+    and by bot-decision hour without recomputing from date_str + bot clock.
+    Mirrors entry-record fields populated in execute_opportunity."""
     fields = ("event_ticker", "market_ticker", "station", "series", "date_str",
               "label", "floor", "cap",
               "yes_bid", "yes_ask", "no_bid", "no_ask",
@@ -4880,12 +4885,26 @@ def record_candidate(opp: dict) -> None:
               "yes_ask_frac", "no_ask_frac",
               "action", "edge", "entry_price")
     blocked_by, block_reason = _evaluate_gates(opp)
+    # 2026-05-13 PM: derive cohort fields at log time.
+    _tz_name = opp.get("tz")
+    _entry_local_hour = None
+    _entry_local_dow = None
+    if _tz_name:
+        try:
+            _now_local = datetime.now(ZoneInfo(_tz_name))
+            _entry_local_hour = _now_local.hour
+            _entry_local_dow = _now_local.strftime("%a")
+        except Exception:
+            pass
     record = {
         "ts": datetime.now(timezone.utc).isoformat(),
         "kind": "candidate",
         "bracket_kind": opp.get("kind"),
         "blocked_by": blocked_by,
         "block_reason": block_reason,
+        "days_out": _days_out_int(opp),
+        "entry_local_hour": _entry_local_hour,
+        "entry_local_dow": _entry_local_dow,
         **{k: opp.get(k) for k in fields},
     }
     _append_jsonl(_trades_file_today(), record)
