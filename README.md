@@ -3,6 +3,106 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-13 — `cli_low` metadata restore + `BUY_YES_DISAGREE` gate
+
+Two changes shipped together (commit `b9d0c46`).
+
+### 1. `CLI_FINAL_BUFFER_H` 6 → 1 (restore `cli_low` in settlements)
+
+The phantom-settlement fix on 2026-04-29 added `_cli_is_final()` to gate
+obs-pipeline CLI usage: only accept the CLI when issued ≥ `climate_date_end_LST
++ CLI_FINAL_BUFFER_H`. The original 6 h value was based on the (incorrect)
+assumption that NWS publishes the morning-after climate summary at ~07:00 LST.
+Empirical truth: NWS issues it at **01:00-03:00 LST**.
+
+Result of the 6 h overshoot: 100% of settlements since 2026-04-29 (n=86)
+routed through the Kalshi `/portfolio/settlements` fallback path which
+hardcodes `cli_low: None` in the settlement record. The bot's *outcome*
+(won, pnl) was correct via Kalshi's authoritative `market_result`, but
+the CLI value was lost — breaking downstream backtest joins that need
+the actual settled low.
+
+**Counterfactual on the 86 affected settlements:** 78 (90.7%) have a CLI
+in obs-pipeline that `buffer=1` admits. The 4 PM partial CLI (the original
+phantom trigger) is issued 8+ hours BEFORE `climate_date_end_LST`, so 1 h
+buffer still blocks it.
+
+```
+Total kalshi-sourced settlements (Apr 29 - May 11): 86
+Have a CLI in obs-pipeline:                          78 (90.7%)
+Pass _cli_is_final w/ buffer=6h (current):           0
+Pass _cli_is_final w/ buffer=1h (proposed):          78 (90.7%)
+Pass _cli_is_final w/ buffer=0h:                     78
+```
+
+`buffer=1` over `buffer=0` is defense-in-depth against a CLI issued at
+exactly the midnight LST boundary.
+
+**Tests updated:** `test_morning_after_cli_is_final` retimed to use a
+realistic 02:00 AM CDT issuance (was 07:00 AM CDT under the wrong
+assumption). New `test_pre_climate_day_end_cli_still_not_final` guards
+against a late-evening same-day CLI sneaking through under `buffer=1`.
+
+### 2. `BUY_YES_DISAGREE` gate (new, BUY_YES side)
+
+**Trigger:** post-cleanup BUY_YES cohort analysis on settled pool
+(2026-04-24 → 2026-05-11, 123 trades, BUY_YES ≈ 32). User asked for
+forward-watch on the disagreement tail.
+
+**Backtest:**
+
+| Filter | n_blk | lift | robust(-1) | h:hu | early lift | late lift |
+|--------|-------|------|-----------|------|-----------|-----------|
+| `BUY_YES AND disagreement >= 2.0°F` | 11 | +$50 | +$30 | 4:2 | +$22 | +$28 |
+
+n_blk=11 is below the playbook's n>=20 bar but mechanism is conservative
+(only the disagreement tail of an already-small cohort; every loss matters
+more), walk-forward is positive in both halves, and user explicitly wanted
+the gate live for forward-watch.
+
+**Mechanism:** when NWP sources disagree by ≥2°F, the σ may still
+under-state true uncertainty (similar pattern to `HIGH_CONVICTION_DISAG_TRAP`
+on the BUY_NO side). BUY_YES asymmetric loss profile (pay 30-50c, lose
+100% on miss) makes this tail particularly expensive.
+
+**Playbook bars:**
+
+| Bar | Status |
+|-----|--------|
+| n ≥ 20 | ❌ (n=11) |
+| lift ≥ +$30 | ✓ |
+| robust(-1) ≥ +$15 | ✓ (2x) |
+| helps:hurts ≥ 4:2 | ✓ exactly |
+| walk-forward positive | ✓ both halves |
+| mechanism articulable | ✓ |
+
+Sub-bar by n only; precedent (`COLD_SOURCE_OUTLIER` n=1, `HIGH_CONVICTION_DISAG_TRAP`
+n=3) covers the n-shortage with structural-mechanism + walk-forward overrides.
+
+**Wired into both** `_evaluate_gates` (shadow-log telemetry) and
+`execute_opportunity` (live blocking) for parity.
+
+Constant: `BUY_YES_DISAGREE_MAX_F = 2.0`.
+
+**Tests:** `test_buy_yes_disagree_blocks_at_threshold`,
+`test_buy_yes_disagree_blocks_above_threshold`,
+`test_buy_yes_disagree_passes_below_threshold`,
+`test_buy_yes_disagree_does_not_block_buy_no`. Existing
+`test_h_2_0_does_not_block_buy_yes` retuned to disagreement=1.5
+(below the new threshold).
+
+**Rollback:** either change individually — set `CLI_FINAL_BUFFER_H = 6`
+(rolls back the cli_low restore) or delete the `BUY_YES_DISAGREE` block in
+`_evaluate_gates` + `execute_opportunity` (rolls back the YES gate).
+
+Tests: **347 passed / 42 skipped / 0 failed** (same baseline as pre-change).
+Service restart 2026-05-13 04:07 UTC clean: first cycle markets=240 cands=132
+opps=109 taken=0 settled=0 (1.7s), no errors.
+
+Backup: `paper_min_bot.py.bak.pre_cli_buffer_yes_disagree_20260513`.
+
+---
+
 ## 2026-05-12 eve — `HIGH_CONVICTION_DISAG_TRAP` gate (new, BUY_NO d-0 + d-1+)
 
 **Trigger:** systematic audit of 14d V1 min BUY_NO pool (n=83 settled+live)
