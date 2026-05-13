@@ -3,6 +3,20 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-13 PM — candidate log: add `days_out` + `entry_local_hour` + `entry_local_dow`
+
+Future-backtest enrichment for `data/trades_YYYY-MM-DD.jsonl` candidate records. Three new fields populated in `record_candidate`:
+
+- **`days_out`** — derived via `_days_out_int(opp)`. Critical for d-0 vs d-1+ cohort splits.
+- **`entry_local_hour`** — `datetime.now(ZoneInfo(opp['tz'])).hour` at log time. Mirrors the field already on entry records (kind=entry).
+- **`entry_local_dow`** — day-of-week from same tz.
+
+Audit (2026-05-13 PM): all 286,554 V1 min candidate records from today had **0% coverage** of these three fields despite entry records having them. Forced backtests using the candidate pool to either skip these dimensions or re-derive from `date_str` + bot clock.
+
+Pure additive change; no decision logic touched. Tests 734 passed, 46 skipped.
+
+---
+
 ## 2026-05-13 — `cli_low` metadata restore + `BUY_YES_DISAGREE` gate
 
 Two changes shipped together (commit `b9d0c46`).
