@@ -1014,6 +1014,39 @@ COLD_SOURCE_OUTLIER_F = 4.0
 HIGH_CONVICTION_DISAG_TRAP_ENABLED = True
 HIGH_CONVICTION_DISAG_TRAP_MP_MAX  = 0.075
 HIGH_CONVICTION_DISAG_TRAP_DISAG_F = 2.0
+
+# 2026-05-15: HRRR_DISSENT — BUY_NO B-bracket gate. Block when HRRR predicts
+# low at-or-below cap (HRRR is the near-term short-horizon model, ~0-12h
+# lead) AND both slow consensus models (NBP, NBM-OM) confidently above cap
+# by HRRR_DISSENT_NBP_NBM_BUFFER. Catches the "primary-NBP overconfidence
+# with HRRR nowcast dissent" pattern.
+#
+# Trigger: KXLOWTNYC-26MAY15-B49.5 entered 2026-05-14 14:10 UTC at $0.68 NO
+# (88 contracts, $59.84 cost), now MTM −$59.84 / settled-losing (market
+# YES at 99c). At entry: NBP=53.0, NBM-OM=52.3, HRRR=50.0 (HRRR exactly at
+# cap 50). Bot picked NBP as primary (mu_source="nbp"), ignored HRRR's
+# warning. Existing H_2_0_DISAGREE_F (4.5°F) didn't fire because disag
+# was 3.0°F (53-50 = 3); COLD_SOURCE_OUTLIER didn't fire because bot
+# picked the WARMEST source (53) not coldest.
+#
+# Backtest (paper_min_bot/tools/backtest_filters.py --stack live,
+# since 2026-04-15, pool n=140):
+#   n_blocked_inc=1, lift_inc=+$30.00, h:hu=1:0 PERFECT (caught
+#   KXLOWTDC-26MAY12-B45.5 −$60.35 loss with same NBP-vs-HRRR pattern:
+#   HRRR=45.4 ≤ cap=45.5, NBP=48.0 / NBM-OM=49.1 ≥ cap+1.5=47.0).
+#   Robust drop-day: $0 (single fire — drop day removes it).
+#   13+ other variants tested (min(picks)<=cap, disag>=4, hrrr<=cap+1,
+#   etc.) all bled historical winners; this surgical 1-arm is the only
+#   positive-lift configuration. See backtest_filters --custom output.
+#
+# Mechanism: HRRR is the only short-horizon nowcast in the stack and
+# updates hourly with current boundary-layer conditions. NBP is consensus,
+# slower-updating; can lag regime shifts. When HRRR ≤ cap but NBP/NBM-OM
+# are both confidently above (≥+1.5°F gap), HRRR is typically reading
+# nowcast info NBP missed; bot's primary-NBP confidence is misplaced.
+HRRR_DISSENT_ENABLED = True
+HRRR_DISSENT_NBP_NBM_BUFFER = 1.5   # min(NBP, NBM-OM) >= cap + this triggers
+                                    # set ENABLED=False to disable
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3597,6 +3630,42 @@ def _check_cold_source_outlier(opp: dict) -> Optional[str]:
     return None
 
 
+# ─── HRRR_DISSENT gate (BUY_NO B-bracket only, d-0 + d-1+) ────────────────
+def _check_hrrr_dissent(opp: dict) -> Optional[str]:
+    """Block BUY_NO B-bracket when HRRR predicts low at-or-below cap AND
+    both slow models (NBP, NBM-OM) are confidently above cap by
+    HRRR_DISSENT_NBP_NBM_BUFFER. Catches the "primary-NBP overconfidence
+    with HRRR nowcast dissent" pattern. See HRRR_DISSENT_* constants for
+    backtest evidence (n=1 historical fire, h:hu 1:0 perfect, +$30 lift)
+    and the 2026-05-15 KXLOWTNYC trigger case (-$59.84)."""
+    if not HRRR_DISSENT_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    floor = opp.get("floor")
+    cap = opp.get("cap")
+    # B-bracket only (both floor + cap not None)
+    if floor is None or cap is None:
+        return None
+    hrrr_v = opp.get("mu_hrrr")
+    nbp_v = opp.get("mu_nbp")
+    nbm_v = opp.get("mu_nbm_om")
+    if hrrr_v is None or nbp_v is None or nbm_v is None:
+        return None  # need all 3 sources to evaluate
+    cap_f = float(cap)
+    hrrr = float(hrrr_v); nbp = float(nbp_v); nbm = float(nbm_v)
+    if hrrr > cap_f:
+        return None  # HRRR not at-or-below cap → no dissent signal
+    slow_min = min(nbp, nbm)
+    threshold = cap_f + float(HRRR_DISSENT_NBP_NBM_BUFFER)
+    if slow_min < threshold:
+        return None  # slow models not confidently above cap → no dissent gap
+    return (f"HRRR_DISSENT: HRRR={hrrr:.1f}<=cap={cap_f:.1f} but "
+            f"NBP={nbp:.1f}/NBM-OM={nbm:.1f} both >= cap+"
+            f"{HRRR_DISSENT_NBP_NBM_BUFFER:.1f}={threshold:.1f} "
+            f"(primary-NBP overconfidence + HRRR near-term dissent)")
+
+
 # ─── HIGH_CONVICTION_DISAG_TRAP gate (BUY_NO only, d-0 + d-1+) ────────────
 def _check_high_conviction_disag_trap(opp: dict) -> Optional[str]:
     """Block BUY_NO when model_prob < HIGH_CONVICTION_DISAG_TRAP_MP_MAX AND
@@ -4874,6 +4943,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     cold_block = _check_cold_source_outlier(opp)
     if cold_block:
         return ("COLD_SOURCE_OUTLIER", cold_block)
+    hrrr_dissent_block = _check_hrrr_dissent(opp)
+    if hrrr_dissent_block:
+        return ("HRRR_DISSENT", hrrr_dissent_block)
     hcdt_block = _check_high_conviction_disag_trap(opp)
     if hcdt_block:
         return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
@@ -5334,6 +5406,17 @@ def execute_opportunity(opp: dict) -> bool:
         if cold_block:
             _audit_skip(opp, "COLD_SOURCE_OUTLIER",
                 f"  skip {ticker}: {cold_block}")
+            return False
+        # HRRR_DISSENT gate (2026-05-15). B-bracket BUY_NO when HRRR at-or-
+        # below cap + both slow models (NBP, NBM-OM) confidently above cap.
+        # Catches primary-NBP overconfidence + HRRR near-term dissent.
+        # Trigger: KXLOWTNYC-26MAY15-B49.5 (-$59.84). Historical pool n=1
+        # fire (DC-MAY12 -$60.35), 1:0 perfect h:hu. See HRRR_DISSENT_*
+        # constants for backtest evidence.
+        hrrr_dissent_block = _check_hrrr_dissent(opp)
+        if hrrr_dissent_block:
+            _audit_skip(opp, "HRRR_DISSENT",
+                f"  skip {ticker}: {hrrr_dissent_block}")
             return False
         # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
         # for the max-Kelly-trap pattern where low mp meets active NWP source
