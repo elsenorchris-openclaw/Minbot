@@ -3,6 +3,61 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-15 PM — `HRRR_DISSENT` gate (new, BUY_NO B-bracket)
+
+Block BUY_NO B-bracket entries when HRRR (the only short-horizon nowcast model in the stack) predicts low at-or-below cap AND both slow models (NBP, NBM-OM) are confidently above cap. Catches the "primary-NBP overconfidence + HRRR near-term dissent" loss pattern.
+
+### Constants
+
+```python
+HRRR_DISSENT_ENABLED = True
+HRRR_DISSENT_NBP_NBM_BUFFER = 1.5   # min(NBP, NBM-OM) >= cap + this triggers
+```
+
+### Trigger case
+
+`KXLOWTNYC-26MAY15-B49.5` entered 2026-05-14 14:10 UTC, BUY_NO 88 contracts @ $0.68 ($59.84 cost), settled-losing at −$59.84.
+
+Entry context:
+- NBP=53.0 (primary, mu_source=nbp)
+- NBM-OM=52.3
+- **HRRR=50.0 — exactly at cap=50**
+- Bot picked NBP as primary, edge=0.207, mp=0.113
+
+Existing filters missed it:
+- `H_2_0_DISAGREE_F` (4.5°F): disag was 3.0°F (53−50) → under threshold
+- `COLD_SOURCE_OUTLIER`: bot picked WARMEST source not coldest → opposite direction
+- `HIGH_CONVICTION_DISAG_TRAP`: mp 0.113 > 0.075 threshold
+
+### Mechanism
+
+HRRR is the only short-horizon nowcast in the 3-model stack (~0-12h lead), updates hourly with current boundary-layer conditions. NBP is consensus-based, slower-updating; can lag regime shifts. When HRRR ≤ cap but both slow models are confidently above by ≥1.5°F gap, HRRR is typically reading nowcast info the slow models missed. The bot uses NBP as primary, so HRRR's signal gets discounted at entry — this filter restores its veto power.
+
+### Backtest
+
+`paper_min_bot/tools/backtest_filters.py --stack live`, pool n=140 since 2026-04-15:
+
+| Metric | Value |
+|---|---|
+| n_blocked_inc | 1 |
+| lift_inc | +$30.00 |
+| helps:hurts | **1:0** PERFECT |
+| robust_lift_inc | $0 (single fire — drop-day removes only data point) |
+
+Historical fire: `KXLOWTDC-26MAY12-B45.5` (−$60.35) — HRRR=45.4 ≤ cap=45.5, NBP=48 / NBM-OM=49.1 (both ≥ cap+1.5=47.0). Same NBP-vs-HRRR primary-overconfidence pattern.
+
+13+ other variants tested (`min(picks)<=cap`, `disag>=4.0`, `hrrr<=cap+1`, `buy_no+yb` thresholds, primary_outlier_diff variants). All bled historical winners (h:hu 1:7 to 1:9). This surgical 1-arm gate is the only positive-lift configuration.
+
+### Sub-bar caveats
+
+- Lift +$30 < $110 nominal bar
+- Robust $0 < $50 nominal bar (single fire — small-n artifact)
+- These are both forced by n=1 historical fire. Mechanism is the argument: 1:0 perfect h:hu + clean physical interpretation + today's NY would have been blocked. Same precedent override as `COLD_SOURCE_OUTLIER` (shipped at n=1) and `HIGH_CONVICTION_DISAG_TRAP` (shipped at n=3).
+
+Wired at both decision sites (`_audit_skip` + tuple-return), tag `HRRR_DISSENT`. Tests: `tests/test_hrrr_dissent_20260515.py` (12 cases).
+
+---
+
 ## 2026-05-15 — `BUY_NO_LOW_BRACKET_TRAP` gate (new, BUY_NO B-bracket)
 
 Block BUY_NO B-bracket entries that match either of two loss patterns
