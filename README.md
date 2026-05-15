@@ -3,6 +3,36 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-15 — `BUY_NO_LOW_BRACKET_TRAP` gate (new, BUY_NO B-bracket)
+
+Block BUY_NO B-bracket entries that match either of two loss patterns
+identified from 2026-05-14 (all 3 V1-min entries lost, combined −$100.47):
+
+- **Mechanism A — `BUY_NO_LOW_BRACKET_TRAP_CONSENSUS`**: `μ > cap` AND
+  `disagreement_at_entry < 2.5°F`. All three forecasts (NBP / HRRR /
+  NBM-OM) cluster within ~1°F of each other above the bracket cap. Low
+  buffer + consensus bias = high risk of the day's low dropping into
+  bracket. Catches DAL-26MAY14-B67.5 (disg 1.40, −$31.64) and
+  DC-26MAY14-B52.5 (disg 0.90, −$61.59).
+- **Mechanism B — `BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE`**: `μ < floor` AND
+  `running_min ≥ cap`. Entered after the day's low began forming but rm
+  hasn't even crossed bracket from above. Bot is betting low will pass
+  *through* the bracket on its way to forecast. Catches
+  MIN-26MAY14-B49.5 (rm=51.1 ≥ cap=50, μ=46.1 HRRR cold outlier, −$7.24).
+
+**Backtest 2026-05-12 – 2026-05-14 (n=15 settled BUY_NO trades):**
+catches all 3 5/14 losers (lift +$100.47), blocks 0 of 9 historical
+5/12–5/13 winners. Winners with `μ>cap` all had disagreement ≥ 2.9°F
+(DEN 4.20, DC-5/13 3.10, SFO 2.90, LV 3.30, NYC-5/13 4.20); winners with
+`μ<floor` (CHI/MIN-5/12, MIN-5/13) all entered before sunrise with
+`running_min=None`. Constant: `BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX=2.5`.
+Live-fire format: `🪤 BLOCKED BUY_NO {ticker} LOW_BRACKET_TRAP / {CONSENSUS|RM_ABOVE}`.
+
+First live fire post-restart: KXLOWTMIN-26MAY15-B58.5 caught by
+mechanism B (μ=54.7 < floor=58 AND rm=64.4 ≥ cap=59). Tests: 729 pass /
+5 pre-existing fail (`test_buy_yes_b_bracket_obs_loser.py`, unrelated) /
+46 skipped. Backup at `paper_min_bot.py.pre_low_bracket_trap_20260515`.
+
 ## 2026-05-13 PM — candidate log: add `days_out` + `entry_local_hour` + `entry_local_dow`
 
 Future-backtest enrichment for `data/trades_YYYY-MM-DD.jsonl` candidate records. Three new fields populated in `record_candidate`:

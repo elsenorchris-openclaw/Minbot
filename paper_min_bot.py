@@ -221,6 +221,29 @@ BUY_NO_EXTREME_SIGMA_MAX_MP    = 0.10
 # generalization would block winners.
 LAX_BUY_NO_HIGH_SIGMA_THRESHOLD = 2.5
 
+# 2026-05-15: BUY_NO_LOW_BRACKET_TRAP. Block BUY_NO on LOW B-bracket in
+# two specific configurations identified from V1-min 5/14 losses:
+#   DAL-26MAY14-B67.5 -$31.64, DC-26MAY14-B52.5 -$61.59,
+#   MIN-26MAY14-B49.5 -$7.24  →  combined -$100.47.
+# Mechanism A (CONSENSUS_NEAR_CAP): mu > cap AND disagreement < 2.5°F.
+#   All three forecasts (NBP/HRRR/NBM) cluster within ~1°F above the
+#   bracket cap. With small buffer and consensus bias, the day's low
+#   can drop into bracket.
+#   - DAL-5/14: mNBP=69.0 mHRR=67.8 (already inside [67,68]!) mNBM=69.2
+#     disg=1.40 → SKIP
+#   - DC-5/14:  mNBP=55.0 mHRR=54.1 mNBM=54.7 disg=0.90 → SKIP
+# Mechanism B (RM_ABOVE_BRACKET): mu < floor AND running_min >= cap.
+#   Entered after the day's low began forming but rm hasn't crossed the
+#   bracket from above. Bot is betting low will pass *through* the
+#   bracket on its way to forecast.
+#   - MIN-5/14: mu=46.1 (HRRR cold outlier) rm=51.1 >= cap=50 → SKIP
+# Backtest 5/12-5/14 (n=15 settled BUY_NO trades): catches all 3 5/14
+# losers (lift +$100.47), blocks 0 of 9 historical winners — winners
+# with mu>cap all had disagreement >= 2.9°F (DEN 4.20, DC-5/13 3.10,
+# SFO 2.90, LV 3.30, NYC-5/13 4.20); winners with mu<floor (CHI/MIN-5/12,
+# MIN-5/13) all entered before sunrise with rm=None.
+BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX = 2.5
+
 # 2026-05-01: BUY_YES tail margin gate. Live-pool loser pattern:
 # losers had margin median = -0.50°F (μ on wrong side / barely across the
 # threshold), winners had margin = +0.90°F. DC-T46 today (μ=47, floor=46.5,
@@ -4726,6 +4749,34 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
                 f"KLAX BUY_NO B-bracket with σ={opp.get('sigma'):.2f}"
                 f"≥{LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} "
                 f"(Pacific microclimate uncertainty; backtest 0W:3L, lift +$70)")
+    # 2026-05-15: BUY_NO_LOW_BRACKET_TRAP — see constant block for full
+    # mechanism + backtest (catches 3/3 5/14 V1-min losers, 0/9 winners).
+    if (action == "BUY_NO"
+            and opp.get("floor") is not None
+            and opp.get("cap") is not None):
+        _bt_fl = float(opp["floor"]); _bt_cp = float(opp["cap"])
+        _bt_mu = opp.get("mu")
+        _bt_disg = opp.get("disagreement")
+        _bt_rm = opp.get("running_min")
+        if _bt_mu is not None:
+            # Mechanism A: mu > cap AND models tightly agree (consensus near cap)
+            if (float(_bt_mu) > _bt_cp
+                    and _bt_disg is not None
+                    and float(_bt_disg) < BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX):
+                return ("BUY_NO_LOW_BRACKET_TRAP_CONSENSUS",
+                        f"μ={_bt_mu:.1f}>cap={_bt_cp} AND "
+                        f"disagree={_bt_disg:.2f}<{BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX} "
+                        f"(NBP/HRRR/NBM consensus stacked above bracket — "
+                        f"caught DAL-5/14 -$31, DC-5/14 -$61)")
+            # Mechanism B: mu < floor AND rm not yet below cap (bracket in path)
+            if (float(_bt_mu) < _bt_fl
+                    and _bt_rm is not None
+                    and float(_bt_rm) >= _bt_cp):
+                return ("BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE",
+                        f"μ={_bt_mu:.1f}<floor={_bt_fl} AND "
+                        f"rm={_bt_rm:.1f}≥cap={_bt_cp} "
+                        f"(bracket sits between current rm and forecast μ — "
+                        f"caught MIN-5/14 -$7)")
     # Global BUY_NO T-high block (2026-05-01, was per-station LAX-only).
     # Backtest helps:hurts 6:1, net +$2.93 across n=7 historical entries.
     # Forward audit: candidate log records blocked_by="NO_THIGH" so future
@@ -5128,6 +5179,50 @@ def execute_opportunity(opp: dict) -> bool:
                 f"backtest: 0W:3L on n=3 LAX entries, lift +$69.90, h:h 3:0"
             )
             return False
+        # 2026-05-15: BUY_NO_LOW_BRACKET_TRAP gate (live block + Discord notify).
+        # See constant block above for full mechanism. Catches 3/3 5/14
+        # V1-min losers (DAL/DC/MIN, -$100.47), blocks 0/9 historical winners.
+        if (action == "BUY_NO"
+                and opp.get("floor") is not None
+                and opp.get("cap") is not None):
+            _bt_fl = float(opp["floor"]); _bt_cp = float(opp["cap"])
+            _bt_mu = opp.get("mu")
+            _bt_disg = opp.get("disagreement")
+            _bt_rm = opp.get("running_min")
+            _bt_skip = None
+            if _bt_mu is not None:
+                if (float(_bt_mu) > _bt_cp
+                        and _bt_disg is not None
+                        and float(_bt_disg) < BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX):
+                    _bt_skip = ("BUY_NO_LOW_BRACKET_TRAP_CONSENSUS",
+                                f"μ={_bt_mu:.1f}>cap={_bt_cp} AND "
+                                f"disagree={_bt_disg:.2f}<"
+                                f"{BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX} "
+                                f"(NBP/HRRR/NBM consensus above bracket)")
+                elif (float(_bt_mu) < _bt_fl
+                        and _bt_rm is not None
+                        and float(_bt_rm) >= _bt_cp):
+                    _bt_skip = ("BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE",
+                                f"μ={_bt_mu:.1f}<floor={_bt_fl} AND "
+                                f"rm={_bt_rm:.1f}≥cap={_bt_cp} "
+                                f"(bracket between rm and forecast μ)")
+            if _bt_skip is not None:
+                _bt_code, _bt_reason = _bt_skip
+                _audit_skip(opp, _bt_code, f"  skip {ticker}: {_bt_reason}")
+                _discord_skip_send(ticker,
+                    f"🪤 **BLOCKED BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
+                    f"LOW_BRACKET_TRAP / {_bt_code.split('_')[-1]}\n"
+                    f"μ {(_bt_mu or 0):.1f}°F  bracket [{_bt_fl:.0f},{_bt_cp:.0f}]  "
+                    f"σ {(opp.get('sigma') or 0):.2f}°F  "
+                    f"rm={('-' if _bt_rm is None else f'{_bt_rm:.1f}')}\n"
+                    f"src=`{opp.get('mu_source')}`  "
+                    f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} "
+                    f"NBM={opp.get('mu_nbm_om')}  "
+                    f"disagree={(_bt_disg or 0):.2f}°F\n"
+                    f"backtest: 3/3 5/14 V1-min losers (lift +$100.47), "
+                    f"0/9 winners blocked"
+                )
+                return False
         # Global BUY_NO T-high block (2026-05-01, was LAX-only).
         if (action == "BUY_NO"
                 and opp.get("floor") is not None and opp.get("cap") is None):

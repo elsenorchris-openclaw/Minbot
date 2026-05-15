@@ -2135,11 +2135,15 @@ class TestQuickWinGates(unittest.TestCase):
         # no_ask=55 → entry=0.55 → edge = 0.80 − 0.55 = 0.25;
         # yes_bid=33 sits squarely in the FORMER PRICE_ZONE [30, 40];
         # μ=62 vs bracket [59, 60] → ABS_DIST passes (|62-59.5|=2.5°F > 0.5°F).
+        # disagreement=3.0 keeps the test isolated from BUY_NO_LOW_BRACKET_TRAP
+        # (shipped 2026-05-15): that filter blocks BUY_NO when μ>cap AND
+        # disagreement<2.5; this fixture verifies a different gate path.
         opp = self._opp(yes_bid=33, yes_ask=37,
                         no_bid=53, no_ask=55,
                         entry_price=0.55, edge=0.25,
                         model_prob=0.20, mu=62.0,
-                        floor=59.0, cap=60.0)
+                        floor=59.0, cap=60.0,
+                        disagreement=3.0)
         pb.execute_opportunity(opp)
         self.assertEqual(len(self._captured), 1,
                          "yes_bid=33 in former PRICE_ZONE should pass post-removal")
@@ -2618,15 +2622,21 @@ class TestMpRangeBypassEnd2End(unittest.TestCase):
 
     def _atl_b59_opp(self):
         """Reconstructs KXLOWTATL-26APR27-B59.5 backtest winner: BUY_NO,
-        edge=0.25, mp=0.03 (< MIN_MODEL_PROB=0.05), μ=62 with bracket [59,60]
-        (μ 2°F above bracket — clearly outside), KATL recent CLI [44, 66]."""
+        edge=0.25, mp=0.03 (< MIN_MODEL_PROB=0.05), bracket [59,60],
+        KATL recent CLI [44, 66]. μ originally 62 (2°F above cap); switched
+        to μ=56 to dodge BUY_NO_LOW_BRACKET_TRAP_CONSENSUS (shipped
+        2026-05-15: μ>cap AND disagree<2.5 → block). μ=56 sits below cap
+        (so TRAP mech A doesn't apply), inside the pass test's CLI range
+        [44,66]+buffer, but outside the block test's CLI range [40,50]+buffer
+        — preserves the inconsistent/consistent split of the original test."""
         return {
             "market_ticker": "KXLOWTATL-26APR27-B59.5",
             "event_ticker": "KXLOWTATL-26APR27",
             "action": "BUY_NO", "model_prob": 0.03, "edge": 0.25,
             "entry_price": 0.67, "yes_bid": 7, "yes_ask": 11,
-            "no_bid": 65, "no_ask": 67, "mu": 62.0, "sigma": 4.5,
+            "no_bid": 65, "no_ask": 67, "mu": 56.0, "sigma": 4.5,
             "mu_source": "nbp", "running_min": None,
+            "mu_nbp": 56.0, "mu_hrrr": 56.0, "mu_nbm_om": 56.0,
             "post_sunrise_lock": False, "disagreement": 0.5,
             "floor": 59.0, "cap": 60.0,
             "station": "KATL", "date_str": "2026-04-27", "label": "Atlanta",
@@ -2804,7 +2814,13 @@ class TestEvaluateGates(unittest.TestCase):
         self.assertEqual(gate, "MAX_DISAGREEMENT")
 
     def test_mu_vs_rm(self):
-        gate, _ = pb._evaluate_gates(self._opp(mu=41.0, running_min=50.0))
+        # μ inside bracket [45,46] (was μ=41 below floor pre-2026-05-15);
+        # rm well above cap. |μ−rm|=5.5°F > 5°F threshold → MU_VS_RM fires.
+        # Need μ in-bracket (not below floor) so BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE
+        # mechanism B (μ<floor AND rm≥cap) does not fire first. Also avoids
+        # OBS_CONFIRMED_LOSER (rm not in [floor,cap]) and obs_alive_bypass
+        # (rm > floor−OBS_ALIVE_BUFFER_F).
+        gate, _ = pb._evaluate_gates(self._opp(mu=45.5, running_min=51.0))
         self.assertEqual(gate, "MU_VS_RM")
 
     def test_spread(self):
@@ -2896,7 +2912,11 @@ class TestCoastalTightFloorGate(unittest.TestCase):
         # ABS_DIST passes (|mu-mid|=0.9 > 0.625 default min), but COASTAL_TIGHT_FLOOR
         # blocks because gap = floor-mu = -1.4 < 2.0. This was a real loser
         # (-$29.44) in the audit pool.
-        gate, _ = pb._evaluate_gates(self._opp("KHOU", mu=69.4, floor=68.0))
+        # disagreement=3.0 prevents BUY_NO_LOW_BRACKET_TRAP_CONSENSUS (shipped
+        # 2026-05-15) from firing first — that gate triggers on
+        # μ>cap AND disagreement<2.5; here we want COASTAL_TIGHT_FLOOR's path.
+        gate, _ = pb._evaluate_gates(self._opp("KHOU", mu=69.4, floor=68.0,
+                                               disagreement=3.0))
         self.assertEqual(gate, "COASTAL_TIGHT_FLOOR")
 
     def test_inland_station_not_affected(self):
