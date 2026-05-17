@@ -159,21 +159,14 @@ class TestHelperBehavior(unittest.TestCase):
     def test_returns_none_on_none_input(self):
         import sys
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        # Reload so flag flip takes effect
-        import importlib
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
-        m = importlib.import_module("paper_min_bot")
+        import paper_min_bot as m
         self.assertIsNone(m._cli_aligned_rmin(None))
         self.assertIsNone(m._cli_aligned_rmin(None, "KSEA", "2026-05-06"))
 
     def test_returns_int_when_station_date_missing(self):
         import sys
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        import importlib
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
-        m = importlib.import_module("paper_min_bot")
+        import paper_min_bot as m
         # Without station/date, falls through to plain int-round
         self.assertEqual(m._cli_aligned_rmin(55.4), 55.0)
         self.assertEqual(m._cli_aligned_rmin(55.94), 56.0)

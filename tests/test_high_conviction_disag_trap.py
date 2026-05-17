@@ -34,8 +34,6 @@ class TestHighConvictionDisagTrapConstants(unittest.TestCase):
 
     def test_helper_defined(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
         import paper_min_bot as m
         self.assertTrue(hasattr(m, "_check_high_conviction_disag_trap"))
         self.assertTrue(callable(m._check_high_conviction_disag_trap))
@@ -63,8 +61,6 @@ class TestHighConvictionDisagTrapHelper(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
         import paper_min_bot as m
         cls.m = m
 

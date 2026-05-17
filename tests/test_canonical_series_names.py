@@ -102,10 +102,10 @@ class TestVegasResolves(unittest.TestCase):
     def test_vegas_d0_resolves_to_nbp_via_hardcoded(self):
         """With no auto-primary JSON loaded, get_d0_primary('KXLOWTLV')
         falls through to PER_SERIES_D0_PRIMARY which has nbp."""
-        import sys, importlib
-        # Force a clean import
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
+        import sys
+        # Don't del sys.modules["paper_min_bot"] — that breaks any other
+        # test file that captured a `pb = paper_min_bot` reference at import
+        # time. Plain import is sufficient (module is loaded once per run).
         sys.path.insert(0, str(ROOT))
         try:
             import paper_min_bot as bot

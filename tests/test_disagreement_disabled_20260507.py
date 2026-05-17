@@ -41,8 +41,6 @@ class TestDisagreementDisabled(unittest.TestCase):
 
     def test_module_imports_with_flag_false(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
         import paper_min_bot as m
         self.assertFalse(m._DISAGREEMENT_ENABLED)
         self.assertEqual(m.MAX_DISAGREEMENT_F, 5.0)
