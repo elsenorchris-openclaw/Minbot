@@ -46,16 +46,17 @@ class TestBucketBoundaryBehavior(unittest.TestCase):
     (today's SEA-class) and still passes mp 0.22 (well below threshold)."""
 
     def test_module_imports_without_error(self):
+        # Avoid del sys.modules + reimport here — it replaces the module
+        # object, leaving any `pb = paper_min_bot` references captured by
+        # other test files pointing at the stale copy, which breaks
+        # `patch("paper_min_bot.datetime")` on the new copy (the patched
+        # attribute lands on a module the victim doesn't reference).
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
         import paper_min_bot as m
         self.assertEqual(m.DIRECTIONAL_BUY_NO_MAX_MP, 0.25)
 
     def test_threshold_blocks_027_passes_022(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")
-        if "paper_min_bot" in sys.modules:
-            del sys.modules["paper_min_bot"]
         import paper_min_bot as m
         # mp 0.27 must BE blocked (SEA-class entry; above threshold)
         self.assertTrue(0.27 > m.DIRECTIONAL_BUY_NO_MAX_MP)
