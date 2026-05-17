@@ -3,6 +3,68 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-17 — settlement dedup guard (`_settled_tickers` set)
+
+Fixes a duplicate-settlement bug where `_reconcile_kalshi_positions` would re-add positions we'd already settled (because Kalshi's batch settlement lagged ours), and the next `check_settlements` cycle would then re-settle them, writing a second settlement record. Over 22 days the bot accumulated 6 duplicate records across 5 tickers, inflating reported PnL by $-101.34 (loss-side dupes counted twice → reported $+336.67 vs actual $+438.01).
+
+### Mechanism
+
+Race condition:
+1. `check_settlements` calls Kalshi `/portfolio/settlements`, marks position settled in `positions.json`, writes record to `settlements.jsonl`, removes from `_open_positions`.
+2. `_reconcile_kalshi_positions` (on next startup, or scheduled) calls Kalshi `/portfolio/positions` — for tickers Kalshi hasn't yet flushed from its batch settlement queue, the position still appears as "open" with non-zero `position_fp`.
+3. Reconcile re-adds the ticker to `_open_positions` as an "untracked" stub. `positions.json` regrows the entry.
+4. Next `check_settlements` cycle sees Kalshi has now finalized the settlement → marks settled again → writes duplicate record.
+
+Triple-settle case (`KXLOWTDC-26MAY14-B52.5`): two stop-restart cycles caught Kalshi mid-batch twice, producing 3 settlement records over ~21 hours.
+
+### Fix
+
+In-memory `_settled_tickers: set[str]` seeded from `settlements.jsonl` at `_load_positions`. Augmented every time `check_settlements` writes a new record. Both `_reconcile_kalshi_positions` (re-add guard) and `check_settlements` (idempotency) consult it.
+
+```python
+# in _reconcile_kalshi_positions, after _open_positions check:
+if tk in _settled_tickers:
+    continue   # already settled — Kalshi's batch is just lagging
+```
+
+Survives restarts because it re-seeds from the on-disk log. No additional persistence needed.
+
+### Data cleanup
+
+Live `settlements.jsonl` deduped 149 → 143 records (kept first per ticker, which carries full entry context: mu, sigma, edge, etc.; later reconciled stubs were NULL-context). Backups:
+- `settlements.jsonl.bak.pre_dedup_20260517_191827` (original 149-line file)
+- `paper_min_bot.py.bak.pre_settled_dedup_20260517_191827`
+- `README.md.bak.pre_settled_dedup_20260517_191827`
+
+Audit of dropped records (`/tmp/settlements_excess.jsonl`):
+
+| Ticker | Dupes | Wrong PnL impact |
+|---|---|---|
+| KXLOWTDC-26MAY14-B52.5 | 2 dup (triple-settle) | $-119.66 |
+| KXLOWTMIN-26MAY14-B50.5 | 1 dup | $-0.38 |
+| KXLOWTBOS-26MAY16-B55.5 | 1 dup | $+4.50 |
+| KXLOWTHOU-26MAY16-B68.5 | 1 dup | $-0.84 |
+| KXLOWTNYC-26MAY16-B55.5 | 1 dup | $+15.04 |
+| **Total** | **6** | **$-101.34** |
+
+Reported lifetime PnL: $+336.67 → corrected $+438.01.
+
+### Tests
+
+`tests/test_settled_tickers_dedup_20260517.py` (5 cases): empty-file seed, multi-record dedup, non-settlement filtering, bad-JSON tolerance, reconcile-skip enforcement. Full suite 753 passed / 44 skipped (no regressions).
+
+### Verification
+
+Post-restart 19:21:39 UTC PID 2952048 single+current:
+```
+[19:21:58.762]   seeded 143 settled tickers from 143 records
+[19:21:58.764]   loaded 5 positions (dropped 0 > 3d old, pruned 3 settled-past)
+```
+
+Five known-dupe tickers (KDCA/BOS/HOU/MIN/NYC May14-16) confirmed absent from `positions.json` after reconcile cycle — the guard fired and prevented re-add.
+
+---
+
 ## 2026-05-15 PM — `HRRR_DISSENT` gate (new, BUY_NO B-bracket)
 
 Block BUY_NO B-bracket entries when HRRR (the only short-horizon nowcast model in the stack) predicts low at-or-below cap AND both slow models (NBP, NBM-OM) are confidently above cap. Catches the "primary-NBP overconfidence + HRRR near-term dissent" loss pattern.

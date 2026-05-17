@@ -4019,6 +4019,18 @@ def _append_jsonl(path: Path, record: dict) -> None:
 _open_positions: dict[str, dict] = {}  # market_ticker → position record
 _positions_lock = threading.Lock()
 
+# 2026-05-17 — settlement dedup. Tracks tickers we've already written a
+# settlement record for. Set is seeded at startup from settlements.jsonl
+# and grows as new settlements are written. Used by both:
+#   • _reconcile_kalshi_positions — skip re-adding tickers Kalshi still lists
+#     as "open" because their batch settlement lags ours (the source of the
+#     2026-05-14 KXLOWTDC-26MAY14-B52.5 triple-settlement bug, $120 fake loss
+#     across 5 tickers/6 records lifetime).
+#   • check_settlements — guard against any future code path that bypasses
+#     the existing settled-flag check.
+# In-memory only; settlements.jsonl is the durable source of truth.
+_settled_tickers: set[str] = set()
+
 # ─── Per-cycle / per-day budget tracking ────────────────────────────────
 _cycle_budget_lock = threading.Lock()
 _cycle_new_count = 0                          # reset each cycle
@@ -4202,6 +4214,15 @@ def _reconcile_kalshi_positions() -> int:
         with _positions_lock:
             if tk in _open_positions:
                 continue  # already tracked locally
+            # 2026-05-17 — settlement-dedup guard. If we've already written
+            # a settlement record for this ticker, don't re-add it as an
+            # unsettled stub. Kalshi's batch settlement can lag ours by
+            # 10min-2h+; without this guard the next check_settlements
+            # cycle re-settles the position and writes a duplicate record
+            # (see _settled_tickers comment + the KDCA-MAY14 triple-settle
+            # incident).
+            if tk in _settled_tickers:
+                continue
             # Add stub so dedupe blocks re-entry. Kalshi's settle loop will
             # do its thing; settle records will be missing some entry context
             # (mu, sigma at entry) but that's an analytics gap, not a safety one.
@@ -4356,6 +4377,39 @@ def _reconcile_from_trades_log() -> int:
     return added
 
 
+def _seed_settled_tickers() -> int:
+    """Populate _settled_tickers from settlements.jsonl. Best-effort: any
+    parse error is swallowed (an unparseable line just means we won't dedup
+    that one ticker on this boot, which is the existing behavior anyway).
+
+    Returns the count loaded for logging.
+    """
+    if not SETTLEMENTS_FILE.exists():
+        return 0
+    n = 0
+    try:
+        with open(SETTLEMENTS_FILE) as f:
+            for line in f:
+                if not line.strip():
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("kind") != "settlement":
+                    continue
+                tk = rec.get("market_ticker")
+                if tk:
+                    _settled_tickers.add(tk)
+                    n += 1
+    except Exception as e:
+        log(f"  settled-tickers seed failed: {e}", "warn")
+        return 0
+    if n:
+        log(f"  seeded {len(_settled_tickers)} settled tickers from {n} records")
+    return n
+
+
 def _load_positions() -> None:
     """Load positions.json, dropping any whose climate day is more than
     POSITION_TTL_DAYS in the past. Defends against orphaned positions that
@@ -4386,6 +4440,12 @@ def _load_positions() -> None:
                 continue
             keep[tk] = pos
         _open_positions = keep
+        # 2026-05-17: seed _settled_tickers from settlements.jsonl so the
+        # reconcile-on-restart path can skip tickers we've already settled.
+        # Without this, Kalshi's slower settlement causes reconcile to re-add
+        # our settled positions as fresh stubs → next check_settlements writes
+        # duplicate records (the 2026-05-14 KDCA triple-settlement bug).
+        _seed_settled_tickers()
         # 2026-05-03: prune settled positions for past climate-days BEFORE
         # logging the count, so the load message reflects the post-prune
         # count of operationally-active positions.
@@ -6596,6 +6656,9 @@ def check_settlements() -> int:
             }
             log_cli = f"{cli_low}°F"
         _append_jsonl(SETTLEMENTS_FILE, settlement)
+        # 2026-05-17 — record settled ticker so reconcile-on-restart skips
+        # re-adding it. See _settled_tickers comment.
+        _settled_tickers.add(ticker)
         # Don't pop — keep the record in _open_positions tagged as settled so
         # the per-ticker dedupe (in scan_cycle and execute_opportunity) still
         # blocks re-entry. Without this, the cascade bug (~50 V2-wallet orders
