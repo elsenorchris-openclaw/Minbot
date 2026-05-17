@@ -289,7 +289,8 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 25.00                 # 2026-05-15 PM: $60 → $25 per Chris.
+MAX_BET_USD = 50.00                 # 2026-05-17: $25 → $50 per Chris.
+                                    # 2026-05-15 PM: $60 → $25 per Chris.
                                     # Risk reduction after the 5/14 -$100.47 cluster (DAL/DC/MIN all losers
                                     # at near-$60 cap each). New BUY_NO_LOW_BRACKET_TRAP filter blocks the
                                     # exact replay, but cap reduction limits blast radius on whatever pattern
@@ -297,7 +298,7 @@ MAX_BET_USD = 25.00                 # 2026-05-15 PM: $60 → $25 per Chris.
                                     # 2026-05-12: $80 → $60 REVERT after NYC-26MAY12-B46.5 stacked $74.57 loss.
                                     # History: $1 (live launch) → $3 (2026-04-26) → ... → $30 (2026-04-29 eve)
                                     # → $45 (2026-05-05) → $60 (2026-05-10) → $80 (2026-05-12) → $60 (2026-05-12 eve)
-                                    # → $25 (2026-05-15 PM). Default cap.
+                                    # → $25 (2026-05-15 PM) → $50 (2026-05-17). Default cap.
 
 # 2026-05-01: BUY_YES entries get a tighter $5 cap (was tail-only originally).
 # Asymmetric blast-radius limit. Historical wins on these were ALL ≤ $4.90
