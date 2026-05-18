@@ -289,7 +289,8 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 50.00                 # 2026-05-17: $25 → $50 per Chris.
+MAX_BET_USD = 25.00                 # 2026-05-17 PM: $50 → $25 per Chris (rollback after 6-day bleed $-172).
+                                    # 2026-05-17: $25 → $50 per Chris (rolled back same day).
                                     # 2026-05-15 PM: $60 → $25 per Chris.
                                     # Risk reduction after the 5/14 -$100.47 cluster (DAL/DC/MIN all losers
                                     # at near-$60 cap each). New BUY_NO_LOW_BRACKET_TRAP filter blocks the
@@ -1048,6 +1049,59 @@ HIGH_CONVICTION_DISAG_TRAP_DISAG_F = 2.0
 HRRR_DISSENT_ENABLED = True
 HRRR_DISSENT_NBP_NBM_BUFFER = 1.5   # min(NBP, NBM-OM) >= cap + this triggers
                                     # set ENABLED=False to disable
+
+# 2026-05-17 PM: BUY_NO_NBM_IN_BRACKET — d-1+ BUY_NO B-bracket gate. Block when
+# NBM-OM (the bias-corrected slow-model consensus) lies INSIDE the upper 1°F of
+# the YES bracket AND HRRR is below cap. Catches the "climatological avg
+# predicts cli right at upper bracket edge" pattern: small forecast errors flip
+# cli into bracket = BUY_NO loses.
+#
+# Backtest (stack-aware, full pool n=63 BUY_NO d-1+ since 2026-04-25; nets out
+# HRRR_DISSENT / COLD_SOURCE_OUTLIER / HCDT / BUY_NO_LOW_BRACKET_TRAP overlap):
+#   n=3 unique catches: MIA-MAY12-B77.5 −$43.04 (NBM=77.9 cap=78), MIN-MAY16-
+#   B57.5 −$15.36 (NBM=57.8 cap=58), MIN-MAY13-B48.5 +$11.90 win (NBM=48.1
+#   cap=49). h:hu = 2:1 PERFECT by count, lift +$46.50, LOO-1 +$3.46.
+#
+# Sub-bar on n (n=3 vs playbook n>=20) and LOO-1 ($3 vs $15) but passes the
+# count h:hu bar cleanly. Mechanism: NBM ∈ [cap-1, cap] = slow-model consensus
+# inside YES bracket. HRRR<cap confirms cold direction. Bot's BUY_NO bet is on
+# the wrong side of the bracket geometry. n=1 precedent ships exist (HRRR_DISSENT,
+# COLD_SOURCE_OUTLIER both shipped at n=1 with mechanism override).
+#
+# Driver: 5 of 6 May 11-17 fully-stopped BUY_NO catastrophes (-$197 cohort)
+# uncaught by current stack. This gate catches the 2 with NBM-inside-bracket
+# pattern (MIA-MAY12 + MIN-MAY16 = -$58.40 of the $197) and prevents PHIL-MAY18
+# (open today, NBM=65.6 cap=66 → in [65, 66]) from following the same path.
+BUY_NO_NBM_IN_BRACKET_ENABLED = True
+BUY_NO_NBM_IN_BRACKET_MARGIN_F = 1.0  # NBM in [cap - margin, cap] triggers
+                                      # set ENABLED=False to disable
+
+# 2026-05-17 PM: BUY_NO_HIGH_MP_TRAP — BUY_NO gate (all brackets). Block when
+# bot's model_prob > MP_MAX. Calibration audit shows bot's mp is UNDERESTIMATED
+# at the high end: mp 25-30% bucket actually loses 67% (n=3), mp 20-25% loses
+# 30% (n=10), mp 15-20% loses only 12% (n=17 — the calibration sweet spot).
+#
+# Backtest (stack-aware, full pool):
+#   mp > 0.24: n=5 unique, W=2 L=3, lift +$101, LOO-1 +$49, h:hu 3:2 PERFECT.
+#   Catches SEA-MAY11 (-$52 STOP), MIA-MAY12 (-$43 STOP), DC-MAY17 (-$24 STOP)
+#   = 3 of the recent fully-stopped catastrophes. Blocks BOS-MAY16 +$4.50 and
+#   SFO-MAY12 +$13.27 wins.
+#
+# Mechanism: When bot mp > 24% on a BUY_NO, the bot is essentially taking a
+# coin-flip-ish bet on a position with asymmetric reward (NO at $0.55-0.65 →
+# win pays 35-45c, lose costs 55-65c). At true mp=67% (per calibration), the
+# EV is decisively negative. The bot's "edge" reading at high mp is the
+# classic obs-rule trap: market is right, our model is wrong — when bot
+# disagrees with market by 25+pp on a high-conviction position, market knows
+# something. See feedback_market_right_obs_wrong / RULE #2.
+#
+# Sub-bar on n (n=5 vs playbook n>=20) — small sample but internally consistent
+# (LOO-1 robust + calibration table provides independent mechanistic evidence).
+# h:hu 3:2 dollar-weighted is even stronger (6.7:1 by $).
+BUY_NO_HIGH_MP_TRAP_ENABLED = True
+BUY_NO_HIGH_MP_TRAP_MP_MAX  = 0.24   # block BUY_NO when model_prob > this
+                                     # set ENABLED=False to disable
+
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3695,6 +3749,66 @@ def _check_high_conviction_disag_trap(opp: dict) -> Optional[str]:
             f"{HIGH_CONVICTION_DISAG_TRAP_DISAG_F:.1f}°F")
 
 
+# ─── BUY_NO_NBM_IN_BRACKET gate (d-1+ BUY_NO B-bracket only) ──────────────
+def _check_nbm_in_bracket(opp: dict) -> Optional[str]:
+    """Block d-1+ BUY_NO B-bracket when NBM-OM lies INSIDE the upper edge of
+    the YES bracket (NBM ∈ [cap - margin, cap]) AND HRRR is below cap.
+    NBM is the bias-corrected slow-model consensus; when it sits right at
+    the upper bracket boundary, a small forecast error pushes cli into the
+    bracket = BUY_NO loses. HRRR<cap confirms cold direction. Bypassed by
+    caller when _obs_confirmed_alive. See BUY_NO_NBM_IN_BRACKET_* constants
+    for backtest evidence + 2026-05-17 ship rationale."""
+    if not BUY_NO_NBM_IN_BRACKET_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    floor = opp.get("floor")
+    cap = opp.get("cap")
+    if floor is None or cap is None:
+        return None  # B-bracket only
+    if opp.get("is_today", False):
+        return None  # d-1+ only (d-0 has running_min)
+    nbm_v = opp.get("mu_nbm_om")
+    hrrr_v = opp.get("mu_hrrr")
+    if nbm_v is None or hrrr_v is None:
+        return None
+    cap_f = float(cap)
+    nbm = float(nbm_v); hrrr = float(hrrr_v)
+    lo = cap_f - float(BUY_NO_NBM_IN_BRACKET_MARGIN_F)
+    if not (lo <= nbm <= cap_f):
+        return None
+    if hrrr >= cap_f:
+        return None
+    return (f"BUY_NO_NBM_IN_BRACKET: NBM-OM={nbm:.1f} in "
+            f"[{lo:.1f}, {cap_f:.1f}] (slow-model consensus inside upper "
+            f"edge of YES bracket) AND HRRR={hrrr:.1f}<cap={cap_f:.1f}")
+
+
+# ─── BUY_NO_HIGH_MP_TRAP gate (BUY_NO any bracket, all days_out) ──────────
+def _check_high_mp_trap(opp: dict) -> Optional[str]:
+    """Block BUY_NO when model_prob > BUY_NO_HIGH_MP_TRAP_MP_MAX. Calibration
+    audit shows the bot's mp is underestimated at the high end (mp 25-30%
+    bucket actually loses 67% vs bot's expected 25-30%; mp 20-25% loses
+    30%; sweet spot is mp 15-20% with 12% loss rate). At high bot-mp, the
+    "edge" reading is the classic obs-rule trap: market is right, our
+    model is wrong. Bypassed by caller when _obs_confirmed_alive. See
+    BUY_NO_HIGH_MP_TRAP_* constants for backtest evidence + 2026-05-17 ship
+    rationale."""
+    if not BUY_NO_HIGH_MP_TRAP_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    mp_v = opp.get("model_prob")
+    if mp_v is None:
+        return None
+    mp = float(mp_v)
+    if mp <= float(BUY_NO_HIGH_MP_TRAP_MP_MAX):
+        return None
+    return (f"BUY_NO_HIGH_MP_TRAP: mp={mp:.3f} > "
+            f"{BUY_NO_HIGH_MP_TRAP_MP_MAX:.3f} (high bot-mp on BUY_NO = "
+            f"calibration trap, market likely right per RULE #2)")
+
+
 # ─── SKIP_MODEL_MARKET_DISAGREE gate (V2 port, both sides) ────────────────
 def _check_model_market_disagree(opp: dict) -> Optional[str]:
     """Block when model and market disagree by GAP_MIN with model assigning at
@@ -5007,6 +5121,12 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     hrrr_dissent_block = _check_hrrr_dissent(opp)
     if hrrr_dissent_block:
         return ("HRRR_DISSENT", hrrr_dissent_block)
+    nbm_bracket_block = _check_nbm_in_bracket(opp)
+    if nbm_bracket_block:
+        return ("BUY_NO_NBM_IN_BRACKET", nbm_bracket_block)
+    high_mp_block = _check_high_mp_trap(opp)
+    if high_mp_block:
+        return ("BUY_NO_HIGH_MP_TRAP", high_mp_block)
     hcdt_block = _check_high_conviction_disag_trap(opp)
     if hcdt_block:
         return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
@@ -5478,6 +5598,27 @@ def execute_opportunity(opp: dict) -> bool:
         if hrrr_dissent_block:
             _audit_skip(opp, "HRRR_DISSENT",
                 f"  skip {ticker}: {hrrr_dissent_block}")
+            return False
+        # BUY_NO_NBM_IN_BRACKET gate (2026-05-17 PM). d-1+ BUY_NO B-bracket
+        # when NBM-OM lies inside upper 1°F of YES bracket AND HRRR<cap.
+        # Backtest stack-aware n=3, h:hu 2:1 ✓, lift +$46.50. Catches MIA-MAY12
+        # + MIN-MAY16 + (today's PHIL-MAY18 going forward). See
+        # BUY_NO_NBM_IN_BRACKET_* constants for backtest + ship rationale.
+        nbm_bracket_block = _check_nbm_in_bracket(opp)
+        if nbm_bracket_block:
+            _audit_skip(opp, "BUY_NO_NBM_IN_BRACKET",
+                f"  skip {ticker}: {nbm_bracket_block}")
+            return False
+        # BUY_NO_HIGH_MP_TRAP gate (2026-05-17 PM). BUY_NO any bracket when
+        # bot's model_prob > 0.24. Calibration audit: mp 25-30% bucket loses
+        # 67% (vs bot's expected 25-30%). Stack-aware n=5, h:hu 3:2 ✓, lift
+        # +$101, LOO-1 +$49. Catches SEA-MAY11 + MIA-MAY12 + DC-MAY17 of
+        # recent fully-stopped catastrophes. See BUY_NO_HIGH_MP_TRAP_*
+        # constants for backtest + calibration table.
+        high_mp_block = _check_high_mp_trap(opp)
+        if high_mp_block:
+            _audit_skip(opp, "BUY_NO_HIGH_MP_TRAP",
+                f"  skip {ticker}: {high_mp_block}")
             return False
         # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
         # for the max-Kelly-trap pattern where low mp meets active NWP source

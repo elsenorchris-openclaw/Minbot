@@ -3,6 +3,119 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-17 PM — Bleed-fix bundle: `BUY_NO_NBM_IN_BRACKET` + `BUY_NO_HIGH_MP_TRAP` + MAX_BET rollback
+
+Driven by a 6-day bleed ($-172 May 11-17) that surfaced once stop-loss exits were
+included alongside settlements. True realized lifetime P/L was $+232 (not $+438) —
+$-206 in stop-loss exits since May 11, with 8 of 8 fully-stopped tickers (no settlement)
+all losses totaling $-198.
+
+### Root cause discovery
+
+The 8 fully-stopped catastrophes all hit `MARKET_STOP` (bid ≤ 1¢) — selling NO contracts
+for 1¢ that were bought at 50-66¢. Stop-loss isn't the cause; it's the symptom of bad
+entries the model can't recover from.
+
+Filter dig (stack-aware against current shipped filters: HRRR_DISSENT, COLD_SOURCE_OUTLIER,
+HCDT, BUY_NO_LOW_BRACKET_TRAP) found two gates with positive h:hu by count that catch
+unique recent catastrophes plus today's open positions:
+
+### Constants
+
+```python
+# Catches d-1+ BUY_NO B-bracket when NBM-OM (bias-corrected slow-model consensus)
+# lies inside upper 1°F of YES bracket AND HRRR<cap. NBM in [cap-1, cap] means
+# climatological average predicts cli at upper bracket edge — small forecast errors
+# push cli into bracket = BUY_NO loses.
+BUY_NO_NBM_IN_BRACKET_ENABLED = True
+BUY_NO_NBM_IN_BRACKET_MARGIN_F = 1.0
+
+# Catches BUY_NO when bot's model_prob > 0.24. Calibration audit shows mp 25-30%
+# bucket actually loses 67% (n=3) vs bot's expected 25-30%. Sweet spot is mp 15-20%
+# (88% wr). High-mp BUY_NO = classic obs-rule trap: market is right, model is wrong.
+BUY_NO_HIGH_MP_TRAP_ENABLED = True
+BUY_NO_HIGH_MP_TRAP_MP_MAX  = 0.24
+
+# Position-size rollback (same-day reversal of $25 → $50 bump that contributed
+# to bleed amplification).
+MAX_BET_USD = 25.00
+```
+
+### Backtest (stack-aware, full pool n=63 BUY_NO d-1+ since 2026-04-25)
+
+`BUY_NO_NBM_IN_BRACKET` (J1 in dig notes):
+
+| Metric | Value |
+|---|---|
+| n unique catches | 3 |
+| W:L | 1:2 |
+| **h:hu count** | **2:1 ✓** |
+| Lift | +$46.50 |
+| LOO-1 | +$3.46 |
+| Catches | MIA-MAY12 -$43.04 STOP, MIN-MAY16 -$15.36 STOP, MIN-MAY13 +$11.90 win |
+| Today | PHIL-MAY18-B65.5 (NBM=65.6, cap=66 → in [65, 66]) |
+
+`BUY_NO_HIGH_MP_TRAP` (mp > 0.24):
+
+| Metric | Value |
+|---|---|
+| n unique catches | 5 |
+| W:L | 2:3 |
+| **h:hu count** | **3:2 ✓** |
+| **h:hu $-weighted** | **6.7:1** |
+| Lift | +$101.33 |
+| LOO-1 | +$49.43 |
+| Catches | SEA-MAY11 -$51.90 STOP, MIA-MAY12 -$43.04 STOP, DC-MAY17 -$24.16 STOP, BOS +$4.50, SFO +$13.27 |
+
+Calibration table (BUY_NO B-bracket, full pool):
+
+| Bot's mp | n | Actual loss rate | Calibration |
+|---|---|---|---|
+| < 5% | 2 | 0% | ✓ accurate |
+| 5-10% | 9 | 33% | under |
+| 10-15% | 13 | 46% | under |
+| **15-20%** | **17** | **12%** | **✓ sweet spot** |
+| 20-25% | 10 | 30% | accurate |
+| **25-30%** | **3** | **67%** | **way under** |
+
+### Combined impact (stack-aware)
+
+Together the 2 gates catch 4 of 5 recent fully-stopped catastrophes (MIA-MAY12, SEA-MAY11,
+DC-MAY17, MIN-MAY16) plus PHIL-MAY18 going forward. The 5th (DAL-MAY14) is uncaught by
+any filter with positive h:hu — sits in a genuinely mixed cohort.
+
+### Sub-bar caveats
+
+Both gates fail the playbook n≥20 bar:
+- NBM_IN_BRACKET: n=3, LOO-1 +$3 (barely positive)
+- HIGH_MP_TRAP: n=5, LOO-1 +$49 (strong)
+
+Shipped on count h:hu pass + mechanism + driver-urgency (6-day bleed, 3 underwater
+positions open today). Precedent: HRRR_DISSENT (commit `68d83d6`) and COLD_SOURCE_OUTLIER
+(commit `2410f33`) both shipped at n=1 with same sub-bar override.
+
+### Wiring
+
+`_check_nbm_in_bracket` (line ~3752) and `_check_high_mp_trap` (line ~3787) added with
+`opp.get(...)`-style accessors; both wired into `_evaluate_gates` (line ~5124) and
+`_audit_skip` (line ~5602) after HRRR_DISSENT, before HCDT. `_obs_confirmed_alive`
+bypass preserved upstream as with other BUY_NO gates.
+
+### Backups + tests
+
+- `paper_min_bot.py.bak.pre_nbm_mp_maxbet_20260518_003457`
+- `tests/test_nbm_bracket_and_high_mp_20260517.py` (25 new tests: trigger cases,
+  thresholds, boundary, disabled state, BUY_YES/T-bracket non-fire, MAX_BET rollback)
+
+Full suite: **778 passed / 44 skipped** (no regressions; +25 new vs prior 753/44-skip).
+
+Verified post-restart 2026-05-18 00:37 UTC PID 3503529 single+current:
+```
+[00:37:05]   caps: max_bet=$25.00 per_cycle=3 daily_exposure=$10000.00 min_edge=20%
+```
+
+---
+
 ## 2026-05-17 — settlement dedup guard (`_settled_tickers` set)
 
 Fixes a duplicate-settlement bug where `_reconcile_kalshi_positions` would re-add positions we'd already settled (because Kalshi's batch settlement lagged ours), and the next `check_settlements` cycle would then re-settle them, writing a second settlement record. Over 22 days the bot accumulated 6 duplicate records across 5 tickers, inflating reported PnL by $-101.34 (loss-side dupes counted twice → reported $+336.67 vs actual $+438.01).
