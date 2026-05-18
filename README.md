@@ -3,6 +3,49 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-18 PM — `BUY_NO_TAIL_RISK` gate (mu-near-cap)
+
+Driven by today's open-position MTM check: 8 losers totaling $-74 unrealized,
+with 4 BUY_NO B-bracket entries showing the same structural pattern of `mu`
+sitting just barely above `cap` (gap 0.4 to 1.5°F). Today's caught cohort:
+PHIL ($-22.32, gap 1.0), LV ($-8.68, gap 0.9), PHX ($-3.40, gap 0.4),
+MIN ($-2.58, gap 1.5). Misses CHI (gap 2.9), SFO (HRRR-src), SATX (T-bracket).
+
+### Constant
+
+```python
+# Block BUY_NO B-bracket when 0 < mu - cap < 2.0. Forecast sits right at upper
+# bracket boundary so any small error puts cli inside [floor, cap] and BUY_NO
+# loses. Coin-flip-ish bracket geometry — production sigma is typically 2-5°F,
+# making a sub-2°F gap well within the noise floor.
+BUY_NO_TAIL_RISK_ENABLED  = True
+BUY_NO_TAIL_RISK_MU_GAP_F = 2.0
+```
+
+### Backtest (May 4-18 BUY_NO settled, stack-aware net of all prior gates)
+
+- n=12 unique blocks
+- helps:hurts = **7:5 (1.40x positive)**
+- lift **+$87.76**, LOO-1 **+$35.86**
+- losses blocked (7): SEA-MAY11 -$51.90, DAL-MAY14 -$31.64, LAX-MAY08 -$29.27,
+  MIN-MAY16 -$15.36, LV-MAY18 -$8.82, PHX-MAY18 -$6.12, DEN-MAY08 -$1.34
+- wins blocked (5): NYC-MAY13 +$33.88, NYC-MAY16 +$15.04, MIN-MAY11 +$5.16,
+  OKC-MAY08 +$1.75, SATX-MAY09 +$0.86
+
+### Bars
+
+| bar | value | pass |
+|---|---|---|
+| n ≥ 20 | 12 | sub-bar |
+| lift ≥ $30 | +$87.76 | ✓ |
+| LOO-1 ≥ $15 | +$35.86 | ✓ |
+| h:hu ≥ 2:1 | 1.4x | sub-bar (positive) |
+| mechanism | coin-flip bracket geometry on small mu-cap gap | ✓ |
+
+Sub-bar on n + h:hu ratio (1.4x not 2.0x) but strictly positive on h:hu count.
+Precedent: NBM_IN_BRACKET shipped at n=3, COLD_SOURCE_OUTLIER + HRRR_DISSENT
+both shipped at n=1 with mechanism override.
+
 ## 2026-05-17 PM — Bleed-fix bundle: `BUY_NO_NBM_IN_BRACKET` + `BUY_NO_HIGH_MP_TRAP` + MAX_BET rollback
 
 Driven by a 6-day bleed ($-172 May 11-17) that surfaced once stop-loss exits were

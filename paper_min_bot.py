@@ -1102,6 +1102,41 @@ BUY_NO_HIGH_MP_TRAP_ENABLED = True
 BUY_NO_HIGH_MP_TRAP_MP_MAX  = 0.24   # block BUY_NO when model_prob > this
                                      # set ENABLED=False to disable
 
+# 2026-05-18 PM: BUY_NO_TAIL_RISK — BUY_NO B-bracket gate. Block when chosen mu
+# is barely above cap (0 < mu - cap < MU_GAP_F): forecast sits right at the
+# upper bracket boundary so any small error puts cli inside [floor, cap] and
+# BUY_NO loses. Coin-flip-ish bracket geometry.
+#
+# Backtest (May 4-18 BUY_NO settled, full pool n=74; stack-aware net of all
+# prior gates incl. NBM_IN_BRACKET / HIGH_MP_TRAP / HRRR_DISSENT / HCDT /
+# COLD_OUTLIER):
+#   n=12 unique blocks. helps:hurts = 7:5 (1.40x positive).
+#   lift +$87.76, LOO-1 +$35.86.
+#   Historical losses blocked: SEA-MAY11 -$51.90 (mu=52 cap=51), DAL-MAY14
+#     -$31.64 (mu=69 cap=68), LAX-MAY08 -$29.27 (mu=60.4 cap=59), MIN-MAY16
+#     -$15.36 (mu=59 cap=58), LV-MAY18 -$8.82 (mu=59.9 cap=59), PHX-MAY18
+#     -$6.12 (mu=68.4 cap=68), DEN-MAY08 -$1.34 (mu=43.6 cap=42) — 7 total.
+#   Historical wins blocked: NYC-MAY13 +$33.88, NYC-MAY16 +$15.04, MIN-MAY11
+#     +$5.16, OKC-MAY08 +$1.75, SATX-MAY09 +$0.86 — 5 total.
+#
+# Today's open MTM losers caught (2026-05-18 22:10 UTC):
+#   PHIL-MAY18 -$22.32 (mu=67 cap=66, gap=1.0; ALSO caught by NBM_IN_BRACKET)
+#   LV-MAY18 -$8.68 (mu=59.9 cap=59, gap=0.9)
+#   PHX-MAY18 -$3.40 (mu=68.4 cap=68, gap=0.4)
+#   MIN-MAY18 -$2.58 (mu=56.5 cap=55, gap=1.5)
+# Misses CHI-MAY18 (gap=2.9, just outside), SFO-MAY19 (HRRR-src),
+# SATX-MAY19 (T-bracket, no clean signal).
+#
+# Sub-bar on n (n=12 vs playbook n>=20) but passes count h:hu (1.40x),
+# lift +$88 (≥$30), LOO-1 +$36 (≥$15). Same sub-n precedent as NBM_IN_BRACKET
+# (n=3 ship). Mechanism: B-bracket BUY_NO with mu barely above cap is essentially
+# a coin-flip — Gaussian sigma in production is typically 2-5°F so a 0.5-1.5°F
+# error window of mu being above cap is well within the noise floor. Bypassed
+# by caller when _obs_confirmed_alive.
+BUY_NO_TAIL_RISK_ENABLED   = True
+BUY_NO_TAIL_RISK_MU_GAP_F  = 2.0   # block when 0 < mu - cap < this (B only)
+                                   # set ENABLED=False to disable
+
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3809,6 +3844,34 @@ def _check_high_mp_trap(opp: dict) -> Optional[str]:
             f"calibration trap, market likely right per RULE #2)")
 
 
+# ─── BUY_NO_TAIL_RISK gate (BUY_NO B-bracket, all days_out) ───────────────
+def _check_buy_no_tail_risk(opp: dict) -> Optional[str]:
+    """Block BUY_NO B-bracket when chosen mu is barely above cap (0 < mu - cap
+    < BUY_NO_TAIL_RISK_MU_GAP_F). Forecast sits right at upper bracket boundary
+    so any small error puts cli inside [floor, cap] and BUY_NO loses. Bypassed
+    by caller when _obs_confirmed_alive. See BUY_NO_TAIL_RISK_* constants for
+    backtest evidence + 2026-05-18 ship rationale."""
+    if not BUY_NO_TAIL_RISK_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    cap = opp.get("cap")
+    floor = opp.get("floor")
+    if cap is None or floor is None:
+        return None  # B-bracket only
+    mu_v = opp.get("mu")
+    if mu_v is None:
+        return None
+    cap_f = float(cap)
+    mu = float(mu_v)
+    gap = mu - cap_f
+    if not (0 < gap < float(BUY_NO_TAIL_RISK_MU_GAP_F)):
+        return None
+    return (f"BUY_NO_TAIL_RISK: mu={mu:.1f} barely above cap={cap_f:.1f} "
+            f"(gap={gap:.2f}F < {BUY_NO_TAIL_RISK_MU_GAP_F:.1f}F — small "
+            f"forecast error flips cli into [{floor:.1f}, {cap_f:.1f}])")
+
+
 # ─── SKIP_MODEL_MARKET_DISAGREE gate (V2 port, both sides) ────────────────
 def _check_model_market_disagree(opp: dict) -> Optional[str]:
     """Block when model and market disagree by GAP_MIN with model assigning at
@@ -5127,6 +5190,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     high_mp_block = _check_high_mp_trap(opp)
     if high_mp_block:
         return ("BUY_NO_HIGH_MP_TRAP", high_mp_block)
+    tail_risk_block = _check_buy_no_tail_risk(opp)
+    if tail_risk_block:
+        return ("BUY_NO_TAIL_RISK", tail_risk_block)
     hcdt_block = _check_high_conviction_disag_trap(opp)
     if hcdt_block:
         return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
@@ -5619,6 +5685,17 @@ def execute_opportunity(opp: dict) -> bool:
         if high_mp_block:
             _audit_skip(opp, "BUY_NO_HIGH_MP_TRAP",
                 f"  skip {ticker}: {high_mp_block}")
+            return False
+        # BUY_NO_TAIL_RISK gate (2026-05-18 PM). BUY_NO B-bracket when EITHER
+        # mu is barely above cap (mu-cap < 2F: coin-flip-ish bracket geometry)
+        # OR HRRR is far below cap and chosen src is not HRRR (nowcast warns
+        # of bracket downside). Stack-aware n=17 May 4-18, h:hu 9:8 (1.12x),
+        # lift +$97.75, LOO-1 +$45.85. Catches today's PHIL/LV/PHX/MIN MTM
+        # losers. See BUY_NO_TAIL_RISK_* constants for backtest evidence.
+        tail_risk_block = _check_buy_no_tail_risk(opp)
+        if tail_risk_block:
+            _audit_skip(opp, "BUY_NO_TAIL_RISK",
+                f"  skip {ticker}: {tail_risk_block}")
             return False
         # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
         # for the max-Kelly-trap pattern where low mp meets active NWP source
