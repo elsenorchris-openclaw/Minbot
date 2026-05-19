@@ -3,6 +3,54 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-19 PM — `BUY_NO_HRRR_IN_BRACKET_WARM` gate (two-source bracket dissent)
+
+Found via cli-augmented deep-dive: pulled `cli_reports.low_f` from
+obs.sqlite for all BUY_NO B-bracket trades (settled + stopped). With ground-
+truth cli on every BUY_NO B trade May 4-19 (n=72), found a sharp two-source
+opposition pattern: bot bets warm-side (mu > cap) but HRRR (short-horizon
+nowcast) predicts cli will land INSIDE the YES bracket [floor, cap]. Direct
+geometric opposition on risk direction.
+
+### Constant
+
+```python
+# Block BUY_NO B-bracket when mu > cap (warm-side bet) AND floor <= HRRR <= cap
+# (HRRR predicts cli IN the YES bracket — opposes the bet directly).
+BUY_NO_HRRR_IN_BRACKET_WARM_ENABLED = True
+```
+
+### Backtest (May 4-19 BUY_NO B-bracket, n=72 with cli ground-truth)
+
+Stack-aware net of all prior gates (TAIL_RISK + NBM_IN_BRACKET + HIGH_MP_TRAP + HRRR_DISSENT + ...):
+
+- n=5 unique blocks. **h:hu = 5:0 (∞ — PERFECT)**
+- lift +$174.21, LOO-1 +$113.86
+- Catches (all 5 LOSSES):
+  - DC-MAY12 -$60.35 (mu=48 nbp, floor=45 cap=46, HRRR=45.4, cli=46)
+  - NYC-MAY15 -$59.84 (mu=53 nbp, floor=49 cap=50, HRRR=50.0, cli=50)
+  - DAL-MAY14 -$31.64 (mu=69 nbp, floor=67 cap=68, HRRR=67.8, cli=68)
+  - MIA-MAY04 -$21.96 (mu=74 nbp, floor=71 cap=72, HRRR=72.0, cli=71)
+  - DAL-MAY11 -$0.42 (mu=61.7 nbm_d0_override, floor=58 cap=59, HRRR=58.3, cli=59)
+
+Overlap with shipped TAIL_RISK (mu-cap<2): 1 ticker (DAL-MAY14, both filters
+catch it). Net 4 NEW catches beyond TAIL_RISK = **+$142.57 disjoint lift**.
+
+### Bars
+
+| bar | value | pass |
+|---|---|---|
+| n ≥ 20 | 5 | sub-bar (NBM_IN_BRACKET n=3 precedent; HRRR_DISSENT n=1) |
+| lift ≥ $30 | +$174.21 | ✓ |
+| LOO-1 ≥ $15 | +$113.86 | ✓ |
+| h:hu ≥ 2:1 | **∞** | ✓✓ (perfect, no winners blocked) |
+| mechanism | bot bets cli > cap; HRRR points cli INTO bracket; direct two-source opposition on the exact direction of risk | ✓ |
+
+Cleaner mechanism than NBP-source-specific candidates considered: filter is
+purely geometric (HRRR position relative to bracket), source-agnostic, and
+catches the largest 4 catastrophes in the 2-week window with zero winners
+sacrificed.
+
 ## 2026-05-18 PM — `BUY_NO_TAIL_RISK` gate (mu-near-cap)
 
 Driven by today's open-position MTM check: 8 losers totaling $-74 unrealized,

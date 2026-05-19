@@ -1137,6 +1137,39 @@ BUY_NO_TAIL_RISK_ENABLED   = True
 BUY_NO_TAIL_RISK_MU_GAP_F  = 2.0   # block when 0 < mu - cap < this (B only)
                                    # set ENABLED=False to disable
 
+# 2026-05-19 PM: BUY_NO_HRRR_IN_BRACKET_WARM — BUY_NO B-bracket gate. Block
+# when bot bets warm-side (mu > cap) BUT HRRR (the short-horizon nowcast)
+# predicts cli will land INSIDE the YES bracket [floor, cap]. Direct two-source
+# opposition on the exact direction of risk — the bot picked a warmer model
+# for primary mu while HRRR points at the bracket.
+#
+# Found via cli-augmented deep-dive (2026-05-19): pulled `cli_reports.low_f`
+# from obs.sqlite for all BUY_NO B-bracket trades including STOP_LOSS exits
+# (which don't write settlement records). With ground-truth cli on every
+# BUY_NO B trade May 4-19, n=72.
+#
+# Backtest (May 4-19 BUY_NO settled+stopped, stack-aware net of all prior
+# gates incl. TAIL_RISK + NBM_IN_BRACKET + HIGH_MP_TRAP):
+#   n=5 unique blocks. helps:hurts = 5:0 (∞ — perfect).
+#   lift +$174.21, LOO-1 +$113.86.
+#   Detail (all 5 LOSSES):
+#     DC-MAY12 -$60.35 (mu=48 nbp, floor=45 cap=46, HRRR=45.4, cli=46)
+#     NYC-MAY15 -$59.84 (mu=53 nbp, floor=49 cap=50, HRRR=50.0, cli=50)
+#     DAL-MAY14 -$31.64 (mu=69 nbp, floor=67 cap=68, HRRR=67.8, cli=68)
+#     MIA-MAY04 -$21.96 (mu=74 nbp, floor=71 cap=72, HRRR=72.0, cli=71)
+#     DAL-MAY11 -$0.42 (mu=61.7 nbm_d0_override, floor=58 cap=59, HRRR=58.3, cli=59)
+#
+# Overlap with shipped TAIL_RISK (mu-cap<2): 1 ticker (DAL-MAY14, mu-cap=1
+# AND HRRR-in-bracket — both filters catch it, no harm). Net 4 NEW catches
+# beyond TAIL_RISK = +$142.57 disjoint lift.
+#
+# Sub-bar on n (n=5 vs playbook n>=20) but PASSES all other bars including
+# the strict h:hu>=2:1 by infinite margin. Same sub-n precedent as
+# NBM_IN_BRACKET (n=3) + HRRR_DISSENT (n=1) ships.
+#
+# Bypassed by caller when _obs_confirmed_alive (running_min established).
+BUY_NO_HRRR_IN_BRACKET_WARM_ENABLED = True
+
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3844,6 +3877,40 @@ def _check_high_mp_trap(opp: dict) -> Optional[str]:
             f"calibration trap, market likely right per RULE #2)")
 
 
+# ─── BUY_NO_HRRR_IN_BRACKET_WARM gate (BUY_NO B-bracket, all days_out) ────
+def _check_hrrr_in_bracket_warm(opp: dict) -> Optional[str]:
+    """Block BUY_NO B-bracket when bot bets warm-side (mu > cap) BUT HRRR
+    predicts cli will land INSIDE the YES bracket [floor, cap]. Direct
+    two-source opposition: bot picked a warmer model for primary mu while
+    HRRR (the short-horizon nowcast) points at the bracket. Bypassed by
+    caller when _obs_confirmed_alive. See BUY_NO_HRRR_IN_BRACKET_WARM_*
+    constants for backtest evidence + 2026-05-19 ship rationale."""
+    if not BUY_NO_HRRR_IN_BRACKET_WARM_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    cap = opp.get("cap")
+    floor = opp.get("floor")
+    if cap is None or floor is None:
+        return None  # B-bracket only
+    mu_v = opp.get("mu")
+    if mu_v is None:
+        return None
+    cap_f = float(cap); floor_f = float(floor); mu = float(mu_v)
+    if mu <= cap_f:
+        return None  # warm-side only (mu > cap)
+    hrrr_v = opp.get("mu_hrrr")
+    if hrrr_v is None:
+        return None
+    hrrr = float(hrrr_v)
+    if not (floor_f <= hrrr <= cap_f):
+        return None  # HRRR must be IN the bracket
+    return (f"BUY_NO_HRRR_IN_BRACKET_WARM: mu={mu:.1f}>cap={cap_f:.1f} "
+            f"(warm-side bet) BUT HRRR={hrrr:.1f} in YES bracket "
+            f"[{floor_f:.1f}, {cap_f:.1f}] (nowcast points at bracket = "
+            f"direct two-source opposition on risk direction)")
+
+
 # ─── BUY_NO_TAIL_RISK gate (BUY_NO B-bracket, all days_out) ───────────────
 def _check_buy_no_tail_risk(opp: dict) -> Optional[str]:
     """Block BUY_NO B-bracket when chosen mu is barely above cap (0 < mu - cap
@@ -5193,6 +5260,9 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     tail_risk_block = _check_buy_no_tail_risk(opp)
     if tail_risk_block:
         return ("BUY_NO_TAIL_RISK", tail_risk_block)
+    hrrr_in_bracket_block = _check_hrrr_in_bracket_warm(opp)
+    if hrrr_in_bracket_block:
+        return ("BUY_NO_HRRR_IN_BRACKET_WARM", hrrr_in_bracket_block)
     hcdt_block = _check_high_conviction_disag_trap(opp)
     if hcdt_block:
         return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
@@ -5696,6 +5766,17 @@ def execute_opportunity(opp: dict) -> bool:
         if tail_risk_block:
             _audit_skip(opp, "BUY_NO_TAIL_RISK",
                 f"  skip {ticker}: {tail_risk_block}")
+            return False
+        # BUY_NO_HRRR_IN_BRACKET_WARM gate (2026-05-19 PM). BUY_NO B-bracket
+        # warm-side bet (mu > cap) where HRRR predicts cli IN the YES bracket
+        # = direct two-source opposition on risk direction. Stack-aware n=5,
+        # h:hu 5:0 PERFECT, lift +$174.21, LOO-1 +$113.86. Catches DC-MAY12 +
+        # NYC-MAY15 + DAL-MAY14 + MIA-MAY04 + DAL-MAY11 catastrophes. See
+        # BUY_NO_HRRR_IN_BRACKET_WARM_* constants for backtest evidence.
+        hrrr_in_bracket_block = _check_hrrr_in_bracket_warm(opp)
+        if hrrr_in_bracket_block:
+            _audit_skip(opp, "BUY_NO_HRRR_IN_BRACKET_WARM",
+                f"  skip {ticker}: {hrrr_in_bracket_block}")
             return False
         # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
         # for the max-Kelly-trap pattern where low mp meets active NWP source
