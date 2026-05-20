@@ -3,6 +3,22 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-20 — `MAX_BET_USD` $25 → $50 (reversal of 5/17 rollback)
+
+Position-size cap raised back to $50 per Chris after 5/19 closed net **+$49.16**
+on settled markets (4 winners + 1 SFO loser) under the post-`BUY_NO_TAIL_RISK`
+(5/18) + `BUY_NO_HRRR_IN_BRACKET_WARM` (5/19) gate stack. The 5/17 cut to $25
+was a defensive response to a 6-day bleed ($-172 May 11-17); subsequent gates
+have rebuilt confidence enough to handle the larger bet size.
+
+```python
+MAX_BET_USD = 50.00  # was 25.00 since 2026-05-17
+```
+
+`MAX_BET_BUY_YES_USD` unchanged at $1.00. No code besides the constant changed.
+Backup `paper_min_bot.py.bak.pre_maxbet50_20260520_045505`. Restarted via
+`sudo systemctl restart paper-min-bot.service`; new MainPID confirmed single.
+
 ## 2026-05-19 PM — `BUY_NO_HRRR_IN_BRACKET_WARM` gate (two-source bracket dissent)
 
 Found via cli-augmented deep-dive: pulled `cli_reports.low_f` from
@@ -128,7 +144,7 @@ BUY_NO_HIGH_MP_TRAP_ENABLED = True
 BUY_NO_HIGH_MP_TRAP_MP_MAX  = 0.24
 
 # Position-size rollback (same-day reversal of $25 → $50 bump that contributed
-# to bleed amplification).
+# to bleed amplification). REVERSED 2026-05-20 back to $50 — see top-of-file.
 MAX_BET_USD = 25.00
 ```
 

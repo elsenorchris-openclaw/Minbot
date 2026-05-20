@@ -289,7 +289,7 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 25.00                 # 2026-05-17 PM: $50 → $25 per Chris (rollback after 6-day bleed $-172).
+MAX_BET_USD = 50.00                 # 2026-05-20: $25 → $50 per Chris (raise after 5/19 net +$49 settle, post-tail_risk + post-hrrr_in_bracket_warm).
                                     # 2026-05-17: $25 → $50 per Chris (rolled back same day).
                                     # 2026-05-15 PM: $60 → $25 per Chris.
                                     # Risk reduction after the 5/14 -$100.47 cluster (DAL/DC/MIN all losers
