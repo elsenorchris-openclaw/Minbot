@@ -3,6 +3,65 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-20 PM — `BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP` gate (ratio guard)
+
+Block BUY_NO when `yes_ask_c >= K * (model_prob * 100)` with K=8 — i.e. market
+prices YES 8x+ above what bot mp claims. Catches SATX-class outliers where the
+truncated-Gaussian collapses mp to near zero (rm above cap) but the market
+correctly prices YES at 30-50c reading forecast trajectory / cooling regime
+signals the static mu/sigma model cant see.
+
+### Trigger
+
+SATX-26MAY19-T71 BUY_NO entered at no_ask=43c for $24.94. mp=0.7%, yes_ask=46c
+at entry (ratio 65.7x). Position peaked +$11.60 MTM at 9 PM CDT, then late-
+evening cooling drove rm 73.4 -> 66 in last 3 hours of LST day -> bracket
+flipped YES -> full loss -$24.94. Market had been signaling the cooling all
+day; bots truncated model never updated.
+
+### Backtest (n=71 settled BUY_NO with mp+yes_ask, 2026-04-25 to 05-20)
+
+| K | n_skip | losers caught | winners killed | lift |
+|---|---|---|---|---|
+| 10 | 1  | 1 (SATX -$24.94)              | 0           | +$24.94 |
+| **8** | **2**  | **2 (SATX + NYC-MAY12)**  | **0**       | **+$99.51** |
+| 6  | 3  | 2 (above + DAL-MAY10 winner)  | 1 ($6.00)   | +$93.51 |
+| 5  | 6  | 4                             | 2 ($6.50)   | +$182.57 |
+| 4  | 16 | 7                             | 9 (~$159)   | +$57.07 (high churn) |
+
+Picked K=8 as **no-false-positive floor**. Both K=8 catches were the bots
+worst recent losses; mechanism cleanly identifies SATX-class (ratio 65x) +
+NYC-MAY12 (ratio 8.2x) without churning legit BUY_NO trades.
+
+### Constants
+
+```python
+BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_ENABLED = True
+BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_RATIO   = 8.0   # yes_ask_c / (mp*100)
+```
+
+### Stack overlap
+
+Zero overlap with `MODEL_MARKET_DISAGREE` (which requires mp>=0.22, the
+high-mp side). This filter implicitly bounds mp<=0.125 via the ratio at K=8
+(yes_ask<=100). Complementary, no double-blocking.
+
+### Bars
+
+| bar | value | pass |
+|---|---|---|
+| n >= 20 | 2 | sub-bar (SATX has no precedent at this mp regime) |
+| lift >= $30 | +$99.51 | sub-bar |
+| h:hu >= 2:1 | 2:0 (perfect) | INF |
+| mechanism | extreme yes_ask/mp ratio = market sees signal bot misses (truncated Gaussian collapses mp at high rm-cap; market BBO encodes forecast + dealer flow) | clean |
+
+Sub-n bar consistent with `HRRR_DISSENT` (n=1) and `NBM_IN_BRACKET` (n=3)
+precedent ships — mechanism dominates when n is small but h:hu is perfect.
+
+Reversible via `BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_ENABLED = False`. Tests
+in `tests/test_buy_no_extreme_market_disagree_low_mp_20260520.py` (11 new,
+suite 836/44-skip). Backup `paper_min_bot.py.bak.pre_ext_market_disagree_20260520_223149`.
+
 ## 2026-05-20 — `TAKE_PROFIT_15` gate (late-morning take-profit on BUY_NO)
 
 Lock in BUY_NO gains when **MTM/cost ≥ 15% AND local time ≥ 10:30 LST**.

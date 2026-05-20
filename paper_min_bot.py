@@ -1201,6 +1201,30 @@ BUY_NO_TAIL_RISK_MU_GAP_F  = 2.0   # block when 0 < mu - cap < this (B only)
 # Bypassed by caller when _obs_confirmed_alive (running_min established).
 BUY_NO_HRRR_IN_BRACKET_WARM_ENABLED = True
 
+# 2026-05-20 PM: BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP. BUY_NO gate. Block
+# when market priced YES >> bot mp (yes_ask_c >= K * mp_pct, K=8). Catches
+# SATX-style mp~0 outliers where bot truncated-Gaussian collapses P(YES) to
+# ~0 but market reads forecast trajectory / cooling regime / dealer flow
+# correctly. Market BBO encodes signal the static mu/sigma model misses.
+#
+# Backtest n=71 settled BUY_NO with mp+yes_ask (2026-04-25 to 05-20):
+#   K=8:  skip 2 (NYC-26MAY12-B46.5 -74.57 USD + SATX-26MAY19-T71 -24.94 USD),
+#         2L:0W, 0 winners killed, lift +99.51 USD
+#   K=5:  skip 6 (4L:2W; 6.50 USD winners killed), lift +182.57 USD
+#   K=10: skip 1 (SATX only), lift +24.94 USD
+# Picked K=8 as no-false-positive floor; both catches were the bots worst
+# recent losses. Mechanism cleanly captures SATX-class (mp=0.7%, yes_ask=46c,
+# ratio=65x) and NYC-MAY12 (mp=5.5%, yes_ask=45c, ratio=8.2x).
+#
+# Stack overlap with MODEL_MARKET_DISAGREE: zero. That filter requires
+# mp >= 0.22; this filter requires mp <= yes_ask/(K*100), so K=8 implicitly
+# bounds mp <= 0.125 even at yes_ask=100c. Complementary, no double-block.
+#
+# Bypassed by caller when _obs_confirmed_alive (running_min established).
+BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_ENABLED = True
+BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_RATIO   = 8.0   # yes_ask_c / (mp*100)
+
+
 ORDER_FILL_TIMEOUT_SEC = 5.0        # wait this long for fill, then cancel
 # 2026-05-03: laddered ask-chase on first-entry partial fills. After the
 # initial maker order fills < intended count, walk the ask up by 1c each
@@ -3941,6 +3965,36 @@ def _check_hrrr_in_bracket_warm(opp: dict) -> Optional[str]:
             f"[{floor_f:.1f}, {cap_f:.1f}] (nowcast points at bracket = "
             f"direct two-source opposition on risk direction)")
 
+# --- BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP gate (BUY_NO, all bracket kinds) ---
+def _check_extreme_market_disagree_low_mp(opp: dict) -> Optional[str]:
+    """Block BUY_NO when yes_ask_c >= K * (mp * 100). Catches SATX-class
+    outliers where the truncated Gaussian collapses mp to ~0 but the market
+    correctly prices YES at 30-50c via signals (forecast trajectory, frontal
+    passage, dealer flow) the static mu/sigma model misses. Bypassed by
+    caller when _obs_confirmed_alive. See BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_*
+    constants for backtest evidence."""
+    if not BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    mp_v = opp.get("model_prob")
+    ya_v = opp.get("yes_ask")
+    if mp_v is None or ya_v is None:
+        return None
+    mp = float(mp_v)
+    if mp <= 0:
+        return None
+    ya_c = float(ya_v)
+    K = float(BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP_RATIO)
+    threshold_c = K * mp * 100.0
+    if ya_c < threshold_c:
+        return None
+    ratio = ya_c / (mp * 100.0)
+    return (f"BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP: yes_ask={ya_c:.0f}c >= "
+            f"{K:.1f}x mp ({mp*100:.1f}%) = {threshold_c:.1f}c "
+            f"(ratio {ratio:.1f}x - market sees signal bot misses)")
+
+
 
 # ─── BUY_NO_TAIL_RISK gate (BUY_NO B-bracket, all days_out) ───────────────
 def _check_buy_no_tail_risk(opp: dict) -> Optional[str]:
@@ -5294,6 +5348,11 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     hrrr_in_bracket_block = _check_hrrr_in_bracket_warm(opp)
     if hrrr_in_bracket_block:
         return ("BUY_NO_HRRR_IN_BRACKET_WARM", hrrr_in_bracket_block)
+    # BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP gate (2026-05-20 PM). Catches
+    # SATX-class mp~0 outliers where yes_ask >> 8x mp.
+    ext_md_block = _check_extreme_market_disagree_low_mp(opp)
+    if ext_md_block:
+        return ("BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP", ext_md_block)
     hcdt_block = _check_high_conviction_disag_trap(opp)
     if hcdt_block:
         return ("HIGH_CONVICTION_DISAG_TRAP", hcdt_block)
@@ -5808,6 +5867,12 @@ def execute_opportunity(opp: dict) -> bool:
         if hrrr_in_bracket_block:
             _audit_skip(opp, "BUY_NO_HRRR_IN_BRACKET_WARM",
                 f"  skip {ticker}: {hrrr_in_bracket_block}")
+            return False
+        # BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP gate (2026-05-20 PM).
+        ext_md_block = _check_extreme_market_disagree_low_mp(opp)
+        if ext_md_block:
+            _audit_skip(opp, "BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP",
+                f"  skip {ticker}: {ext_md_block}")
             return False
         # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
         # for the max-Kelly-trap pattern where low mp meets active NWP source
