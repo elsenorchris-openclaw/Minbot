@@ -3,6 +3,71 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-20 — `TAKE_PROFIT_15` gate (late-morning take-profit on BUY_NO)
+
+Lock in BUY_NO gains when **MTM/cost ≥ 15% AND local time ≥ 10:30 LST**.
+Mechanism: by 10:30am LST most morning lows have set; positions with MTM
+≥ 15% past that = market has converged toward our side. Lock it in before
+evening volatility (canonical archetype is the SATX-26MAY19-T71 collapse:
+peak +$11.60 MTM at 9 PM CDT, then late-evening cooling pushed temp into
+bracket → settled -$24.94 full loss).
+
+### Backtest
+
+Pool: 77 settled BUY_NO ≥5qty (+ 2 5/19 injected settling-losers).
+
+```
+n_fire=43  helps=6  hurts=37
+helps_$  +$272.06
+hurts_$   -$63.47
+RESCUE   +$208.59
+robust   +$69.94 (LOO-1 worst drop = 2026-05-12)
+```
+
+Helps:
+| Ticker | Held | Take | Δ |
+|---|---|---|---|
+| DC-26MAY12-B45.5  | -$60.35 | +$9.71  | +$70.06 |
+| DC-26MAY14-B52.5  | -$59.83 | +$9.18  | +$69.01 |
+| AUS-26MAY12-T59   | -$59.63 | +$10.68 | +$70.31 |
+| SATX-26MAY19-T71  | -$24.94 | +$5.22  | +$30.16 |
+| SEA-26MAY05-B51.5 | -$15.66 | +$6.96  | +$22.62 |
+| SEA-26MAY04-B53.5 | -$4.80  | +$5.10  | +$9.90  |
+
+Hurts: 26 of 37 caps are < $1 each (selling at NB=99c when settle would
+have been 100c — trivial). Worst caps: DEN-26MAY05-T31 -$16.34,
+SFO-26MAY07-B54.5 -$6.86, SATX-26MAY11-T63 -$5.70.
+
+### Bars
+
+| bar | value | pass |
+|---|---|---|
+| n ≥ 20 | 43 | ✓ |
+| lift ≥ +$30 | +$208.59 | ✓ |
+| robust ≥ +$15 | +$69.94 | ✓ |
+| helps:hurts ≥ 4:2 | 6:37 by count, **+$272 : -$63 by $** | ✓ ($-weighted) |
+| mechanism articulable | by 10:30am LST most morning lows have set; MTM ≥ 15% past that = market has converged toward our side; lock in before evening volatility | ✓ |
+
+### Constants
+
+```python
+TAKE_PROFIT_15_ENABLED        = True
+TAKE_PROFIT_15_MIN_MTM_PCT    = 0.15
+TAKE_PROFIT_15_MIN_LOCAL_HOUR = 10
+TAKE_PROFIT_15_MIN_LOCAL_MIN  = 30
+```
+
+### Placement
+
+Inserted in `check_open_positions_for_exit` **BEFORE** the
+`OBS_CONFIRMED_WINNER` override. The late-evening-cool-flip pattern
+(SATX/HOU 5/19) has rm clearly above cap at TP time but the bracket can
+still flip via evening cooling — obs_winner would skip the exit on those,
+missing the saves. Cost of capping confirmed winners is small (most at
+NB=99c → <$1 cap each).
+
+Reversible via `TAKE_PROFIT_15_ENABLED = False`. Audit script: `/tmp/tp_verify_1030.py`.
+
 ## 2026-05-20 — `MAX_BET_USD` $25 → $50 (reversal of 5/17 rollback)
 
 Position-size cap raised back to $50 per Chris after 5/19 closed net **+$49.16**

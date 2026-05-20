@@ -926,6 +926,37 @@ NARROW_MARGIN_TP_MAX_BID_C    = 80       # bid ceiling (avoid extreme-MTM hurter
 NARROW_MARGIN_TP_MIN_MTM      = 0.20     # MTM floor
 NARROW_MARGIN_TP_STATIONS     = frozenset(['KLAX', 'KMDW', 'KMIA', 'KSEA'])
 
+# ─── TAKE_PROFIT_15 — late-morning take-profit on BUY_NO positions ────────
+# 2026-05-20: Lock in BUY_NO gains when MTM ≥ 15% of cost AND local time
+# ≥ 10:30 LST. Mechanism: by 10:30am LST most morning lows have set;
+# positions with MTM ≥ 15% past that = market has converged toward our side.
+# Lock it in before evening volatility (canonical archetype is SATX-
+# 26MAY19-T71: peak +$11.60 MTM at 9 PM CDT, then late-evening cooling
+# pushed temp into bracket → settled -$24.94 full loss).
+#
+# Backtest (n=77 settled BUY_NO ≥5qty pool, +2 injected 5/19 settling-losers):
+#   n_fire=43  helps=6  hurts=37
+#   helps_$ +$272.06  hurts_$ -$63.47
+#   RESCUE +$208.59  /  robust +$69.94 (LOO-1 drop 2026-05-12)
+# Helps: DC-MAY12 +$70 / DC-MAY14 +$69 / AUS-MAY12 +$70 /
+#        SATX-MAY19 +$30 / SEA-MAY04 +$10 / SEA-MAY05 +$23
+# Hurts: 26 of 37 caps are < $1 each (selling at NB=99c when settle is 100c).
+# Worst caps: DEN-MAY05 -$16.34 / SFO-MAY07 -$6.86 / SATX-MAY11 -$5.70.
+# Playbook bars: n>=20 PASS, lift>=+$30 PASS, robust>=+$15 PASS,
+# $-weighted h:hu strong (+$272 : -$63), mechanism articulable.
+#
+# Placed BEFORE obs_confirmed_winner in the exit loop: the late-evening-
+# cool-flip pattern (SATX/HOU 5/19) has rm clearly above cap at TP time
+# but the bracket can still flip via evening cooling — obs_winner would
+# skip the exit on those, missing the saves. Cost of capping confirmed
+# winners is small (most at NB=99c → <$1 cap each).
+# Reversible: TAKE_PROFIT_15_ENABLED = False to disable.
+# Audit script: /tmp/tp_verify_1030.py
+TAKE_PROFIT_15_ENABLED        = True
+TAKE_PROFIT_15_MIN_MTM_PCT    = 0.15     # MTM/cost floor
+TAKE_PROFIT_15_MIN_LOCAL_HOUR = 10       # min local hour (10:30 = past 10:30am LST)
+TAKE_PROFIT_15_MIN_LOCAL_MIN  = 30
+
 # ─── PRICE_ZONE block REMOVED 2026-04-29 ─────────────────────────────────
 # V2 port that blocked BUY_NO when yes_bid ∈ [30c, 40c] (market "uncertain").
 # Removed after all-gate audit on min_bot historical candidates: 2/2
@@ -6421,6 +6452,52 @@ def _check_narrow_margin_tp(pos: dict, rm: Optional[float],
     return mtm >= NARROW_MARGIN_TP_MIN_MTM
 
 
+def _check_take_profit_15(pos: dict, current_bid_c: Optional[int],
+                           now_local: Optional[datetime] = None) -> bool:
+    """TAKE_PROFIT_15 gate: lock in BUY_NO gains when MTM/cost ≥ 15% AND
+    local time ≥ 10:30 LST. See TAKE_PROFIT_15_* constant block for audit.
+
+    Args:
+      pos: open position dict (must have action/count/cost/entry_price/tz)
+      current_bid_c: current bid on sell-side (no_bid for BUY_NO)
+      now_local: tz-aware datetime in the position's local tz; if None,
+                 computed from pos['tz'] (helps testing without freezegun)."""
+    if not TAKE_PROFIT_15_ENABLED:
+        return False
+    if pos.get("action") != "BUY_NO":
+        return False
+    if current_bid_c is None:
+        return False
+    try:
+        bid = int(current_bid_c)
+    except (TypeError, ValueError):
+        return False
+    if bid <= 0:
+        return False
+    try:
+        qty = int(pos.get("count", 0))
+        cost = float(pos.get("cost", 0) or 0)
+    except (TypeError, ValueError):
+        return False
+    if qty <= 0 or cost <= 0:
+        return False
+    mtm_usd = qty * (bid / 100.0) - cost
+    if mtm_usd / cost < TAKE_PROFIT_15_MIN_MTM_PCT:
+        return False
+    if now_local is None:
+        tz_name = pos.get("tz") or pos.get("entry_tz") or "America/New_York"
+        try:
+            now_local = datetime.now(ZoneInfo(tz_name))
+        except Exception:
+            return False
+    h, m = now_local.hour, now_local.minute
+    if h < TAKE_PROFIT_15_MIN_LOCAL_HOUR:
+        return False
+    if h == TAKE_PROFIT_15_MIN_LOCAL_HOUR and m < TAKE_PROFIT_15_MIN_LOCAL_MIN:
+        return False
+    return True
+
+
 def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
                    reason: str) -> bool:
     """Place a SELL order for an existing position at sell_price_c. Polls for
@@ -6610,6 +6687,26 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
             continue
         current_price = current_bid_c / 100.0
         loss_pct = (entry_price - current_price) / entry_price
+
+        # 2026-05-20: TAKE_PROFIT_15 — lock in BUY_NO gains when MTM/cost
+        # ≥ 15% AND local time ≥ 10:30 LST. Placed BEFORE obs_winner override
+        # because late-evening-cool-flip patterns (SATX/HOU 5/19) have rm
+        # clearly above cap at TP time but the bracket can still flip with
+        # evening cooling — obs_winner would block the save. See
+        # TAKE_PROFIT_15_* constant block for audit + rationale.
+        try:
+            if _check_take_profit_15(pos, current_bid_c):
+                _bid = int(current_bid_c)
+                _mtm_pct = ((_bid / 100.0 - entry_price) / entry_price) * 100
+                _realize = (_bid / 100.0 - entry_price) * pos.get("count", 0)
+                log(f"  TAKE_PROFIT_15 trigger {ticker}: bid={_bid}c "
+                    f"entry={entry_price:.2f} mtm_pct={_mtm_pct:+.0f}% "
+                    f"would-realize ${_realize:+.2f}")
+                if _execute_exit(ticker, pos, sell_side, _bid, "take_profit_15"):
+                    n_exits += 1
+                continue
+        except Exception as _tpx:
+            log(f"  TAKE_PROFIT_15 check raised {type(_tpx).__name__}: {_tpx}", "warn")
 
         # OBS_CONFIRMED_WINNER override — never sell a guaranteed winner.
         if rm is not None:
