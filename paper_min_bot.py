@@ -6701,6 +6701,25 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         entry_price = float(pos.get("entry_price", 0))
         if entry_price <= 0:
             continue
+        # 2026-05-24 (Chris): TIME_EXIT_10AM — liquidate ALL open positions at
+        # 10:00 station-local on their OWN climate day. Backtest 5/12-5/23
+        # (n=48 open-at-10am): hold-to-settlement -15.0% ROI vs sell-at-10am-bid
+        # +3.8% (+$223 over the window; better on 8/10 days). Min-bot positions
+        # erode from 10am -> settlement, so cut them. Sells at current bid; if no
+        # bid, falls through to existing logic (holds). The climate-day guard
+        # prevents dumping d-1 positions (entered today for tomorrow) a day early.
+        _tz10 = _STATION_TZ.get(pos.get("station"))
+        if _tz10:
+            _nl10 = datetime.now(ZoneInfo(_tz10))
+            if pos.get("date_str") == _nl10.strftime("%Y-%m-%d") and _nl10.hour >= 10:
+                _ss10 = "yes" if action == "BUY_YES" else ("no" if action == "BUY_NO" else None)
+                _bid10 = mkt.get("yes_bid") if action == "BUY_YES" else mkt.get("no_bid")
+                if _ss10 and _bid10 is not None and _bid10 > 0:
+                    log(f"  TIME_EXIT_10AM {ticker}: local={_nl10:%H:%M} "
+                        f"cd={pos.get('date_str')} sell {_ss10} @ {int(_bid10)}c")
+                    if _execute_exit(ticker, pos, _ss10, int(_bid10), "time_exit_10am"):
+                        n_exits += 1
+                    continue
         # No-obs skip: skip hard-stop entirely when no obs are available
         # for the position's climate day. Covers:
         #   - d-1+ trades (cd hasn't started — Austin entered today for

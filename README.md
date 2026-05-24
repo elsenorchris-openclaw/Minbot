@@ -3,6 +3,22 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-24 — `TIME_EXIT_10AM` (liquidate all open positions at 10:00 local)
+
+At 10:00 station-local on a position's own climate day, sell **every** open
+position at the current bid (reuses `_execute_exit`, reason `time_exit_10am`).
+Generalizes `TAKE_PROFIT_15` (which only sold >=15%-MTM winners at >=10:30) to a
+full liquidation. Placed first in the exit loop so it applies to BUY_NO, BUY_YES,
+and T-high uniformly; if there is no bid it falls through and holds. A climate-day
+guard (`date_str == today-local`) prevents dumping d-1 positions a day early.
+
+**Why:** backtest on telemetry 2026-05-12..05-23 (n=48 positions open at 10am):
+hold-to-settlement **-15.0% ROI** vs sell-at-10am-bid **+3.8%** -- a **+$223**
+swing over the window, better on 8 of 10 days. Min-bot positions erode from 10am
+to settlement (the 10am market still prices held sides ~50-75c on names that
+settle to $0); cutting at 10am banks that value. Cost is giving up upside on the
+minority that would have won. Assumes the 10am bid fills; large positions may slip.
+
 ## 2026-05-20 PM — `BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP` gate (ratio guard)
 
 Block BUY_NO when `yes_ask_c >= K * (model_prob * 100)` with K=8 — i.e. market
