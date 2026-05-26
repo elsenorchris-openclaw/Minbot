@@ -3,6 +3,21 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-26 — BUY_NO sizing → flat $80 (per Chris)
+
+`FLAT_BET_NO_USD` $10 → $80 and `MAX_BET_USD` cap $50 → $80 (commit `aa8adcc`).
+BUY_NO is flat-sized (`FLAT_SIZING_NO_ENABLED=True`), so `FLAT_BET_NO_USD` is the
+real stake; the `MAX_BET_USD` cap is raised to match so the flat stake is not
+clipped (`count = min(count, int(MAX_BET_USD/price))`). v1 wallet, ~$394 bankroll;
+daily exposure cap unchanged ($10k). Live via
+`sudo systemctl restart paper-min-bot.service` (startup log: `caps: max_bet=$80.00`).
+
+Note: the flat-$10 stake (entry below) was a deliberate de-risk (4wk book
+−$250 → ~−$23). $80 is ~8× that backtest basis, so per-bet variance/downside
+scales accordingly — a Chris-directed sizing-up, not a backtested change. Guard
+test `test_max_bet_is_80` updated (commit `cec5539`); BUY_YES unchanged
+(`MAX_BET_BUY_YES_USD`).
+
 ## 2026-05-26 — Gate unification: `execute_opportunity` delegates to `_evaluate_gates`
 
 Eliminated the long-standing duplication where every forecast/market gate was
