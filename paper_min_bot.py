@@ -343,6 +343,18 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
                                     # 96% sub-$1 fills on 2026-04-25/26 (avg $0.45). Capped by
                                     # MAX_BET_USD downstream so the floor can't blow the ceiling.
 
+# ─── Flat sizing for BUY_NO (2026-05-26) ──────────────────────────────────
+# Replace Kelly×bankroll variable sizing with a flat per-trade stake for
+# BUY_NO. Validated 2026-05-26 on the realized (settle∪exit) pool: the
+# model's confidence signals do NOT predict per-contract outcome
+# (corr(edge, per-contract pnl)=+0.02), so varying bet size by them injects
+# pure noise — and that noise landed on losers: corr(bet $, per-contract
+# pnl)=−0.11; big bets (≥$40) 48% WR/−$198 vs small (<$40) 57% WR/−$51.
+# Flat sizing alone took the realized 4wk book −$250 → ~−$23; flat $10 +
+# THIN_MARGIN → +$36. BUY_YES is unaffected (stays at MAX_BET_BUY_YES_USD).
+FLAT_SIZING_NO_ENABLED = True
+FLAT_BET_NO_USD = 10.00
+
 # 2026-05-10: DISABLED. 14d audit (n=16 settled): 5 helps / 11 hurts (31%
 # accuracy, well below random). Net -$93 raw / -$31 adj. Today (May 10)
 # stack-aware re-audit on n=10 fires showed 7 would actually buy if gate
@@ -376,6 +388,21 @@ MIN_ABS_DISTANCE_SIGMA_K = 0.25     # σ-relative tightening on top of the 0.5°
                                     # OKC-B48.5 σ=2.3 dist=0.6 (cli=51 WIN) and HOU-B68.5
                                     # σ=2.8 dist=0.9 (cli=74 WIN). Net lift swing: +$18.79
                                     # vs current. Zero false positives in available sample.
+
+# ─── THIN_MARGIN gate (2026-05-26) ────────────────────────────────────────
+# Skip BUY_NO when the primary forecast μ sits within THIN_MARGIN_MIN_F of
+# the NEAR bracket edge (μ−cap if μ>cap, else floor−μ). Distinct from the
+# disabled ABS_DIST (|μ−bracket_MID|, 0.5°F floor): this measures distance to
+# the EDGE the low must clear, at a wider 2.0°F. Mechanism: a BUY_NO at
+# ~$0.59 needs ~59% WR (breakeven WR == price); μ within ~2°F of the edge is
+# a boundary coin-flip (~51% WR) that loses on the NO payoff asymmetry.
+# Validated 2026-05-26 on the realized (settle∪exit) pool via
+# tools/backtest_filters.py --stack live: lift_inc +$222.6, robust_lift_inc
+# +$153.6, n_blocked 49; net-negative removed in all 3 time folds. (Required
+# the survivorship-bias harness fix to see — the settlements-only pool hid
+# 19 of 28 thin-margin losers behind intraday stop-outs.)
+THIN_MARGIN_GATE_ENABLED = True
+THIN_MARGIN_MIN_F = 2.0
 
 # ─── Per-station σ multiplier (2026-04-29) ────────────────────────────────
 # σ multiplier applied to the bot's pre-mult σ in find_opportunities.
@@ -5319,6 +5346,26 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
                 return ("COASTAL_TIGHT_FLOOR",
                         f"floor-mu gap {_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
                         f"(station={_ctf_station} marine cold-bias)")
+    # THIN_MARGIN (2026-05-26): skip BUY_NO when μ is within THIN_MARGIN_MIN_F
+    # of the NEAR bracket edge (μ−cap if μ>cap, else floor−μ) — a boundary
+    # coin-flip that loses on the NO payoff asymmetry (breakeven WR == price).
+    # Distinct from the disabled ABS_DIST (|μ−mid|, 0.5°F). Placed after
+    # COASTAL_TIGHT_FLOOR so that gate keeps its specific reason when enabled.
+    if THIN_MARGIN_GATE_ENABLED and action == "BUY_NO":
+        _tm_mu = opp.get("mu")
+        _tm_fl = opp.get("floor")
+        _tm_cp = opp.get("cap")
+        if _tm_mu is not None:
+            _tm_mu = float(_tm_mu)
+            _tm_margin = None
+            if _tm_cp is not None and _tm_mu > float(_tm_cp):
+                _tm_margin = _tm_mu - float(_tm_cp)
+            elif _tm_fl is not None and _tm_mu < float(_tm_fl):
+                _tm_margin = float(_tm_fl) - _tm_mu
+            if _tm_margin is not None and _tm_margin <= THIN_MARGIN_MIN_F:
+                return ("THIN_MARGIN",
+                        f"μ {_tm_margin:.1f}°F outside near edge ≤ "
+                        f"{THIN_MARGIN_MIN_F}°F (boundary coin-flip)")
     mmd_block = _check_model_market_disagree(opp)
     if mmd_block:
         return ("MODEL_MARKET_DISAGREE", mmd_block)
@@ -5570,7 +5617,14 @@ def execute_opportunity(opp: dict) -> bool:
         if count < 1:
             return False  # nothing to add
     else:
-        bet_usd = min(_effective_max_bet, max(MIN_BET_USD, kelly * bankroll))
+        # Flat sizing for BUY_NO (2026-05-26): the model's confidence signals
+        # don't predict per-contract outcome, so Kelly×bankroll just injects
+        # noise that has landed on losers. Flat stake removes it. BUY_YES keeps
+        # Kelly (already bounded tiny by MAX_BET_BUY_YES_USD).
+        if FLAT_SIZING_NO_ENABLED and _bet_action == "BUY_NO":
+            bet_usd = FLAT_BET_NO_USD
+        else:
+            bet_usd = min(_effective_max_bet, max(MIN_BET_USD, kelly * bankroll))
         count = max(1, int(bet_usd / price))
         count = max(count, math.ceil(MIN_COST_USD / price))
         count = min(count, max(1, int(_effective_max_bet / price)))
@@ -5785,6 +5839,27 @@ def execute_opportunity(opp: dict) -> bool:
                         f"  skip {ticker}: COASTAL_TIGHT_FLOOR — floor-mu gap "
                         f"{_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
                         f"(station={_ctf_station} marine cold-bias)")
+                    return False
+        # THIN_MARGIN (2026-05-26): live mirror of the _evaluate_gates twin —
+        # skip BUY_NO when μ is within THIN_MARGIN_MIN_F of the NEAR bracket
+        # edge (boundary coin-flip; loses on the NO payoff asymmetry). Placed
+        # after COASTAL_TIGHT_FLOOR to preserve that gate's reason when enabled.
+        if THIN_MARGIN_GATE_ENABLED and action == "BUY_NO":
+            _tm_mu = opp.get("mu")
+            _tm_fl = opp.get("floor")
+            _tm_cp = opp.get("cap")
+            if _tm_mu is not None:
+                _tm_mu = float(_tm_mu)
+                _tm_margin = None
+                if _tm_cp is not None and _tm_mu > float(_tm_cp):
+                    _tm_margin = _tm_mu - float(_tm_cp)
+                elif _tm_fl is not None and _tm_mu < float(_tm_fl):
+                    _tm_margin = float(_tm_fl) - _tm_mu
+                if _tm_margin is not None and _tm_margin <= THIN_MARGIN_MIN_F:
+                    _audit_skip(opp, "THIN_MARGIN",
+                        f"  skip {ticker}: THIN_MARGIN — μ {_tm_margin:.1f}°F "
+                        f"outside near edge ≤ {THIN_MARGIN_MIN_F}°F "
+                        f"(boundary coin-flip)")
                     return False
         # SKIP_MODEL_MARKET_DISAGREE (V2 port 2026-05-04, both sides). Mirror
         # of _evaluate_gates twin. See SKIP_MODEL_MARKET_DISAGREE_* constants.

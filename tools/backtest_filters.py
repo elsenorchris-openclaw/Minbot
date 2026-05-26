@@ -6,13 +6,17 @@ Each candidate (or custom) predicate is measured INCREMENTALLY on top of the
 deployed live filter chain, so standalone-overstates-lift overlap bugs are
 caught at the validation step.
 
-Data path: paper_min_bot/data/settlements.jsonl is the source of truth — one
-record per filled+settled trade, with forecast inputs, market state at entry,
-and outcome (won, pnl). This is inherently a POST-LIVE-CHAIN pool: every
-record already passed every deployed gate. So when stack predicates fire
-RETROACTIVELY against this pool, they reflect "if today's chain were applied
-to historical entries, this is what would have been blocked" — useful for
-calibration drift tracking, not forward filter validation.
+Data path: the pool is the bot's REALIZED trades, reconstructed per ticker as
+entry-time features (kind=entry in trades_*.jsonl) joined to realized pnl =
+Σ(kind=exit pnl) ∪ Σ(settlements.jsonl pnl). 2026-05-25: this REPLACED a
+settlements.jsonl-only loader that was survivorship-biased — the bot exits
+intraday (time_exit/take_profit/market_stop/hard_stop), so stopped-out losers
+are logged as exits and never settle, and the old pool silently dropped them
+(saw 29/29 thin-margin winners but only 9/28 losers). This is still a
+POST-LIVE-CHAIN pool: every record already passed every deployed gate, so
+stack predicates fire RETROACTIVELY ("if today's chain were applied to these
+entries, this is what would have been blocked"). won = realized money outcome
+(pnl > 0).
 
 For forward filter validation: the stack returns False on every filled
 record (they all passed), so `lift_inc` ≈ `lift_naive`. The stack interface
@@ -28,8 +32,12 @@ Usage:
   python3 tools/backtest_filters.py --custom my.py:should_skip --stack live
 """
 import argparse
+import glob
+import gzip
 import importlib.util
 import json
+import re
+import subprocess
 from collections import Counter, defaultdict
 from pathlib import Path
 
@@ -44,38 +52,146 @@ DEFAULT_MAX_BET_NORM = 30.0  # min_bot's MAX_BET_USD
 # ─────────────────────────────────────────────────────────────────────────────
 # Data loading
 # ─────────────────────────────────────────────────────────────────────────────
+_BOT_REC_DATE_RE = re.compile(r"trades_(\d{4}-\d{2}-\d{2})\.jsonl")
+
+
+def _iter_bot_records(since_date):
+    """Yield the bot's own kind=entry / kind=exit records out of the daily
+    trades_YYYY-MM-DD.jsonl[.gz] logs, for dates >= since_date.
+
+    These logs are huge (raw market ticks); the bot's own records are a tiny
+    fraction. For plain .jsonl we shell out to grep (≫ faster than a Python
+    scan of 300MB/file); .gz are read inline."""
+    files = sorted(
+        glob.glob(str(ROOT / "data" / "trades_*.jsonl"))
+        + glob.glob(str(ROOT / "data" / "trades_*.jsonl.gz"))
+    )
+    day_lo = since_date[:10]
+    for f in files:
+        m = _BOT_REC_DATE_RE.search(f)
+        if not m or m.group(1) < day_lo:
+            continue
+        lines = []
+        if f.endswith(".gz"):
+            try:
+                with gzip.open(f, "rt") as fh:
+                    lines = [ln for ln in fh
+                             if '"kind": "entry"' in ln or '"kind": "exit"' in ln]
+            except Exception:
+                lines = []
+        else:
+            try:
+                lines = subprocess.run(
+                    ["grep", "-hE", r'"kind": "(entry|exit)"', f],
+                    capture_output=True, text=True, timeout=180,
+                ).stdout.splitlines()
+            except Exception:
+                lines = []
+        for ln in lines:
+            try:
+                yield json.loads(ln)
+            except Exception:
+                continue
+
+
 def load_settled(since_date=DEFAULT_SINCE, normalize_bet=DEFAULT_MAX_BET_NORM):
-    """Load min_bot settled trades from settlements.jsonl. Each record is one
-    fully-resolved trade (entry through settlement) with forecast inputs at
-    entry, market state at entry, and outcome (won, pnl, revenue, cost)."""
-    pool = []
-    if not SETTLEMENTS_PATH.exists():
-        return pool
-    for line in SETTLEMENTS_PATH.read_text().splitlines():
-        try:
-            r = json.loads(line)
-        except Exception:
+    """Load min_bot's REALIZED trades, keyed by ticker.
+
+    2026-05-25 SURVIVORSHIP-BIAS FIX: the bot does intraday exits
+    (time_exit_10am / take_profit / market_stop / hard_stop), so a
+    stopped-out loser is logged as a kind=exit in trades_*.jsonl and NEVER
+    gets a settlements.jsonl record. The old loader read settlements.jsonl
+    only → it saw the winners (held to settle) but dropped the stopped
+    losers. On the May data it saw 29/29 thin-margin winners but only 9/28
+    losers, flipping a true −$307 filter into a tool-visible +$73 and
+    reporting a good entry filter as harmful. Any entry filter that
+    correlates with stop-outs was mis-measured.
+
+    Now: realized pnl per ticker = Σ(exit pnl) + Σ(settlement pnl), with
+    entry-time features taken from the kind=entry record (richest feature
+    set). Settlement-only tickers (held to expiry, or recovered/obs_pipeline
+    sourced with no entry log in window) are still included. won is the
+    realized money outcome (pnl > 0), since that is what filter validation
+    should optimize once exits are in play."""
+    entries = {}
+    exits = defaultdict(list)
+    for r in _iter_bot_records(since_date):
+        t = r.get("market_ticker")
+        if not t:
             continue
-        ts = r.get("ts", "")
-        if ts < since_date:
-            continue
-        # Required fields: action, won, pnl, market_ticker
-        if r.get("action") not in ("BUY_NO", "BUY_YES"):
-            continue
-        if r.get("won") is None or r.get("pnl") is None:
-            continue
-        cost = r.get("cost") or 0.0
-        if normalize_bet is not None and cost > normalize_bet:
+        if r.get("kind") == "entry":
+            entries.setdefault(t, []).append(r)
+        elif r.get("kind") == "exit":
+            exits[t].append(r)
+
+    setl = defaultdict(list)
+    if SETTLEMENTS_PATH.exists():
+        for line in SETTLEMENTS_PATH.read_text().splitlines():
+            try:
+                s = json.loads(line)
+            except Exception:
+                continue
+            if s.get("ts", "") < since_date:
+                continue
+            tk = s.get("market_ticker")
+            if tk:
+                setl[tk].append(s)
+
+    def _dedup_settle_pnl(recs):
+        # the .bak settlement files can double-list a settlement; dedup on
+        # (rounded pnl, day) before summing.
+        seen, tot = set(), 0.0
+        for s in recs:
+            if s.get("pnl") is None:
+                continue
+            key = (round(float(s["pnl"]), 2), s.get("ts", "")[:10])
+            if key in seen:
+                continue
+            seen.add(key)
+            tot += float(s["pnl"])
+        return tot
+
+    def _finalize(base, pnl, cost):
+        rec = dict(base)
+        if normalize_bet is not None and cost and cost > normalize_bet:
             scale = normalize_bet / float(cost)
-            r = dict(r)
-            r["cost"] = float(normalize_bet)
-            r["pnl"] = float(r["pnl"]) * scale
-            r["_normalized"] = True
-        # date for per-day analysis
-        r["date"] = r.get("date_str") or r.get("ts", "")[:10]
-        # kelly_bet alias for parity with V1/V2 record shape
-        r["kelly_bet"] = r.get("cost", 0.0) or 0.0
-        pool.append(r)
+            cost = float(normalize_bet)
+            pnl = float(pnl) * scale
+            rec["_normalized"] = True
+        rec["pnl"] = float(pnl)
+        rec["won"] = float(pnl) > 0
+        rec["cost"] = float(cost)
+        rec["kelly_bet"] = float(cost)
+        rec["date"] = rec.get("date_str") or rec.get("ts", "")[:10]
+        return rec
+
+    pool = []
+    seen_tickers = set()
+    for t, erecs in entries.items():
+        if erecs[0].get("action") not in ("BUY_NO", "BUY_YES"):
+            continue
+        base = sorted(erecs, key=lambda x: x.get("ts", ""))[0]
+        ex, st = exits.get(t, []), setl.get(t, [])
+        pnl_ex = sum((e.get("pnl") or 0) for e in ex)
+        pnl_st = _dedup_settle_pnl(st)
+        if not ex and not st:
+            continue  # still open — no realized outcome
+        cost = sum((e.get("cost") or 0) for e in erecs) or base.get("cost", 0.0)
+        pool.append(_finalize(base, pnl_ex + pnl_st, cost))
+        seen_tickers.add(t)
+
+    # Settlement-only tickers with no entry log in the window (held to expiry,
+    # or recovered/obs_pipeline-sourced). Preserve the old pool's coverage.
+    for t, st in setl.items():
+        if t in seen_tickers:
+            continue
+        base = sorted(st, key=lambda x: x.get("ts", ""))[0]
+        if base.get("action") not in ("BUY_NO", "BUY_YES"):
+            continue
+        if base.get("pnl") is None:
+            continue
+        pool.append(_finalize(base, _dedup_settle_pnl(st), base.get("cost") or 0.0))
+
     return pool
 
 
@@ -230,6 +346,26 @@ def _high_conviction_disag_trap(t):
     return float(disag) >= 2.0
 
 
+def _thin_margin(t):
+    """THIN_MARGIN — BUY_NO skipped when μ sits within 2.0°F of the NEAR
+    bracket edge (μ−cap if μ>cap, else floor−μ): a boundary coin-flip that
+    loses on the NO payoff asymmetry (breakeven WR == price). Mirrors
+    paper_min_bot.py THIN_MARGIN_MIN_F. DEPLOYED 2026-05-26. On the realized
+    (settle∪exit) pool: lift_inc +$222.6, robust_lift_inc +$153.6, n=49."""
+    if t.get("action") != "BUY_NO":
+        return False
+    mu = t.get("mu")
+    if mu is None:
+        return False
+    mu = float(mu)
+    fl, cp = t.get("floor"), t.get("cap")
+    if cp is not None and mu > float(cp):
+        return (mu - float(cp)) <= 2.0
+    if fl is not None and mu < float(fl):
+        return (float(fl) - mu) <= 2.0
+    return False
+
+
 SCENARIOS = {
     "model_prob_oor": (
         _model_prob_out_of_range,
@@ -267,6 +403,10 @@ SCENARIOS = {
         _high_conviction_disag_trap,
         "HIGH_CONVICTION_DISAG_TRAP: BUY_NO mp < 0.075 AND disag >= 2.0F — DEPLOYED 2026-05-12 eve",
     ),
+    "thin_margin": (
+        _thin_margin,
+        "THIN_MARGIN: BUY_NO μ within 2.0F of near bracket edge — DEPLOYED 2026-05-26",
+    ),
 }
 
 # 2026-05-06: `live` meta-scenario — the canonical full-live entry filter
@@ -285,6 +425,7 @@ LIVE_CHAIN = [
     "no_thigh",
     "cold_source_outlier",
     "high_conviction_disag_trap",
+    "thin_margin",
 ]
 SCENARIOS["live"] = (
     lambda t: any(SCENARIOS[name][0](t) for name in LIVE_CHAIN),
@@ -410,10 +551,10 @@ def report_stacked(pool, stack_fn, candidate_fn, stack_label, candidate_label):
     print(f"    robust_lift_inc {inc_robust:>+10.2f} (drop {inc_biggest_date}, delta {inc_biggest:+.2f})")
     if n_drop_inc == 0 and base["n"] == s["n"]:
         print()
-        print("  NOTE: Pool is settled trades only (post-live-chain). Stack")
-        print("  predicates fire on 0 records, so lift_inc here is identical")
-        print("  to a naive on-pool measurement. The stack interface still")
-        print("  serves as documentation that the measurement IS incremental.")
+        print("  NOTE: Pool is realized trades (settle ∪ exit), post-live-chain.")
+        print("  Stack predicates fire on 0 records, so lift_inc here is")
+        print("  identical to a naive on-pool measurement. The stack interface")
+        print("  still serves as documentation that the measurement IS incremental.")
 
 
 def analyze_filter_naive(pool, drop_fn, label="filter"):

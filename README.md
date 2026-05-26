@@ -3,6 +3,40 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-26 — `THIN_MARGIN` gate + flat BUY_NO sizing + backtest survivorship fix
+
+Three changes from a loser-analysis of the last ~4 weeks of buys (realized,
+settle∪exit). Backtest validated on the corrected realized pool via
+`tools/backtest_filters.py --custom thin_margin.py:should_skip --stack live`:
+`lift_inc +$222.6`, `robust_lift_inc +$153.6`, `n_blocked 49`.
+
+1. **`THIN_MARGIN` gate** (`THIN_MARGIN_GATE_ENABLED=True`, `THIN_MARGIN_MIN_F=2.0`).
+   Skip BUY_NO when the primary forecast μ is within 2.0°F of the **near**
+   bracket edge (`μ−cap` if μ>cap, else `floor−μ`). Mechanism: a BUY_NO bought
+   at ~$0.59 needs ~59% WR (breakeven WR == price); μ within ~2°F of the edge
+   is a boundary coin-flip (~51% WR) that loses on the NO payoff asymmetry.
+   Distinct from the disabled `ABS_DIST` (which used `|μ−bracket_mid|`, 0.5°F).
+   Wired in **both** `_evaluate_gates` (audit) and `execute_opportunity` (live
+   block), placed after `COASTAL_TIGHT_FLOOR`. Net-negative removed in all 3
+   backtest time-folds.
+
+2. **Flat BUY_NO sizing** (`FLAT_SIZING_NO_ENABLED=True`, `FLAT_BET_NO_USD=10.00`).
+   Replace Kelly×bankroll with a flat $10 stake for BUY_NO. The model's
+   confidence signals don't predict per-contract outcome (`corr(edge, ppc)=+0.02`),
+   so variable sizing injected noise that landed on losers
+   (`corr(bet $, ppc)=−0.11`; big bets ≥$40 = 48% WR/−$198 vs small <$40 = 57%
+   WR/−$51). Flat sizing alone took the realized 4wk book −$250 → ~−$23; flat
+   $10 + `THIN_MARGIN` → +$36. BUY_YES unchanged (stays at `MAX_BET_BUY_YES_USD`).
+
+3. **`tools/backtest_filters.py` survivorship-bias fix.** The pool now builds
+   from the **realized** ledger (entries+exits in `trades_*.jsonl` ∪
+   `settlements.jsonl`), not settlements-only. The bot exits intraday, so
+   stopped-out losers never settle and the old pool dropped them (it saw 29/29
+   thin-margin winners but only 9/28 losers → reported a good filter as
+   harmful, `lift_inc −$45`). After the fix the pool is n=211 / 58% WR (was
+   161 / 70%). Any entry filter that correlates with stop-outs was mis-measured
+   before this.
+
 ## 2026-05-24 — `TIME_EXIT_10AM` (liquidate all open positions at 10:00 local)
 
 At 10:00 station-local on a position's own climate day, sell **every** open

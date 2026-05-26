@@ -823,6 +823,11 @@ class TestDirectionalConsistency(unittest.TestCase):
         # _cached_bankroll<=0. Seed a real value so sizing reaches the
         # mock-place path rather than short-circuiting to refuse-trade.
         pb._cached_bankroll = 100.0
+        # 2026-05-26: these tests target directional gating; their fixtures
+        # sit at margin 2.0, which the new THIN_MARGIN gate (≤2.0) blocks.
+        # Disable it here — THIN_MARGIN is covered by TestThinMarginGate.
+        self._saved_tm = pb.THIN_MARGIN_GATE_ENABLED
+        pb.THIN_MARGIN_GATE_ENABLED = False
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -838,6 +843,7 @@ class TestDirectionalConsistency(unittest.TestCase):
 
     def tearDown(self):
         pb.place_kalshi_order = self._orig_place
+        pb.THIN_MARGIN_GATE_ENABLED = self._saved_tm
 
     def _opp(self, action, model_prob, **overrides):
         # mu chosen 2.5°F from bracket midpoint (45.5) so ABS DISTANCE GATE
@@ -895,6 +901,59 @@ class TestDirectionalConsistency(unittest.TestCase):
         pb.execute_opportunity(self._opp("BUY_NO", 0.50))
         pb.execute_opportunity(self._opp("BUY_YES", 0.50))
         self.assertEqual(self._order_calls, [])
+
+
+class TestThinMarginGate(unittest.TestCase):
+    """THIN_MARGIN (2026-05-26): BUY_NO skipped when μ is within 2.0°F of the
+    near bracket edge (μ−cap if μ>cap, else floor−μ) — a boundary coin-flip
+    that loses on the NO payoff asymmetry (breakeven WR == price). Validated
+    on the realized (settle∪exit) pool: lift_inc +$222, robust +$153."""
+
+    def _opp(self, mu, action="BUY_NO", floor=45.0, cap=46.0):
+        # Modeled on the gate-clean TestDirectionalConsistency fixture
+        # (KXLOWTBOS — all other gates pass; mu_nbp/hrrr/nbm == mu so
+        # COLD_SOURCE/MSG don't fire), so THIN_MARGIN is the gate in play.
+        return {
+            "market_ticker": "KXLOWTBOS-26APR25-B45.5",
+            "event_ticker": "KXLOWTBOS-26APR25",
+            "action": action,
+            "model_prob": 0.18 if action == "BUY_NO" else 0.70,
+            "edge": 0.25, "entry_price": 0.30 if action == "BUY_NO" else 0.10,
+            "yes_bid": 65, "yes_ask": 70, "no_bid": 28, "no_ask": 32,
+            "mu": mu, "mu_nbp": mu, "mu_hrrr": mu, "mu_nbm_om": mu,
+            "sigma": 2.5, "mu_source": "nws_primary",
+            "running_min": None, "post_sunrise_lock": False, "is_today": True,
+            "disagreement": 1.0, "floor": floor, "cap": cap,
+            "station": "KBOS", "date_str": "2026-04-25", "label": "Boston",
+            "series": "KXLOWTBOS",
+        }
+
+    def setUp(self):
+        self._saved = pb.THIN_MARGIN_GATE_ENABLED
+        pb.THIN_MARGIN_GATE_ENABLED = True
+
+    def tearDown(self):
+        pb.THIN_MARGIN_GATE_ENABLED = self._saved
+
+    def test_blocks_mu_below_floor_within_2f(self):
+        # μ=43 vs floor=45 → margin 2.0 (≤2.0) → blocked
+        gate, _ = pb._evaluate_gates(self._opp(mu=43.0))
+        self.assertEqual(gate, "THIN_MARGIN")
+
+    def test_passes_when_margin_over_2f(self):
+        # μ=42 vs floor=45 → margin 3.0 → THIN_MARGIN does not fire
+        gate, _ = pb._evaluate_gates(self._opp(mu=42.0))
+        self.assertNotEqual(gate, "THIN_MARGIN")
+
+    def test_does_not_fire_on_buy_yes(self):
+        # THIN_MARGIN is BUY_NO-only
+        gate, _ = pb._evaluate_gates(self._opp(mu=44.0, action="BUY_YES"))
+        self.assertNotEqual(gate, "THIN_MARGIN")
+
+    def test_disabled_flag_respected(self):
+        pb.THIN_MARGIN_GATE_ENABLED = False
+        gate, _ = pb._evaluate_gates(self._opp(mu=43.0))
+        self.assertNotEqual(gate, "THIN_MARGIN")
 
 
 @unittest.skipUnless(getattr(pb, 'ABS_DISTANCE_ENABLED', True),
@@ -2134,14 +2193,15 @@ class TestQuickWinGates(unittest.TestCase):
         # mp=0.20 (in [0.15, 0.40] for BUY_NO directional + F2A range);
         # no_ask=55 → entry=0.55 → edge = 0.80 − 0.55 = 0.25;
         # yes_bid=33 sits squarely in the FORMER PRICE_ZONE [30, 40];
-        # μ=62 vs bracket [59, 60] → ABS_DIST passes (|62-59.5|=2.5°F > 0.5°F).
+        # μ=63 vs bracket [59, 60] → ABS_DIST passes (|63-59.5|=3.5°F > 0.5°F)
+        # and THIN_MARGIN passes (μ−cap=3.0°F > 2.0°F).
         # disagreement=3.0 keeps the test isolated from BUY_NO_LOW_BRACKET_TRAP
         # (shipped 2026-05-15): that filter blocks BUY_NO when μ>cap AND
         # disagreement<2.5; this fixture verifies a different gate path.
         opp = self._opp(yes_bid=33, yes_ask=37,
                         no_bid=53, no_ask=55,
                         entry_price=0.55, edge=0.25,
-                        model_prob=0.20, mu=62.0,
+                        model_prob=0.20, mu=63.0,
                         floor=59.0, cap=60.0,
                         disagreement=3.0)
         pb.execute_opportunity(opp)
@@ -4509,6 +4569,13 @@ class TestSigmaAwareSizing(unittest.TestCase):
         self._saved_ref = pb.BANKROLL_REF_USD
         pb.BANKROLL_REF_USD = 50.0
         pb._cached_bankroll = 50.0  # clears cold-start gate
+        # 2026-05-26: BUY_NO ships FLAT sizing by default (σ-Kelly shrink no
+        # longer applies to BUY_NO). These tests guard the σ-shrink mechanism,
+        # which still exists for the Kelly path (BUY_YES / flat disabled), so
+        # exercise it with flat sizing off. test_flat_sizing_ignores_sigma
+        # covers the new default.
+        self._saved_flat = pb.FLAT_SIZING_NO_ENABLED
+        pb.FLAT_SIZING_NO_ENABLED = False
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -4524,6 +4591,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
 
     def tearDown(self):
         pb.BANKROLL_REF_USD = self._saved_ref
+        pb.FLAT_SIZING_NO_ENABLED = self._saved_flat
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, sigma, **overrides):
@@ -4585,6 +4653,25 @@ class TestSigmaAwareSizing(unittest.TestCase):
         self.assertLess(count_wide, count_ref)
         # Quadratic shrink at σ=3.5: ~0.51× — count should be roughly half.
         self.assertLess(count_wide, count_ref * 0.7)
+
+    def test_flat_sizing_ignores_sigma(self):
+        # 2026-05-26 shipped default: flat sizing for BUY_NO → count is
+        # FLAT_BET_NO_USD/price regardless of σ (the σ-Kelly shrink above only
+        # applies on the legacy Kelly path / BUY_YES).
+        pb.FLAT_SIZING_NO_ENABLED = True
+        pb.execute_opportunity(self._opp(sigma=2.5))
+        self.assertEqual(len(self._calls), 1)
+        count_narrow = self._calls[0][2]
+        self._calls.clear()
+        pb._reset_cycle_budget()
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        pb.execute_opportunity(self._opp(sigma=5.0))
+        self.assertEqual(len(self._calls), 1)
+        count_wide = self._calls[0][2]
+        # σ doubled but flat sizing → identical count, == FLAT_BET_NO_USD/price.
+        self.assertEqual(count_wide, count_narrow)
+        self.assertEqual(count_narrow, int(pb.FLAT_BET_NO_USD / 0.50))
 
 
 class TestPartialExitNoOrphan(unittest.TestCase):
@@ -5033,6 +5120,10 @@ class TestAddOnPath(unittest.TestCase):
         # overwriting our seed with a real (server-side) Kalshi fetch.
         pb._cached_bankroll = 1000.0
         pb._bankroll_cache_ts = pb.time.time()
+        # 2026-05-26: add-on fixture sits at margin 2.0; disable THIN_MARGIN
+        # (covered by TestThinMarginGate) so add-on mechanics aren't shadowed.
+        self._saved_tm = pb.THIN_MARGIN_GATE_ENABLED
+        pb.THIN_MARGIN_GATE_ENABLED = False
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -5105,6 +5196,7 @@ class TestAddOnPath(unittest.TestCase):
         pb._check_f2a_gate = self._orig_f2a
         pb._check_msg_gate = self._orig_msg
         pb.get_recent_cli_range = self._orig_recent
+        pb.THIN_MARGIN_GATE_ENABLED = self._saved_tm
         with pb._positions_lock:
             pb._open_positions.clear()
 
@@ -5704,6 +5796,15 @@ class TestYesTailMaxBetCap(unittest.TestCase):
         pb._reset_cycle_budget()
         pb._cached_bankroll = 1000.0  # large bankroll so Kelly doesn't cap
         pb._bankroll_cache_ts = pb.time.time()
+        # 2026-05-26: this class tests the per-action MAX_BET cap distinction
+        # (BUY_YES capped tiny, BUY_NO uses full MAX_BET). Flat BUY_NO sizing
+        # would override that; disable it so the Kelly→cap path is exercised.
+        # Also disable THIN_MARGIN — a T-low fixture here sits at margin 2.0
+        # (covered by TestThinMarginGate).
+        self._saved_flat = pb.FLAT_SIZING_NO_ENABLED
+        pb.FLAT_SIZING_NO_ENABLED = False
+        self._saved_tm = pb.THIN_MARGIN_GATE_ENABLED
+        pb.THIN_MARGIN_GATE_ENABLED = False
         with pb._skip_log_lock:
             pb._skip_log_state.clear()
         self._captured: list = []
@@ -5732,6 +5833,8 @@ class TestYesTailMaxBetCap(unittest.TestCase):
         pb._save_positions = self._orig_save
         pb.discord_send = self._orig_discord
         pb.notify_discord_entry = self._orig_notify
+        pb.FLAT_SIZING_NO_ENABLED = self._saved_flat
+        pb.THIN_MARGIN_GATE_ENABLED = self._saved_tm
         pb._cached_bankroll = 0.0
         with pb._positions_lock:
             pb._open_positions.clear()
