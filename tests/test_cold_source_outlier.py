@@ -46,11 +46,16 @@ class TestColdSourceOutlierConstants(unittest.TestCase):
 
     def test_helper_wired_execute_opportunity(self):
         s = src()
+        # 2026-05-26 gate unification: the gate lives once in _evaluate_gates;
+        # execute_opportunity blocks via delegation (TestGatePathParity guards
+        # block+tag+alert equivalence).
+        ev_idx = s.index("def _evaluate_gates(")
+        ev_block = s[ev_idx:s.find("\n\ndef ", ev_idx)]
+        self.assertIn("_check_cold_source_outlier(opp)", ev_block)
+        self.assertIn('"COLD_SOURCE_OUTLIER"', ev_block)
         ex_idx = s.index("def execute_opportunity(")
-        ex_end = s.find("\n\ndef ", ex_idx)
-        ex_block = s[ex_idx:ex_end]
-        self.assertIn("_check_cold_source_outlier(opp)", ex_block)
-        self.assertIn('"COLD_SOURCE_OUTLIER"', ex_block)
+        ex_block = s[ex_idx:s.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block)
 
 
 class TestColdSourceOutlierHelper(unittest.TestCase):

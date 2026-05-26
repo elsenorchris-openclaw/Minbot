@@ -73,10 +73,14 @@ class TestSourceWiringMMD(unittest.TestCase):
 
     def test_helper_called_from_execute_opportunity(self):
         s = _src()
+        # 2026-05-26 gate unification: single source in _evaluate_gates +
+        # execute_opportunity delegation (TestGatePathParity guards parity).
+        ev_idx = s.index("def _evaluate_gates(")
+        ev_block = s[ev_idx:s.find("\n\ndef ", ev_idx)]
+        self.assertIn("_check_model_market_disagree(opp)", ev_block)
         ex_idx = s.index("def execute_opportunity(")
-        ex_end = s.find("\n\ndef ", ex_idx)
-        ex_block = s[ex_idx:ex_end]
-        self.assertIn("_check_model_market_disagree(opp)", ex_block)
+        ex_block = s[ex_idx:s.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -264,15 +268,20 @@ class TestCoastalTightFloorBothCallSites(unittest.TestCase):
         self.assertIn('"COASTAL_TIGHT_FLOOR"', s[eg_idx:eg_end])
 
     def test_in_execute_opportunity(self):
-        """The bug we are fixing — COASTAL_TIGHT_FLOOR must appear inside
-        execute_opportunity, not just _evaluate_gates."""
+        """COASTAL_TIGHT_FLOOR must block live trades. Pre-2026-05-26 that
+        meant it had to appear inline in execute_opportunity (the 93b1570
+        shadow-only bug). Post gate-unification it lives once in
+        _evaluate_gates and execute_opportunity blocks via delegation —
+        verify the single source + the delegation call."""
         s = _src()
+        ev_idx = s.index("def _evaluate_gates(")
+        ev_block = s[ev_idx:s.find("\n\ndef ", ev_idx)]
+        self.assertIn("COASTAL_TIGHT_FLOOR_STATIONS", ev_block)
+        self.assertIn("COASTAL_TIGHT_FLOOR_MIN_GAP_F", ev_block)
         ex_idx = s.index("def execute_opportunity(")
-        ex_end = s.find("\n\ndef ", ex_idx)
-        ex_block = s[ex_idx:ex_end]
-        self.assertIn("COASTAL_TIGHT_FLOOR_STATIONS", ex_block,
-            "COASTAL_TIGHT_FLOOR not wired into execute_opportunity — silent shadow-only bug")
-        self.assertIn("COASTAL_TIGHT_FLOOR_MIN_GAP_F", ex_block)
+        ex_block = s[ex_idx:s.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block,
+            "execute_opportunity must delegate to _evaluate_gates so the gate blocks live")
 
     def test_evaluate_gates_blocks_lax_tight_gap(self):
         """LAX BUY_NO B-bracket with floor-mu gap < 2.1°F → block."""

@@ -95,22 +95,39 @@ class MinBotDecisionLogIntegrationTests(unittest.TestCase):
         self.assertIn("except Exception:", block)
 
     def test_each_gate_uses_audit_skip(self):
-        """Each gate-skip-and-return-False site in execute_opportunity must
-        use _audit_skip(...) (not bare _log_skip) so the eval state lands
-        in bot_decisions.sqlite. This is the 14-callsite migration."""
-        # Each tag must appear paired with _audit_skip
-        for tag in (
-            "OBS_CONFIRMED_LOSER", "MAX_EDGE_EXCEEDED",
-            "MODEL_PROB_OUT_OF_RANGE",
-            "DIRECTIONAL_NO_DISAGREE", "DIRECTIONAL_YES_DISAGREE",
-            "NO_THIGH", "YES_TAIL_MARGIN", "ABS_DISTANCE",
-            "F2A", "COASTAL_TIGHT_FLOOR",
-            "MODEL_MARKET_DISAGREE", "MSG",
-            "H_2_DISAGREE", "DISAGREEMENT", "MU_VS_RM",
-            "BUDGET", "NO_BANKROLL",
-        ):
+        """Every gate decision must land in bot_decisions.sqlite via _audit_skip.
+
+        2026-05-26 gate unification: the forecast/market gates block via the
+        single _evaluate_gates → unified handler, which calls
+        _audit_skip(opp, _live_tag, ...) with the gate's bot_decisions name
+        (renamed via _AUDIT_TO_LIVE_DECISION, else the audit name). The
+        stateful/structural gates keep their own literal _audit_skip callsites.
+        TestGatePathParity guards that the live tag matches per gate."""
+        # 1) Stateful/structural gates keep literal _audit_skip callsites.
+        for tag in ("STALE_BRACKET", "ADDON_ADVERSE_PRICE", "NO_BANKROLL", "BUDGET"):
             self.assertIn(f'_audit_skip(opp, "{tag}"', self.src,
-                f"_audit_skip(opp, \"{tag}\", ...) callsite must exist")
+                f'stateful gate {tag} must keep its literal _audit_skip callsite')
+        # 2) Unified forecast-gate handler emits the mapped live decision name.
+        self.assertIn("_audit_skip(opp, _live_tag,", self.src,
+            "unified gate handler must _audit_skip with the mapped live name")
+        self.assertIn("_AUDIT_TO_LIVE_DECISION.get(blocked_by, blocked_by)", self.src)
+        # 3) Every forecast bot_decisions name is reachable: a rename target in
+        #    _AUDIT_TO_LIVE_DECISION, or the audit name _evaluate_gates returns.
+        renamed = {"MAX_EDGE_EXCEEDED", "MODEL_PROB_OUT_OF_RANGE",
+                   "DIRECTIONAL_NO_DISAGREE", "DIRECTIONAL_YES_DISAGREE",
+                   "ABS_DISTANCE", "H_2_DISAGREE", "DISAGREEMENT"}
+        ev_idx = self.src.index("def _evaluate_gates(")
+        ev_block = self.src[ev_idx:self.src.find("\n\ndef ", ev_idx)]
+        for tag in ("OBS_CONFIRMED_LOSER", "MAX_EDGE_EXCEEDED",
+                    "MODEL_PROB_OUT_OF_RANGE", "DIRECTIONAL_NO_DISAGREE",
+                    "DIRECTIONAL_YES_DISAGREE", "NO_THIGH", "YES_TAIL_MARGIN",
+                    "ABS_DISTANCE", "F2A", "COASTAL_TIGHT_FLOOR",
+                    "MODEL_MARKET_DISAGREE", "MSG", "H_2_DISAGREE",
+                    "DISAGREEMENT", "MU_VS_RM"):
+            reachable = tag in renamed or f'("{tag}"' in ev_block
+            self.assertTrue(reachable,
+                f"{tag} must reach bot_decisions via the rename map or an "
+                f"_evaluate_gates return tag")
 
     def test_no_gate_uses_bare_log_skip_with_return_false(self):
         """After the migration, NO `_log_skip(ticker, ...) ... return False`

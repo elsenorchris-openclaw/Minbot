@@ -148,12 +148,15 @@ class TestWiringIntoGates(unittest.TestCase):
 
     def test_called_in_two_places(self):
         s = src()
-        callsites = re.findall(r"_check_mu_position_filter\s*\(\s*opp\s*\)", s)
-        # Definition itself doesn't match (it's `def _check_mu_position_filter(`)
-        # but callsites are _check_mu_position_filter(opp).
-        self.assertGreaterEqual(len(callsites), 2,
-            "Helper must be called from BOTH _evaluate_gates AND execute_opportunity "
-            "(mirrors _check_model_market_disagree's twin-call pattern)")
+        # 2026-05-26 gate unification: the helper is called once in
+        # _evaluate_gates (single source); execute_opportunity blocks via
+        # delegation (TestGatePathParity guards parity).
+        ev_idx = s.index("def _evaluate_gates(")
+        ev_block = s[ev_idx:s.find("\n\ndef ", ev_idx)]
+        self.assertIn("_check_mu_position_filter(opp)", ev_block)
+        ex_idx = s.index("def execute_opportunity(")
+        ex_block = s[ex_idx:s.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block)
 
 
 class TestExistingFiltersUnchanged(unittest.TestCase):

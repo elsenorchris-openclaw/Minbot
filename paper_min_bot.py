@@ -5504,6 +5504,31 @@ def record_candidate(opp: dict) -> None:
     _append_jsonl(_trades_file_today(), record)
 
 
+# 2026-05-26 GATE UNIFICATION: execute_opportunity now sources its
+# forecast/market gate decisions from _evaluate_gates (single source of
+# truth — TestGatePathParity guards equivalence). These two tables preserve
+# the live-path observable behavior the unification must not change:
+#   _AUDIT_TO_LIVE_DECISION — _evaluate_gates returns audit decision names;
+#     map them to the bot_decisions.sqlite names the live path emitted before
+#     unification, so historical decision-name queries keep matching.
+#   _GATE_BLOCK_ALERTS — the gates that fire a Discord block-alert.
+_AUDIT_TO_LIVE_DECISION = {
+    "MAX_EDGE": "MAX_EDGE_EXCEEDED",
+    "MP_RANGE": "MODEL_PROB_OUT_OF_RANGE",
+    "DIRECTIONAL_BUY_NO": "DIRECTIONAL_NO_DISAGREE",
+    "DIRECTIONAL_BUY_YES": "DIRECTIONAL_YES_DISAGREE",
+    "ABS_DIST": "ABS_DISTANCE",
+    "H_2_0": "H_2_DISAGREE",
+    "MAX_DISAGREEMENT": "DISAGREEMENT",
+}
+_GATE_BLOCK_ALERTS = frozenset({
+    "BUY_NO_EXTREME_SIGMA",
+    "KLAX_BUY_NO_HIGH_SIGMA",
+    "BUY_NO_LOW_BRACKET_TRAP_CONSENSUS",
+    "BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE",
+})
+
+
 def execute_opportunity(opp: dict) -> bool:
     """Enforce caps, place a real Kalshi limit-buy at the ask, wait up to
     ORDER_FILL_TIMEOUT_SEC for fill via WS cache, cancel any unfilled
@@ -5645,371 +5670,35 @@ def execute_opportunity(opp: dict) -> bool:
     action = opp["action"]
     mp = float(opp.get("model_prob", 0.0))
 
+    # --- Forecast/market gates: SINGLE SOURCE OF TRUTH = _evaluate_gates ---
+    # 2026-05-26 unification. _evaluate_gates replays EXACTLY this sequence
+    # (OBS_CONFIRMED_LOSER through MU_VS_RM) and is the same evaluator the
+    # candidate audit log uses, so the live and audit paths can no longer
+    # drift (TestGatePathParity guards block + tag + alert equivalence). It
+    # returns (None, "obs_alive_bypass") under obs_alive, preserving the
+    # bypass; SPREAD + BUDGET below still apply regardless. MIN_EDGE (silent
+    # return, above) and SPREAD (custom FILTERED_SPREAD logging, below) stay
+    # inline, so they are excluded from the block handler here.
+    blocked_by, block_reason = _evaluate_gates(opp)
+    if blocked_by is not None and blocked_by not in ("NO_ACTION", "MIN_EDGE", "SPREAD"):
+        _live_tag = _AUDIT_TO_LIVE_DECISION.get(blocked_by, blocked_by)
+        if blocked_by in _GATE_BLOCK_ALERTS:
+            _gf = opp.get("floor"); _gc = opp.get("cap")
+            _gbr = ("[{},{}]".format(_gf, _gc) if _gf is not None and _gc is not None
+                    else (">={}".format(_gf) if _gc is None else "<={}".format(_gc)))
+            _discord_skip_send(ticker,
+                f"BLOCKED {action} `{ticker}` ({opp.get('label','?')}) - "
+                f"{_live_tag}: {block_reason} | mu {(opp.get('mu') or 0):.1f}F "
+                f"sigma {(opp.get('sigma') or 0):.2f} bracket {_gbr} "
+                f"src={opp.get('mu_source')} "
+                f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}")
+        # Keep the live decision name in the log text so log/audit greps by
+        # tag still work (the per-gate inline messages used to include it).
+        _audit_skip(opp, _live_tag, f"  skip {ticker}: {_live_tag} — {block_reason}")
+        return False
     if obs_alive:
         log(f"  OBS_CONFIRMED_ALIVE {ticker}: bypassing forecast gates "
-            f"(rm={opp.get('running_min')}, action={action}); kelly×{SIGNAL_KELLY_MULT}")
-    else:
-        # Pre-empt entries where rm has already moved into losing territory.
-        # The hard-stop catches these post-entry, but the round-trip is costly
-        # (LAX-T54 round-trip 2026-04-27 lost $3.44 in 18 min).
-        if _check_obs_confirmed_loser(opp):
-            _audit_skip(opp, "OBS_CONFIRMED_LOSER",
-                f"  skip {ticker}: OBS_CONFIRMED_LOSER — rm={opp.get('running_min')} "
-                f"already in YES territory (floor={opp.get('floor')}, cap={opp.get('cap')})")
-            return False
-        # Forecast-based gates — each prevents a class of model error.
-        # Order: cheapest-to-evaluate first.
-        if edge > MAX_EDGE:
-            # No NBP-CLI bypass here. Backtest 2026-04-29 on historical
-            # candidates: MAX_EDGE-bypass policy lost 5/5 BUY_NO cases
-            # (μ at-or-near bracket boundary — honest forecast still landing
-            # in the wrong bracket). High apparent edge IS a real model-error
-            # signal, even when NBP aligns with recent CLI.
-            _audit_skip(opp, "MAX_EDGE_EXCEEDED",
-                f"  skip {ticker}: edge {edge:.1%} > MAX_EDGE {MAX_EDGE:.0%} (model likely wrong)")
-            return False
-        if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
-            # NBP-CLI consistency bypass kept HERE only. Backtest: 3/3 cheap
-            # BUY_NO cases (mp 3-11%, μ clearly outside bracket, NBP
-            # consistent) all won. The mp-range gate was blocking legit
-            # "very confident NO" trades where the bot's confidence was
-            # justified by recent CLI patterns.
-            if not _nbp_consistent_with_recent_cli(opp):
-                _audit_skip(opp, "MODEL_PROB_OUT_OF_RANGE",
-                    f"  skip {ticker}: model_prob {mp:.0%} outside [{MIN_MODEL_PROB:.0%},{MAX_MODEL_PROB:.0%}]")
-                return False
-            # else: bypass — recent CLI supports the extreme prob.
-        # Directional consistency: never bet against our own model.
-        if action == "BUY_NO" and mp > DIRECTIONAL_BUY_NO_MAX_MP:
-            _audit_skip(opp, "DIRECTIONAL_NO_DISAGREE",
-                f"  skip {ticker}: BUY_NO but model_prob {mp:.0%} > {DIRECTIONAL_BUY_NO_MAX_MP:.0%} (action vs model disagree)")
-            return False
-        if action == "BUY_YES" and mp < DIRECTIONAL_BUY_YES_MIN_MP:
-            _audit_skip(opp, "DIRECTIONAL_YES_DISAGREE",
-                f"  skip {ticker}: BUY_YES but model_prob {mp:.0%} < {DIRECTIONAL_BUY_YES_MIN_MP:.0%} (action vs model disagree)")
-            return False
-        # 2026-05-08: BUY_NO_EXTREME_SIGMA gate (live block + Discord notify).
-        # See constant block above for full mechanism. Backtest 0W:2L.
-        if (action == "BUY_NO"
-                and (opp.get("sigma") or 0) >= BUY_NO_EXTREME_SIGMA_THRESHOLD
-                and (opp.get("model_prob") or 1.0) < BUY_NO_EXTREME_SIGMA_MAX_MP):
-            _audit_skip(opp, "BUY_NO_EXTREME_SIGMA",
-                f"  skip {ticker}: σ={opp.get('sigma'):.2f}≥{BUY_NO_EXTREME_SIGMA_THRESHOLD} "
-                f"AND mp={mp:.1%}<{BUY_NO_EXTREME_SIGMA_MAX_MP:.0%} "
-                f"(Gaussian-flattening at high uncertainty)")
-            _floor = opp.get("floor"); _cap = opp.get("cap")
-            _bracket = (f"[{_floor},{_cap}]" if _floor is not None and _cap is not None
-                        else f"≥{_floor}" if _cap is None else f"≤{_cap}")
-            _discord_skip_send(ticker,
-                f"🛡️ **BLOCKED BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
-                f"extreme-σ filter: σ {opp.get('sigma'):.2f}°F ≥ {BUY_NO_EXTREME_SIGMA_THRESHOLD}  "
-                f"mp {mp:.1%} < {BUY_NO_EXTREME_SIGMA_MAX_MP:.0%}  "
-                f"μ {opp.get('mu'):.1f}°F  bracket {_bracket}\n"
-                f"src=`{opp.get('mu_source')}`  "
-                f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}  "
-                f"disagree={(opp.get('disagreement') or 0):.1f}°F"
-            )
-            return False
-        # 2026-05-08: KLAX_BUY_NO_HIGH_SIGMA gate (live block + Discord notify).
-        # KLAX-specific σ floor; see constant block for mechanism + backtest.
-        if (action == "BUY_NO"
-                and "KXLOWTLAX" in ticker
-                and opp.get("floor") is not None and opp.get("cap") is not None
-                and (opp.get("sigma") or 0) >= LAX_BUY_NO_HIGH_SIGMA_THRESHOLD):
-            _audit_skip(opp, "KLAX_BUY_NO_HIGH_SIGMA",
-                f"  skip {ticker}: KLAX BUY_NO B-bracket "
-                f"σ={opp.get('sigma'):.2f}≥{LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} "
-                f"(Pacific microclimate; backtest 0W:3L on n=3)")
-            _discord_skip_send(ticker,
-                f"🌊 **BLOCKED KLAX BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
-                f"σ {opp.get('sigma'):.2f}°F ≥ {LAX_BUY_NO_HIGH_SIGMA_THRESHOLD} threshold  "
-                f"μ {opp.get('mu'):.1f}°F  bracket [{opp.get('floor'):.1f},{opp.get('cap'):.1f}]\n"
-                f"src=`{opp.get('mu_source')}`  "
-                f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} NBM={opp.get('mu_nbm_om')}\n"
-                f"backtest: 0W:3L on n=3 LAX entries, lift +$69.90, h:h 3:0"
-            )
-            return False
-        # 2026-05-15: BUY_NO_LOW_BRACKET_TRAP gate (live block + Discord notify).
-        # See constant block above for full mechanism. Catches 3/3 5/14
-        # V1-min losers (DAL/DC/MIN, -$100.47), blocks 0/9 historical winners.
-        if (action == "BUY_NO"
-                and opp.get("floor") is not None
-                and opp.get("cap") is not None):
-            _bt_fl = float(opp["floor"]); _bt_cp = float(opp["cap"])
-            _bt_mu = opp.get("mu")
-            _bt_disg = opp.get("disagreement")
-            _bt_rm = opp.get("running_min")
-            _bt_skip = None
-            if _bt_mu is not None:
-                if (float(_bt_mu) > _bt_cp
-                        and _bt_disg is not None
-                        and float(_bt_disg) < BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX):
-                    _bt_skip = ("BUY_NO_LOW_BRACKET_TRAP_CONSENSUS",
-                                f"μ={_bt_mu:.1f}>cap={_bt_cp} AND "
-                                f"disagree={_bt_disg:.2f}<"
-                                f"{BUY_NO_LOW_BRACKET_TRAP_DISAGREE_MAX} "
-                                f"(NBP/HRRR/NBM consensus above bracket)")
-                elif (float(_bt_mu) < _bt_fl
-                        and _bt_rm is not None
-                        and float(_bt_rm) >= _bt_cp):
-                    _bt_skip = ("BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE",
-                                f"μ={_bt_mu:.1f}<floor={_bt_fl} AND "
-                                f"rm={_bt_rm:.1f}≥cap={_bt_cp} "
-                                f"(bracket between rm and forecast μ)")
-            if _bt_skip is not None:
-                _bt_code, _bt_reason = _bt_skip
-                _audit_skip(opp, _bt_code, f"  skip {ticker}: {_bt_reason}")
-                _discord_skip_send(ticker,
-                    f"🪤 **BLOCKED BUY_NO** `{ticker}` ({opp.get('label','?')})\n"
-                    f"LOW_BRACKET_TRAP / {_bt_code.split('_')[-1]}\n"
-                    f"μ {(_bt_mu or 0):.1f}°F  bracket [{_bt_fl:.0f},{_bt_cp:.0f}]  "
-                    f"σ {(opp.get('sigma') or 0):.2f}°F  "
-                    f"rm={('-' if _bt_rm is None else f'{_bt_rm:.1f}')}\n"
-                    f"src=`{opp.get('mu_source')}`  "
-                    f"NBP={opp.get('mu_nbp')} HRRR={opp.get('mu_hrrr')} "
-                    f"NBM={opp.get('mu_nbm_om')}  "
-                    f"disagree={(_bt_disg or 0):.2f}°F\n"
-                    f"backtest: 3/3 5/14 V1-min losers (lift +$100.47), "
-                    f"0/9 winners blocked"
-                )
-                return False
-        # Global BUY_NO T-high block (2026-05-01, was LAX-only).
-        if (action == "BUY_NO"
-                and opp.get("floor") is not None and opp.get("cap") is None):
-            _audit_skip(opp, "NO_THIGH",
-                f"  skip {ticker}: NO_THIGH — BUY_NO on T-high market blocked "
-                f"(structurally fights nighttime cooling; backtest 6L:1W on n=7)")
-            return False
-        # 2026-05-07: BUY_YES T-tail block. See _evaluate_gates twin for backtest.
-        if (action == "BUY_YES"
-                and opp.get("floor") is not None and opp.get("cap") is None):
-            _audit_skip(opp, "YES_TTAIL",
-                f"  skip {ticker}: YES_TTAIL — BUY_YES on T-tail market blocked "
-                f"(mu near threshold = coinflip with asymmetric loss; "
-                f"backtest 0W:6L, -$47/-61% ROI)")
-            return False
-        # BUY_YES tail margin gate (2026-05-01). See _evaluate_gates twin.
-        if action == "BUY_YES":
-            _yt_fl = opp.get("floor"); _yt_cp = opp.get("cap")
-            _yt_mu = opp.get("mu")
-            _yt_is_tail = (_yt_fl is not None) ^ (_yt_cp is not None)
-            if _yt_is_tail and _yt_mu is not None:
-                if _yt_fl is not None:
-                    _yt_margin = float(_yt_mu) - float(_yt_fl)
-                else:
-                    _yt_margin = float(_yt_cp) - float(_yt_mu)
-                if _yt_margin < YES_TAIL_MIN_MARGIN_F:
-                    _audit_skip(opp, "YES_TAIL_MARGIN",
-                        f"  skip {ticker}: YES_TAIL_MARGIN — margin "
-                        f"{_yt_margin:+.1f}°F < {YES_TAIL_MIN_MARGIN_F}°F "
-                        f"into YES region (DC-T46-class boundary risk)")
-                    return False
-        # ABS DISTANCE GATE (BUY_NO only). mu close to bracket midpoint = coin flip.
-        if action == "BUY_NO":
-            fl = opp.get("floor"); cp = opp.get("cap")
-            if fl is not None and cp is not None:
-                bracket_mid = (float(fl) + float(cp)) / 2.0
-            elif fl is not None:
-                bracket_mid = float(fl)
-            elif cp is not None:
-                bracket_mid = float(cp)
-            else:
-                bracket_mid = None
-            if bracket_mid is not None and ABS_DISTANCE_ENABLED:
-                mu_val = float(opp.get("mu", 0.0))
-                sigma_v = float(opp.get("sigma") or 0)
-                abs_dist = abs(mu_val - bracket_mid)
-                # σ-relative threshold (2026-04-30 PM)
-                min_dist = max(MIN_ABS_DISTANCE_F,
-                               MIN_ABS_DISTANCE_SIGMA_K * sigma_v)
-                if abs_dist < min_dist:
-                    _audit_skip(opp, "ABS_DISTANCE",
-                        f"  skip {ticker}: ABS DISTANCE GATE — mu={mu_val:.1f}°F only "
-                        f"{abs_dist:.1f}°F from bracket mid={bracket_mid:.1f}°F "
-                        f"(min {min_dist:.2f}°F = max(0.5, {MIN_ABS_DISTANCE_SIGMA_K}×σ={sigma_v:.1f}))")
-                    return False
-        # F2A asymmetry gate (V2 port, BUY_NO only).
-        f2a_block = _check_f2a_gate(opp)
-        if f2a_block:
-            _audit_skip(opp, "F2A", f"  skip {ticker}: {f2a_block}")
-            return False
-        # COASTAL_TIGHT_FLOOR (production parity 2026-05-04): mirror of
-        # _evaluate_gates twin. Was missing from execute_opportunity since
-        # commit 93b1570 — gate shadow-logged correctly but never blocked
-        # trades. See COASTAL_TIGHT_FLOOR_STATIONS / _evaluate_gates for
-        # backtest. BUY_NO B-bracket only.
-        if _COASTAL_TIGHT_FLOOR_ENABLED and action == "BUY_NO":
-            _ctf_station = opp.get("station")
-            _ctf_floor = opp.get("floor")
-            _ctf_cap = opp.get("cap")
-            _ctf_mu = opp.get("mu")
-            if (_ctf_station in COASTAL_TIGHT_FLOOR_STATIONS
-                    and _ctf_floor is not None and _ctf_cap is not None
-                    and _ctf_mu is not None):
-                _ctf_gap = float(_ctf_floor) - float(_ctf_mu)
-                if _ctf_gap < COASTAL_TIGHT_FLOOR_MIN_GAP_F:
-                    _audit_skip(opp, "COASTAL_TIGHT_FLOOR",
-                        f"  skip {ticker}: COASTAL_TIGHT_FLOOR — floor-mu gap "
-                        f"{_ctf_gap:+.1f}°F < {COASTAL_TIGHT_FLOOR_MIN_GAP_F}°F "
-                        f"(station={_ctf_station} marine cold-bias)")
-                    return False
-        # THIN_MARGIN (2026-05-26): live mirror of the _evaluate_gates twin —
-        # skip BUY_NO when μ is within THIN_MARGIN_MIN_F of the NEAR bracket
-        # edge (boundary coin-flip; loses on the NO payoff asymmetry). Placed
-        # after COASTAL_TIGHT_FLOOR to preserve that gate's reason when enabled.
-        if THIN_MARGIN_GATE_ENABLED and action == "BUY_NO":
-            _tm_mu = opp.get("mu")
-            _tm_fl = opp.get("floor")
-            _tm_cp = opp.get("cap")
-            if _tm_mu is not None:
-                _tm_mu = float(_tm_mu)
-                _tm_margin = None
-                if _tm_cp is not None and _tm_mu > float(_tm_cp):
-                    _tm_margin = _tm_mu - float(_tm_cp)
-                elif _tm_fl is not None and _tm_mu < float(_tm_fl):
-                    _tm_margin = float(_tm_fl) - _tm_mu
-                if _tm_margin is not None and _tm_margin <= THIN_MARGIN_MIN_F:
-                    _audit_skip(opp, "THIN_MARGIN",
-                        f"  skip {ticker}: THIN_MARGIN — μ {_tm_margin:.1f}°F "
-                        f"outside near edge ≤ {THIN_MARGIN_MIN_F}°F "
-                        f"(boundary coin-flip)")
-                    return False
-        # SKIP_MODEL_MARKET_DISAGREE (V2 port 2026-05-04, both sides). Mirror
-        # of _evaluate_gates twin. See SKIP_MODEL_MARKET_DISAGREE_* constants.
-        mmd_block = _check_model_market_disagree(opp)
-        if mmd_block:
-            _audit_skip(opp, "MODEL_MARKET_DISAGREE",
-                f"  skip {ticker}: {mmd_block}")
-            return False
-        # SKIP_MU_NEAR_FLOOR + SKIP_MU_NEAR_BELOW_BRACKET (V1 mirror,
-        # 2026-05-06). See _check_mu_position_filter docstring + constant
-        # block for backtest evidence.
-        mu_block = _check_mu_position_filter(opp)
-        if mu_block is not None:
-            tag, reason = mu_block
-            _audit_skip(opp, tag, f"  skip {ticker}: {reason}")
-            return False
-        # MSG multi-source consensus gate (V2 port, BUY_NO only).
-        msg_block = _check_msg_gate(opp)
-        if msg_block:
-            _audit_skip(opp, "MSG", f"  skip {ticker}: {msg_block}")
-            return False
-        # COLD_SOURCE_OUTLIER gate (2026-05-12). Covers d-0 + d-1+ for the
-        # cold-outlier-pick pattern that H_2_0 misses on d-0. See constant
-        # docstring for backtest + 2026-05-12 KNYC trigger case.
-        cold_block = _check_cold_source_outlier(opp)
-        if cold_block:
-            _audit_skip(opp, "COLD_SOURCE_OUTLIER",
-                f"  skip {ticker}: {cold_block}")
-            return False
-        # HRRR_DISSENT gate (2026-05-15). B-bracket BUY_NO when HRRR at-or-
-        # below cap + both slow models (NBP, NBM-OM) confidently above cap.
-        # Catches primary-NBP overconfidence + HRRR near-term dissent.
-        # Trigger: KXLOWTNYC-26MAY15-B49.5 (-$59.84). Historical pool n=1
-        # fire (DC-MAY12 -$60.35), 1:0 perfect h:hu. See HRRR_DISSENT_*
-        # constants for backtest evidence.
-        hrrr_dissent_block = _check_hrrr_dissent(opp)
-        if hrrr_dissent_block:
-            _audit_skip(opp, "HRRR_DISSENT",
-                f"  skip {ticker}: {hrrr_dissent_block}")
-            return False
-        # BUY_NO_NBM_IN_BRACKET gate (2026-05-17 PM). d-1+ BUY_NO B-bracket
-        # when NBM-OM lies inside upper 1°F of YES bracket AND HRRR<cap.
-        # Backtest stack-aware n=3, h:hu 2:1 ✓, lift +$46.50. Catches MIA-MAY12
-        # + MIN-MAY16 + (today's PHIL-MAY18 going forward). See
-        # BUY_NO_NBM_IN_BRACKET_* constants for backtest + ship rationale.
-        nbm_bracket_block = _check_nbm_in_bracket(opp)
-        if nbm_bracket_block:
-            _audit_skip(opp, "BUY_NO_NBM_IN_BRACKET",
-                f"  skip {ticker}: {nbm_bracket_block}")
-            return False
-        # BUY_NO_HIGH_MP_TRAP gate (2026-05-17 PM). BUY_NO any bracket when
-        # bot's model_prob > 0.24. Calibration audit: mp 25-30% bucket loses
-        # 67% (vs bot's expected 25-30%). Stack-aware n=5, h:hu 3:2 ✓, lift
-        # +$101, LOO-1 +$49. Catches SEA-MAY11 + MIA-MAY12 + DC-MAY17 of
-        # recent fully-stopped catastrophes. See BUY_NO_HIGH_MP_TRAP_*
-        # constants for backtest + calibration table.
-        high_mp_block = _check_high_mp_trap(opp)
-        if high_mp_block:
-            _audit_skip(opp, "BUY_NO_HIGH_MP_TRAP",
-                f"  skip {ticker}: {high_mp_block}")
-            return False
-        # BUY_NO_TAIL_RISK gate (2026-05-18 PM). BUY_NO B-bracket when EITHER
-        # mu is barely above cap (mu-cap < 2F: coin-flip-ish bracket geometry)
-        # OR HRRR is far below cap and chosen src is not HRRR (nowcast warns
-        # of bracket downside). Stack-aware n=17 May 4-18, h:hu 9:8 (1.12x),
-        # lift +$97.75, LOO-1 +$45.85. Catches today's PHIL/LV/PHX/MIN MTM
-        # losers. See BUY_NO_TAIL_RISK_* constants for backtest evidence.
-        tail_risk_block = _check_buy_no_tail_risk(opp)
-        if tail_risk_block:
-            _audit_skip(opp, "BUY_NO_TAIL_RISK",
-                f"  skip {ticker}: {tail_risk_block}")
-            return False
-        # BUY_NO_HRRR_IN_BRACKET_WARM gate (2026-05-19 PM). BUY_NO B-bracket
-        # warm-side bet (mu > cap) where HRRR predicts cli IN the YES bracket
-        # = direct two-source opposition on risk direction. Stack-aware n=5,
-        # h:hu 5:0 PERFECT, lift +$174.21, LOO-1 +$113.86. Catches DC-MAY12 +
-        # NYC-MAY15 + DAL-MAY14 + MIA-MAY04 + DAL-MAY11 catastrophes. See
-        # BUY_NO_HRRR_IN_BRACKET_WARM_* constants for backtest evidence.
-        hrrr_in_bracket_block = _check_hrrr_in_bracket_warm(opp)
-        if hrrr_in_bracket_block:
-            _audit_skip(opp, "BUY_NO_HRRR_IN_BRACKET_WARM",
-                f"  skip {ticker}: {hrrr_in_bracket_block}")
-            return False
-        # BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP gate (2026-05-20 PM).
-        ext_md_block = _check_extreme_market_disagree_low_mp(opp)
-        if ext_md_block:
-            _audit_skip(opp, "BUY_NO_EXTREME_MARKET_DISAGREE_LOW_MP",
-                f"  skip {ticker}: {ext_md_block}")
-            return False
-        # HIGH_CONVICTION_DISAG_TRAP gate (2026-05-12 eve). Covers d-0 + d-1+
-        # for the max-Kelly-trap pattern where low mp meets active NWP source
-        # disagreement. Stack-aware unique catches beyond COLD_SOURCE_OUTLIER:
-        # AUS-MAY12 (-$59.63) + ATL-MAY07 (-$29.93) = +$89.56 over 14d.
-        # See HIGH_CONVICTION_DISAG_TRAP_* constants for backtest evidence.
-        hcdt_block = _check_high_conviction_disag_trap(opp)
-        if hcdt_block:
-            _audit_skip(opp, "HIGH_CONVICTION_DISAG_TRAP",
-                f"  skip {ticker}: {hcdt_block}")
-            return False
-        # PRICE_ZONE block REMOVED 2026-04-29 — see constant comment above.
-        # H_2.0 d-1+ disagreement skip (V2-inspired). On day-1+ markets we
-        # have no obs to break ties between forecasts; pairwise disagreement
-        # > H_2_0_DISAGREE_F (4.5°F, raised from 2.0 on 2026-05-10 per audit)
-        # = forecast uncertainty too high for this BUY_NO. Only fires on
-        # day-1+ where there's no rm safety net.
-        if action == "BUY_NO" and not opp.get("is_today", False):
-            disag = float(opp.get("disagreement", 0.0))
-            if disag > H_2_0_DISAGREE_F:
-                _audit_skip(opp, "H_2_DISAGREE",
-                    f"  skip {ticker}: H_2.0 — d-1+ BUY_NO disagreement "
-                    f"{disag:.1f}°F > {H_2_0_DISAGREE_F:.1f}°F")
-                return False
-        # 2026-05-13: BUY_YES_DISAGREE — BUY_YES disagreement ceiling.
-        # See BUY_YES_DISAGREE_MAX_F constant block for backtest evidence.
-        # Mirror of _evaluate_gates twin (kept in sync for shadow-log parity).
-        if action == "BUY_YES":
-            disag = float(opp.get("disagreement", 0.0))
-            if disag >= BUY_YES_DISAGREE_MAX_F:
-                _audit_skip(opp, "BUY_YES_DISAGREE",
-                    f"  skip {ticker}: BUY_YES_DISAGREE — disagreement "
-                    f"{disag:.1f}°F ≥ {BUY_YES_DISAGREE_MAX_F:.1f}°F "
-                    f"(backtest n=11 blocked, +$50 lift / +$30 robust / 4:2 h:h)")
-                return False
-        if _DISAGREEMENT_ENABLED:
-            disagreement = float(opp.get("disagreement", 0.0))
-            if disagreement > MAX_DISAGREEMENT_F:
-                _audit_skip(opp, "DISAGREEMENT",
-                    f"  skip {ticker}: forecast disagreement {disagreement:.1f}°F > {MAX_DISAGREEMENT_F:.1f}°F")
-                return False
-        # Mu-vs-running_min sanity: pre-sunrise, forecast μ vs observed lowest > 5°F = wrong.
-        rm = opp.get("running_min")
-        if rm is not None and not opp.get("post_sunrise_lock"):
-            mu_check = float(opp.get("mu", 0.0))
-            if abs(mu_check - float(rm)) > MAX_MU_VS_RM_DIFF_F:
-                _audit_skip(opp, "MU_VS_RM",
-                    f"  skip {ticker}: μ={mu_check:.1f} vs rm={float(rm):.1f} diff > {MAX_MU_VS_RM_DIFF_F:.1f}°F")
-                return False
+            f"(rm={opp.get('running_min')}, action={action}); kelly x{SIGNAL_KELLY_MULT}")
     # Spread filter — always applies (even on obs_alive bypass; thin books are
     # untradable regardless of obs confirmation).
     side = "yes" if action == "BUY_YES" else "no"

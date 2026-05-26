@@ -35,9 +35,12 @@ class TestDisagreementDisabled(unittest.TestCase):
     def test_production_call_site_gated(self):
         s = src()
         # Production filter site (with _audit_skip) must also be gated
+        # 2026-05-26 gate unification: the production blocking site is now the
+        # single _evaluate_gates gate (execute_opportunity delegates), so the
+        # flag-gated MAX_DISAGREEMENT check lives there.
         self.assertRegex(
             s,
-            r"if _DISAGREEMENT_ENABLED:\s*\n\s+disagreement = float\(opp\.get\(\"disagreement\", 0\.0\)\)\s*\n\s+if disagreement > MAX_DISAGREEMENT_F:")
+            r"if _DISAGREEMENT_ENABLED:\s*\n\s+disag = float\(opp\.get\(\"disagreement\"\) or 0\)\s*\n\s+if disag > MAX_DISAGREEMENT_F:")
 
     def test_module_imports_with_flag_false(self):
         sys.path.insert(0, "/home/ubuntu/paper_min_bot")

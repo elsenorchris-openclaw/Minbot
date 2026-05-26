@@ -48,11 +48,15 @@ class TestHighConvictionDisagTrapConstants(unittest.TestCase):
 
     def test_helper_wired_execute_opportunity(self):
         s = src()
+        # 2026-05-26 gate unification: single source in _evaluate_gates +
+        # execute_opportunity delegation (TestGatePathParity guards parity).
+        ev_idx = s.index("def _evaluate_gates(")
+        ev_block = s[ev_idx:s.find("\n\ndef ", ev_idx)]
+        self.assertIn("_check_high_conviction_disag_trap(opp)", ev_block)
+        self.assertIn('"HIGH_CONVICTION_DISAG_TRAP"', ev_block)
         ex_idx = s.index("def execute_opportunity(")
-        ex_end = s.find("\n\ndef ", ex_idx)
-        ex_block = s[ex_idx:ex_end]
-        self.assertIn("_check_high_conviction_disag_trap(opp)", ex_block)
-        self.assertIn('"HIGH_CONVICTION_DISAG_TRAP"', ex_block)
+        ex_block = s[ex_idx:s.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block)
 
 
 class TestHighConvictionDisagTrapHelper(unittest.TestCase):

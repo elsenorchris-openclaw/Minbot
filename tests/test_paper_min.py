@@ -982,6 +982,8 @@ class TestGatePathParity(unittest.TestCase):
     def setUp(self):
         self._orig = {}
         self._placed = []
+        self._skips = []
+        self._alerts = []
 
         def _mk_io():
             yield ("place_kalshi_order",
@@ -993,7 +995,10 @@ class TestGatePathParity(unittest.TestCase):
             yield ("_save_positions", lambda: None)
             yield ("discord_send", lambda m: None)
             yield ("notify_discord_entry", lambda r, o: None)
-            yield ("_discord_skip_send", lambda *a, **k: None)
+            yield ("_discord_skip_send",
+                   lambda *a, **k: self._alerts.append(a[0] if a else None))
+            yield ("_audit_skip",
+                   lambda o, decision, msg=None: self._skips.append(decision))
             yield ("_check_obs_confirmed_alive", lambda o: False)
             yield ("_check_obs_confirmed_loser", lambda o: False)
             yield ("_nbp_consistent_with_recent_cli", lambda o: False)
@@ -1023,6 +1028,8 @@ class TestGatePathParity(unittest.TestCase):
             pb._today_date_utc = ""
         pb._reset_cycle_budget()
         self._placed.clear()
+        self._skips.clear()
+        self._alerts.clear()
 
     def _mk(self, **o):
         action = o.get("action", "BUY_NO")
@@ -1050,14 +1057,15 @@ class TestGatePathParity(unittest.TestCase):
             d["no_ask"] = 100 - d["yes_bid"]; d["no_bid"] = 100 - d["yes_ask"]
         return d
 
-    def _live_blocks(self, opp):
+    def _live_eval(self, opp):
+        """Run the live path; return (blocked, decision_tag, alerted).
+        decision_tag is the last _audit_skip decision (None for the silent
+        MIN_EDGE return and the SPREAD filter, which use other logging)."""
         self._reset_state()
         pb.execute_opportunity(opp)
-        return len(self._placed) == 0
-
-    def _audit_blocks(self, opp):
-        bb, _ = pb._evaluate_gates(opp)
-        return bb is not None
+        blocked = len(self._placed) == 0
+        tag = self._skips[-1] if self._skips else None
+        return blocked, tag, len(self._alerts) > 0
 
     def _sweep_opps(self):
         # Base passing opp, then vary one (or two, for multi-condition gates)
@@ -1102,24 +1110,61 @@ class TestGatePathParity(unittest.TestCase):
         for rm in (44.0, 57.0, 60.0):
             yield self._mk(mu=58.0, disagreement=3.0, running_min=rm)
 
+    # Independent spec (read from the live gate code): audit decision name →
+    # the bot_decisions.sqlite name the live path emits. MUST hold before AND
+    # after the unification. Gates not listed share the same name in both.
+    _EXP_LIVE_TAG = {
+        "MAX_EDGE": "MAX_EDGE_EXCEEDED",
+        "MP_RANGE": "MODEL_PROB_OUT_OF_RANGE",
+        "DIRECTIONAL_BUY_NO": "DIRECTIONAL_NO_DISAGREE",
+        "DIRECTIONAL_BUY_YES": "DIRECTIONAL_YES_DISAGREE",
+        "H_2_0": "H_2_DISAGREE",
+        "MAX_DISAGREEMENT": "DISAGREEMENT",
+    }
+    # Gates that fire a Discord block-alert (read from the live code).
+    _EXP_ALERTS = frozenset({
+        "BUY_NO_EXTREME_SIGMA", "KLAX_BUY_NO_HIGH_SIGMA",
+        "BUY_NO_LOW_BRACKET_TRAP_CONSENSUS", "BUY_NO_LOW_BRACKET_TRAP_RM_ABOVE"})
+    # MIN_EDGE (silent return) + SPREAD (custom 'FILTERED_SPREAD' _dlog logging)
+    # don't route through _audit_skip, so their live tag isn't captured here.
+    _TAG_EXEMPT = frozenset({"MIN_EDGE", "SPREAD", "NO_ACTION"})
+
     def test_audit_and_live_paths_agree(self):
-        mismatches = []
+        block_mm, tag_mm, alert_mm = [], [], []
         n = 0
         for opp in self._sweep_opps():
             n += 1
-            a = self._audit_blocks(opp)
-            lv = self._live_blocks(opp)
-            if a != lv:
-                mismatches.append(
-                    (opp["market_ticker"], opp["action"],
-                     f"mu={opp['mu']} br=[{opp['floor']},{opp['cap']}] "
-                     f"edge={opp['edge']} mp={opp['model_prob']} σ={opp['sigma']} "
-                     f"disag={opp['disagreement']} today={opp['is_today']}",
-                     f"audit_blocks={a} live_blocks={lv}"))
-        self.assertEqual(
-            mismatches, [],
-            f"{len(mismatches)}/{n} gate-path disagreements (audit vs live):\n"
-            + "\n".join(str(m) for m in mismatches[:20]))
+            bb, _ = pb._evaluate_gates(opp)
+            audit_blocked = bb is not None
+            live_blocked, live_tag, alerted = self._live_eval(opp)
+            desc = (f"{opp['market_ticker']} {opp['action']} mu={opp['mu']} "
+                    f"br=[{opp['floor']},{opp['cap']}] edge={opp['edge']} "
+                    f"mp={opp['model_prob']} σ={opp['sigma']} "
+                    f"disag={opp['disagreement']} today={opp['is_today']} → audit={bb}")
+            # 1) block / no-block parity
+            if audit_blocked != live_blocked:
+                block_mm.append(f"{desc} | audit_blocked={audit_blocked} "
+                                f"live_blocked={live_blocked}")
+                continue
+            if not audit_blocked:
+                continue
+            # 2) live bot_decisions decision name preserved
+            if bb not in self._TAG_EXEMPT:
+                exp = self._EXP_LIVE_TAG.get(bb, bb)
+                if live_tag != exp:
+                    tag_mm.append(f"{desc} | expected live tag {exp!r}, got {live_tag!r}")
+            # 3) block-alert fires iff this is an alerting gate
+            should_alert = bb in self._EXP_ALERTS
+            if alerted != should_alert:
+                alert_mm.append(f"{desc} | alerted={alerted} expected={should_alert}")
+        parts = []
+        if block_mm:
+            parts.append(f"BLOCK-PARITY ({len(block_mm)}):\n" + "\n".join(block_mm[:15]))
+        if tag_mm:
+            parts.append(f"TAG-DRIFT ({len(tag_mm)}):\n" + "\n".join(tag_mm[:15]))
+        if alert_mm:
+            parts.append(f"ALERT-DRIFT ({len(alert_mm)}):\n" + "\n".join(alert_mm[:15]))
+        self.assertEqual(parts, [], f"\n(swept {n} opps)\n" + "\n\n".join(parts))
 
 
 @unittest.skipUnless(getattr(pb, 'ABS_DISTANCE_ENABLED', True),

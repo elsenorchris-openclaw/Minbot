@@ -137,9 +137,14 @@ class TestHrrrDissentWired(unittest.TestCase):
         src = bot_path.read_text()
         # At least 2 call sites (one in pure-decision return-tuple path,
         # one in audit_skip path)
-        n_calls = src.count("_check_hrrr_dissent(opp)")
-        self.assertGreaterEqual(n_calls, 2,
-                                f"Expected >= 2 wire sites for _check_hrrr_dissent, found {n_calls}")
+        # 2026-05-26 gate unification: single source in _evaluate_gates +
+        # execute_opportunity delegation (TestGatePathParity guards parity).
+        ev_idx = src.index("def _evaluate_gates(")
+        ev_block = src[ev_idx:src.find("\n\ndef ", ev_idx)]
+        self.assertIn("_check_hrrr_dissent(opp)", ev_block)
+        ex_idx = src.index("def execute_opportunity(")
+        ex_block = src[ex_idx:src.find("\n\ndef ", ex_idx)]
+        self.assertIn("_evaluate_gates(opp)", ex_block)
         # Audit skip tag must use HRRR_DISSENT
         self.assertIn('"HRRR_DISSENT"', src,
                       "Skip log must use exact tag 'HRRR_DISSENT' for audit grep")

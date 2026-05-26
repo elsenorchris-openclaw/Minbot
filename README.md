@@ -3,6 +3,35 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-26 — Gate unification: `execute_opportunity` delegates to `_evaluate_gates`
+
+Eliminated the long-standing duplication where every forecast/market gate was
+written twice — once in `_evaluate_gates` (audit/candidate log) and once inline
+in `execute_opportunity` (the live blocker) — kept in sync by hand. That manual
+sync was a recurring bug source (a gate added to only one path; the 93b1570
+`COASTAL_TIGHT_FLOOR` shadow-only bug; the near-miss adding `THIN_MARGIN`).
+
+Now `execute_opportunity` calls `_evaluate_gates(opp)` once and acts on the
+result — **single source of truth** for the forecast/market gates
+(`OBS_CONFIRMED_LOSER` … `MU_VS_RM`). Removed ~340 lines of duplicated inline
+gates. Behavior is preserved exactly:
+- **`MIN_EDGE`** (silent return) and **`SPREAD`** (custom `FILTERED_SPREAD`
+  `stage='filter'` logging) stay inline; the stateful gates
+  (`STALE_BRACKET`/`NO_BANKROLL`/`BUDGET`/`ADDON_ADVERSE_PRICE`) stay inline.
+- **`obs_alive` bypass** preserved (`_evaluate_gates` returns
+  `(None,"obs_alive_bypass")`; `SPREAD`+`BUDGET` still apply below).
+- **`bot_decisions.sqlite` decision names unchanged** via `_AUDIT_TO_LIVE_DECISION`
+  (e.g. `MAX_EDGE`→`MAX_EDGE_EXCEEDED`, `H_2_0`→`H_2_DISAGREE`); the live tag is
+  also kept in the skip-log text so tag greps still work.
+- **3 Discord block-alerts** (`BUY_NO_EXTREME_SIGMA`/`KLAX_BUY_NO_HIGH_SIGMA`/
+  `LOW_BRACKET_TRAP`) re-fired from the unified handler (message format unified).
+
+Guarded by **`TestGatePathParity`**: sweeps ~108 opps through BOTH paths and
+asserts they agree on block/no-block, the live decision tag, AND the alert set —
+so any future drift (a gate added to one path only) fails CI. The per-gate
+structural wiring tests were repointed from "inline in execute_opportunity" to
+"in `_evaluate_gates` + execute_opportunity delegates". 842 tests pass.
+
 ## 2026-05-26 — `THIN_MARGIN` gate + flat BUY_NO sizing + backtest survivorship fix
 
 Three changes from a loser-analysis of the last ~4 weeks of buys (realized,
