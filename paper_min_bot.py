@@ -882,6 +882,27 @@ HARD_STOP_TAIL_LOSS_PCT = 999.0     # disabled (was 0.70) — sentinel
 # when bid is 1c.
 MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-winner override
 
+# ─── PACED 10am liquidation + keep confirmed winners (2026-05-26) ──────────
+# TIME_EXIT_10AM exists to dodge the overnight collapse: a min-temp BUY_NO can
+# be winning at 10am (low still above the bracket) yet get re-tested lower by an
+# evening front, fall into the bracket, and settle 0 -- so we sell AT-RISK
+# positions in the morning. Two bugs in HOW it sold:
+#  (1) Dumped the FULL position at the bid each cycle, chasing the bid down as
+#      its own selling drained the thin KXLOWT book. 5/25 KBOS (low 53.6,
+#      bracket [52,53], NO winning but at-risk) walked 87->33c, bulk at 33c,
+#      -$6.38 -- though the bid HELD 86c all afternoon. KSEA same (60->25c,
+#      -$18.93). ~85-96% self-inflicted impact, not real re-pricing.
+#  (2) Also dumped CONFIRMED winners (low already below floor -> can't lose,
+#      settles 100c) at the ~99c bid, giving up the last cent + sell risk.
+# Fix: (A) keep confirmed winners (skip 10am sell when obs-winner check passes;
+# low only falls so it can't collapse) -- hold to settlement. (B) Everything
+# else: PACE the sell -- offer PACED_EXIT_CLIP_C contracts/cycle at the bid so
+# we don't outrun the book; clears in ~10-15 min at the fair ~86c, not the 33c
+# bottom. Est. 5/25: KBOS +$21, KSEA +$13; clean 99c winners unchanged.
+# Rollback: ENABLE_PACED_EXIT = False (byte-identical full dump).
+ENABLE_PACED_EXIT  = True
+PACED_EXIT_CLIP_C  = 8
+
 # ─── SHADOW exit activation gate (2026-05-13 ship) ────────────────────────
 # Graduates _check_position_obs_confirmed_loser_for_exit from logging-only
 # (Stage 1 since 2026-05-04) to actual exit, scoped to BUY_NO B-bracket
@@ -6342,19 +6363,22 @@ def _check_take_profit_15(pos: dict, current_bid_c: Optional[int],
 
 
 def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
-                   reason: str) -> bool:
+                   reason: str, max_count: Optional[int] = None) -> bool:
     """Place a SELL order for an existing position at sell_price_c. Polls for
     fill, records exit in trades.jsonl with kind='exit', marks position
     settled in the dedupe map. Returns True iff we got any fill."""
-    count = int(pos.get("count", 0))
-    if count <= 0:
+    true_count = int(pos.get("count", 0))
+    if true_count <= 0:
         return False
     if sell_price_c is None or sell_price_c <= 0:
         return False
-    oid = place_kalshi_sell_order(ticker, sell_side, count, sell_price_c)
+    # 2026-05-26: max_count caps THIS order to a clip (paced 10am exit) without
+    # touching the position's true size; settle logic below keys off true_count.
+    order_count = min(true_count, int(max_count)) if max_count else true_count
+    oid = place_kalshi_sell_order(ticker, sell_side, order_count, sell_price_c)
     if not oid:
         return False
-    status, filled = wait_for_fill(oid, count, ORDER_FILL_TIMEOUT_SEC)
+    status, filled = wait_for_fill(oid, order_count, ORDER_FILL_TIMEOUT_SEC)
     if filled <= 0:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
@@ -6364,13 +6388,13 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
             log(f"  exit cancel failed for {oid} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
         log(f"  exit no-fill on {ticker} (status={status}); cancelled")
         return False
-    if filled < count:
+    if filled < order_count:
         try:
             kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
         except Exception as _cx:
             # noqa: should_log — exit partial-fill remainder cancel.
             log(f"  exit cancel-remainder failed for {oid} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
-        log(f"  exit partial fill {filled}/{count} on {ticker}; cancelled remainder")
+        log(f"  exit partial fill {filled}/{order_count} on {ticker}; cancelled remainder")
     sell_revenue = filled * (sell_price_c / 100.0)
     cost_basis = filled * float(pos.get("entry_price", 0))
     pnl = sell_revenue - cost_basis
@@ -6396,7 +6420,7 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
     with _positions_lock:
         existing = _open_positions.get(ticker)
         if existing is not None:
-            if filled < count:
+            if filled < true_count:
                 # Partial fill — DO NOT mark settled. The unsold contracts
                 # are still ours on Kalshi and need to either be re-sold by
                 # the next hard-stop check or settled by check_settlements
@@ -6405,7 +6429,7 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
                 # partial-fill exit, orphaning AUS-26MAY01-T56's 79 unsold
                 # contracts (entry $29.70 → bot reported pnl=-$2.86, missed
                 # $20.54 of unrealized exposure that settles tomorrow).
-                new_count = count - filled
+                new_count = true_count - filled
                 # Keep entry_price unchanged (cost basis per contract).
                 # Reduce `count` so check_settlements computes settlement
                 # against just the remaining contracts. Append-style accumulate
@@ -6429,14 +6453,14 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
                     "_exit_reason": reason,
                 })
     _save_positions()
-    if filled < count:
-        log(f"  EXIT PARTIAL {ticker} ({reason}): {filled}/{count}x @ "
+    if filled < true_count:
+        log(f"  EXIT PARTIAL {ticker} ({reason}): {filled}/{true_count}x @ "
             f"{sell_price_c}c | partial pnl ${pnl:+.2f} | "
-            f"{count - filled} contracts still open")
+            f"{true_count - filled} contracts still open")
         discord_send(
             f"🟡 **PARTIAL EXIT** `{ticker}` {pos.get('action')} "
-            f"{filled}/{count}x @ {sell_price_c}c ({reason}) — partial P&L "
-            f"**${pnl:+.2f}**, {count - filled} still open"
+            f"{filled}/{true_count}x @ {sell_price_c}c ({reason}) — partial P&L "
+            f"**${pnl:+.2f}**, {true_count - filled} still open"
         )
     else:
         log(f"  EXIT FILLED {ticker} ({reason}): {filled}x @ {sell_price_c}c | "
@@ -6490,12 +6514,35 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         if _tz10:
             _nl10 = datetime.now(ZoneInfo(_tz10))
             if pos.get("date_str") == _nl10.strftime("%Y-%m-%d") and _nl10.hour >= 10:
+                # (A) keep confirmed winners — hold to settlement, don't 10am-sell.
+                # Min-temp BUY_NO: running_min only falls, so once it's below the
+                # bracket floor NO can't lose; selling at the ~99c bid just gives
+                # up the last cent + adds execution risk. (2026-05-26)
+                if ENABLE_PACED_EXIT:
+                    _rm10 = pos.get("running_min")
+                    if _rm10 is None:
+                        _rm10 = get_running_min(pos.get("station"), pos.get("date_str"))
+                    if _rm10 is not None:
+                        try:
+                            if _check_position_obs_winning(pos, float(_rm10)):
+                                log(f"  TIME_EXIT_10AM HOLD-WINNER {ticker}: rm={_rm10} "
+                                    f"confirms winner - holding to settlement (100c)")
+                                continue
+                        except Exception as _wx:
+                            log(f"  TIME_EXIT_10AM winner-check raised "
+                                f"{type(_wx).__name__}: {_wx}", "warn")
                 _ss10 = "yes" if action == "BUY_YES" else ("no" if action == "BUY_NO" else None)
                 _bid10 = mkt.get("yes_bid") if action == "BUY_YES" else mkt.get("no_bid")
                 if _ss10 and _bid10 is not None and _bid10 > 0:
+                    # (B) sell everything else PACED — a clip per cycle so we don't
+                    # outrun the thin book and crush our own bid. (2026-05-26)
+                    _clip = (min(int(pos.get("count", 0)), PACED_EXIT_CLIP_C)
+                             if ENABLE_PACED_EXIT else None)
                     log(f"  TIME_EXIT_10AM {ticker}: local={_nl10:%H:%M} "
-                        f"cd={pos.get('date_str')} sell {_ss10} @ {int(_bid10)}c")
-                    if _execute_exit(ticker, pos, _ss10, int(_bid10), "time_exit_10am"):
+                        f"cd={pos.get('date_str')} sell {_ss10} @ {int(_bid10)}c"
+                        + (f" (paced {_clip}/{pos.get('count')})" if _clip else ""))
+                    if _execute_exit(ticker, pos, _ss10, int(_bid10),
+                                     "time_exit_10am", max_count=_clip):
                         n_exits += 1
                     continue
         # No-obs skip: skip hard-stop entirely when no obs are available

@@ -3,6 +3,36 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-26 — PACED 10am liquidation + keep confirmed winners
+
+`TIME_EXIT_10AM` was liquidating by throwing the FULL position at the bid every
+cycle and chasing the bid down as its own selling drained the thin KXLOWT book —
+5/25 KBOS walked 87->33c (-$6.38 on a position whose bid HELD 86c all afternoon),
+KSEA 60->25c (-$18.93). Bid-recovery analysis: ~85-96% of the loss was
+self-inflicted market impact, not real re-pricing (the bids snapped back to
+86c/56c within the hour). Two fixes behind flag `ENABLE_PACED_EXIT` (default on;
+rollback = set `False` for byte-identical prior behavior):
+
+- **(A) Keep confirmed winners.** A min-temp BUY_NO's running_min only falls, so
+  once it's below the bracket floor NO can't lose. Skip the 10am sell when the
+  obs-winner check passes and hold to settlement (100c) instead of dumping at the
+  ~99c bid.
+- **(B) Pace everything else.** Sell only `PACED_EXIT_CLIP_C` (8) contracts/cycle
+  at the bid so we never outrun the book's refill rate (~6-10/min observed); the
+  position still fully clears in ~10-15 min — hours before any evening collapse —
+  at the fair ~86c instead of the 33c bottom. `_execute_exit` gained an optional
+  `max_count` clip param; the settle logic keys off the position's `true_count`
+  so a clip doesn't mark the whole position settled. All other exit paths
+  (`market_stop` / `shadow_obs_loser` / `take_profit_15` / `narrow_margin_tp`)
+  are unchanged.
+
+Purpose of the 10am exit (per Chris): many positions look fine after morning but
+collapse to 0 at night (an evening front re-tests the low into the bracket) — so
+we keep the locked winners and sell the at-risk rest before that, now without
+self-crushing the exit. Est. on 5/25 episodes: KBOS +$21, KSEA +$13; clean 99c
+winners and genuine 1c losers unchanged. Tests: 842 pass.
+
+
 ## 2026-05-26 — BUY_NO sizing → flat $80 (per Chris)
 
 `FLAT_BET_NO_USD` $10 → $80 and `MAX_BET_USD` cap $50 → $80 (commit `aa8adcc`).
