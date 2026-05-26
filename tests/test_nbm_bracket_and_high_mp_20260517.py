@@ -175,12 +175,13 @@ class TestHighMpTrap(unittest.TestCase):
 
 
 class TestMaxBetRollback(unittest.TestCase):
-    """MAX_BET_USD bumped back to $50 on 2026-05-20 after the 5/17 rollback to $25.
+    """BUY_NO sizing raised to a flat $80 on 2026-05-26 per Chris (FLAT_BET_NO_USD 10->80 + MAX_BET_USD cap 50->80).
     History: $50 → $25 (5/17 PM bleed-defense) → $50 (5/20 after 5/19 +$49 settle)."""
 
-    def test_max_bet_is_50(self):
+    def test_max_bet_is_80(self):
         import paper_min_bot as pb
-        self.assertEqual(pb.MAX_BET_USD, 50.00)
+        self.assertEqual(pb.MAX_BET_USD, 80.00)
+        self.assertEqual(pb.FLAT_BET_NO_USD, 80.00)
 
 
 if __name__ == "__main__":
