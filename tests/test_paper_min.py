@@ -956,6 +956,172 @@ class TestThinMarginGate(unittest.TestCase):
         self.assertNotEqual(gate, "THIN_MARGIN")
 
 
+class TestGatePathParity(unittest.TestCase):
+    """⚠️ BEHAVIOR-EQUIVALENCE GUARD (2026-05-26).
+
+    `_evaluate_gates` (audit/shadow) and the inline gate sequence in
+    `execute_opportunity` (live) MUST agree on block / no-block for every
+    forecast-market opp. Catches the 'gate added to only one path' drift (the
+    2026-05 COASTAL near-miss) and is the behavior check for the gate
+    unification. Stateful gates (bankroll/budget/dedupe/stale-bracket/addon)
+    are neutralized and the shared *helper* gates are mocked benign, so the
+    sweep isolates the INLINE-condition gates that are physically duplicated
+    across the two paths (MIN_EDGE, MAX_EDGE, MP_RANGE, DIRECTIONAL_*,
+    BUY_NO_EXTREME_SIGMA, KLAX, LOW_BRACKET_TRAP, NO_THIGH, YES_TTAIL,
+    YES_TAIL_MARGIN, THIN_MARGIN, H_2_0, BUY_YES_DISAGREE, MAX_DISAGREEMENT,
+    MU_VS_RM, SPREAD)."""
+
+    _HELPER_NONE = (
+        "_check_f2a_gate", "_check_msg_gate", "_check_model_market_disagree",
+        "_check_mu_position_filter", "_check_cold_source_outlier",
+        "_check_hrrr_dissent", "_check_nbm_in_bracket", "_check_high_mp_trap",
+        "_check_buy_no_tail_risk", "_check_hrrr_in_bracket_warm",
+        "_check_extreme_market_disagree_low_mp",
+        "_check_high_conviction_disag_trap")
+
+    def setUp(self):
+        self._orig = {}
+        self._placed = []
+
+        def _mk_io():
+            yield ("place_kalshi_order",
+                   lambda *a, **k: (self._placed.append(a) or "oid"))
+            yield ("wait_for_fill",
+                   lambda oid, expected, timeout_sec=5.0: ("executed", expected))
+            yield ("kalshi_delete", lambda p: {})
+            yield ("_append_jsonl", lambda p, r: None)
+            yield ("_save_positions", lambda: None)
+            yield ("discord_send", lambda m: None)
+            yield ("notify_discord_entry", lambda r, o: None)
+            yield ("_discord_skip_send", lambda *a, **k: None)
+            yield ("_check_obs_confirmed_alive", lambda o: False)
+            yield ("_check_obs_confirmed_loser", lambda o: False)
+            yield ("_nbp_consistent_with_recent_cli", lambda o: False)
+        for name, fn in _mk_io():
+            self._orig[name] = getattr(pb, name)
+            setattr(pb, name, fn)
+        for h in self._HELPER_NONE:
+            self._orig[h] = getattr(pb, h)
+            setattr(pb, h, lambda o: None)
+        self._orig_dlog = pb._dlog
+        pb._dlog = None
+        pb._cached_bankroll = 1000.0
+        pb._bankroll_cache_ts = pb.time.time()
+
+    def tearDown(self):
+        for name, fn in self._orig.items():
+            setattr(pb, name, fn)
+        pb._dlog = self._orig_dlog
+        pb._cached_bankroll = 0.0
+
+    def _reset_state(self):
+        with pb._positions_lock:
+            pb._open_positions.clear()
+        with pb._cycle_budget_lock:
+            pb._cycle_new_count = 0
+            pb._today_exposure_usd = 0.0
+            pb._today_date_utc = ""
+        pb._reset_cycle_budget()
+        self._placed.clear()
+
+    def _mk(self, **o):
+        action = o.get("action", "BUY_NO")
+        price = o.get("entry_price", 0.55)
+        spread_c = o.get("spread_c", 1)
+        ask_c = int(round(price * 100))
+        tk = o.get("market_ticker", "KXLOWTBOS-99JAN01-B50.5")
+        d = dict(
+            market_ticker=tk, event_ticker="KXLOWTBOS-99JAN01",
+            series="KXLOWTBOS", station=o.get("station", "KBOS"),
+            date_str="2099-01-01", label="Boston", mu_source="nbp",
+            action=action, entry_price=price,
+            edge=o.get("edge", 0.30), model_prob=o.get("model_prob", 0.18),
+            mu=o.get("mu", 47.0), sigma=o.get("sigma", 2.5),
+            floor=o.get("floor", 50.0), cap=o.get("cap", 51.0),
+            disagreement=o.get("disagreement", 1.0),
+            is_today=o.get("is_today", True),
+            running_min=o.get("running_min", None), post_sunrise_lock=False,
+        )
+        if action == "BUY_NO":
+            d["no_ask"] = ask_c; d["no_bid"] = ask_c - spread_c
+            d["yes_ask"] = 100 - d["no_bid"]; d["yes_bid"] = 100 - d["no_ask"]
+        else:
+            d["yes_ask"] = ask_c; d["yes_bid"] = ask_c - spread_c
+            d["no_ask"] = 100 - d["yes_bid"]; d["no_bid"] = 100 - d["yes_ask"]
+        return d
+
+    def _live_blocks(self, opp):
+        self._reset_state()
+        pb.execute_opportunity(opp)
+        return len(self._placed) == 0
+
+    def _audit_blocks(self, opp):
+        bb, _ = pb._evaluate_gates(opp)
+        return bb is not None
+
+    def _sweep_opps(self):
+        # Base passing opp, then vary one (or two, for multi-condition gates)
+        # field(s) at a time across each inline gate's trigger region.
+        yield self._mk()                                            # clean BUY_NO
+        yield self._mk(action="BUY_YES", model_prob=0.70, mu=50.5)  # clean BUY_YES (in bracket)
+        # edge floor / ceiling
+        for e in (0.0, 0.05, 0.11, 0.30, 0.69, 0.75):
+            yield self._mk(edge=e)
+        # model_prob range + directional (NO needs mp<=0.20; YES needs mp>=0.65)
+        for mp in (0.01, 0.05, 0.18, 0.20, 0.25, 0.50, 0.64, 0.70, 0.96, 0.99):
+            yield self._mk(model_prob=mp)
+            yield self._mk(action="BUY_YES", model_prob=mp, mu=50.5)
+        # sigma (EXTREME_SIGMA: σ>=8 AND mp<0.10; KLAX: σ>=2.5 on KLAX B-bracket)
+        for sg in (2.5, 8.0, 9.0):
+            yield self._mk(sigma=sg, model_prob=0.05)
+            yield self._mk(sigma=sg, market_ticker="KXLOWTLAX-99JAN01-B50.5",
+                           station="KLAX")
+        # mu vs bracket: below/in/above at many margins (THIN_MARGIN, LOW_BRACKET_TRAP, MU_VS_RM)
+        for mu in (40.0, 44.0, 48.0, 49.0, 49.5, 50.5, 51.0, 52.0, 53.0, 56.0, 60.0):
+            yield self._mk(mu=mu)
+            yield self._mk(mu=mu, disagreement=0.5)   # LOW_BRACKET_TRAP_CONSENSUS (disag<max)
+            yield self._mk(mu=mu, running_min=52.0)   # LOW_BRACKET_TRAP_RM_ABOVE / MU_VS_RM
+        # bracket shape: T-high (cap None), T-low (floor None) — NO_THIGH / YES_TTAIL / YES_TAIL_MARGIN
+        for fl, cp in ((50.0, None), (None, 51.0)):
+            for act in ("BUY_NO", "BUY_YES"):
+                for mu in (45.0, 50.5, 56.0):
+                    yield self._mk(action=act, floor=fl, cap=cp, mu=mu,
+                                   model_prob=0.70 if act == "BUY_YES" else 0.18)
+        # disagreement: H_2_0 (NO, not today, disag>4.5), BUY_YES_DISAGREE, MAX_DISAGREEMENT
+        for dg in (1.0, 4.6, 5.5, 6.0):
+            for it in (True, False):
+                yield self._mk(disagreement=dg, is_today=it)
+                yield self._mk(action="BUY_YES", model_prob=0.70, mu=50.5,
+                               disagreement=dg, is_today=it)
+        # spread
+        for sc in (1, 8, 11, 12, 20):
+            yield self._mk(spread_c=sc)
+            yield self._mk(action="BUY_YES", model_prob=0.70, mu=50.5, spread_c=sc)
+        # MU_VS_RM: |μ−rm|>5, margin-safe (μ≫cap) + disag≥2 so LOW_BRACKET_TRAP
+        # and THIN_MARGIN don't pre-empt it.
+        for rm in (44.0, 57.0, 60.0):
+            yield self._mk(mu=58.0, disagreement=3.0, running_min=rm)
+
+    def test_audit_and_live_paths_agree(self):
+        mismatches = []
+        n = 0
+        for opp in self._sweep_opps():
+            n += 1
+            a = self._audit_blocks(opp)
+            lv = self._live_blocks(opp)
+            if a != lv:
+                mismatches.append(
+                    (opp["market_ticker"], opp["action"],
+                     f"mu={opp['mu']} br=[{opp['floor']},{opp['cap']}] "
+                     f"edge={opp['edge']} mp={opp['model_prob']} σ={opp['sigma']} "
+                     f"disag={opp['disagreement']} today={opp['is_today']}",
+                     f"audit_blocks={a} live_blocks={lv}"))
+        self.assertEqual(
+            mismatches, [],
+            f"{len(mismatches)}/{n} gate-path disagreements (audit vs live):\n"
+            + "\n".join(str(m) for m in mismatches[:20]))
+
+
 @unittest.skipUnless(getattr(pb, 'ABS_DISTANCE_ENABLED', True),
                      'ABS_DISTANCE disabled per 2026-05-10 audit')
 class TestAbsDistanceGate(unittest.TestCase):
