@@ -5175,16 +5175,29 @@ def _compute_primary_outlier_diff(opp: dict) -> Optional[float]:
 
 
 def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
-    """Replay all entry gates in `execute_opportunity` order against `opp` and
-    return `(blocked_by, reason)` for the FIRST gate that blocks. Returns
+    """⚠️ AUDIT / CALIBRATION ONLY — THIS DOES NOT BLOCK LIVE TRADES. ⚠️
+
+    The LIVE entry-gate path is the inline gate sequence in
+    `execute_opportunity` (each gate there calls `_audit_skip(...)` then
+    `return False`). THIS function is a read-only REPLICA of that sequence,
+    used only to stamp a `blocked_by` reason on every candidate for
+    calibration analysis. It is NOT dead code: `record_candidate` writes its
+    result to the candidate log, and `tools/gate_audit.py` imports and calls
+    it directly — so it cannot be deleted, but it also cannot block anything.
+
+    => A new gate MUST be added in BOTH places, in the same order:
+         (1) HERE, so the candidate audit log attributes the block, AND
+         (2) `execute_opportunity`, so the trade is actually blocked.
+       Added only here  → logged but NEVER blocks (the 2026-05 COASTAL +
+       THIN_MARGIN near-miss). Added only there → blocks but is unattributed
+       in the audit pool. Keep the two sequences in sync.
+
+    Replays all entry gates in `execute_opportunity` order against `opp` and
+    returns `(blocked_by, reason)` for the FIRST gate that blocks. Returns
     `(None, "obs_alive_bypass")` when `_obs_confirmed_alive` triggers and
     bypasses forecast gates, or `(None, None)` when all gates pass and the
     bot would enter (modulo per-ticker dedupe + budget caps which are stateful
-    and not modeled here).
-
-    Used by `record_candidate` to write a `blocked_by` field per candidate so
-    later analysis can answer "which gate is blocking winners?" — V2-style
-    shadow logging. Pure function: no side effects, no Kalshi calls."""
+    and not modeled here). Pure function: no side effects, no Kalshi calls."""
     action = opp.get("action")
     entry_price = opp.get("entry_price")
     edge = float(opp.get("edge") or 0)
