@@ -289,7 +289,7 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 80.00                 # 2026-05-26: $50 -> $80 per Chris (raised with flat BUY_NO stake -> $80; see FLAT_BET_NO_USD).
+MAX_BET_USD = 20.00                 # 2026-05-27: $80 -> $20 per Chris (tail control; also caps add-on growth). $80 8x'd correlated-bust drawdown -> 5/27 -$357 night wiped ~a month. Was $50->$80 on 5/26.
                                     # 2026-05-20: $25 → $50 per Chris (raise after 5/19 net +$49 settle, post-tail_risk + post-hrrr_in_bracket_warm).
                                     # 2026-05-17: $25 → $50 per Chris (rolled back same day).
                                     # 2026-05-15 PM: $60 → $25 per Chris.
@@ -354,7 +354,7 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
 # Flat sizing alone took the realized 4wk book −$250 → ~−$23; flat $10 +
 # THIN_MARGIN → +$36. BUY_YES is unaffected (stays at MAX_BET_BUY_YES_USD).
 FLAT_SIZING_NO_ENABLED = True
-FLAT_BET_NO_USD = 80.00          # 2026-05-26: $10 -> $80 per Chris (flat BUY_NO stake; MAX_BET_USD cap raised to match).
+FLAT_BET_NO_USD = 20.00          # 2026-05-27: $80 -> $20 per Chris (reduce correlated-tail drawdown after 5/27 -$357). Was $10->$80 on 5/26.
 
 # 2026-05-10: DISABLED. 14d audit (n=16 settled): 5 helps / 11 hurts (31%
 # accuracy, well below random). Net -$93 raw / -$31 adj. Today (May 10)

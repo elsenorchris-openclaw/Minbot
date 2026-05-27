@@ -3,6 +3,20 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-27 — BUY_NO stake $80 → $20 (per Chris): cut correlated-tail risk
+
+After the 5/27 **−$357** night, the root cause of the *magnitude* (not the busts) was the
+5/26 stake bump **$10 → $80 (8×)**. A broad forecast cold-miss busted five cities' NO bets
+at once (San Antonio/Austin/Dallas/Las Vegas/Chicago — lows came in 4–5.5°F colder than
+forecast, into their brackets). The *same routine cold-miss* historically cost ~$50; at $80
+it cost −$357 and wiped roughly a month's profit. Lowered `FLAT_BET_NO_USD` $80→$20 and
+`MAX_BET_USD` $80→$20 (the cap also bounds add-on growth, so no BUY_NO position exceeds $20).
+**The forecast model is unchanged** — this is purely position-sizing risk control; the edge
+per bet is thin and the losses are weather-correlated, so $80 over-sized the tail. Stale
+value-pin test `test_max_bet_is_80` updated to $20. Tests 842 pass. Pending: proper
+EV-vs-tail sizing analysis to pick the long-term stake.
+
+
 ## 2026-05-27 — REVERT paced 10am dribble (self-crushed live); keep hold-confirmed-winner
 
 The paced clip shipped 5/26 (`ee203b0`) FAILED in production. KOKC-26MAY27's NO bid was a
