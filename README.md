@@ -3,6 +3,91 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-27 PM — `ENTRY_TIME_WINDOW` gate (T=5h, BUY_NO)
+
+Block BUY_NO entries fired more than 5 hours before climate-day local
+midnight start. Catches d-1 lead-time failure mode: `MIN_EDGE` clears on a
+confident d-1 forecast but actual forecast error exceeds bot's reported σ.
+
+### Trigger
+
+2026-05-26 Texas cluster (the magnitude side of the −$357 night). 6 of 9
+BUY_NO entries that day were Texas-region, all using `hrrr_d1_override`,
+all entered 7-13h before climate-day start. Single forecast bet, six times.
+
+| Ticker | hpc | cost | realized |
+|---|---|---|---|
+| AUS-26MAY27-T65   | +9.0h  | $79.65 | ~−$79 |
+| SATX-26MAY27-T64  | +8.4h  | $79.35 | −$78  |
+| DAL-26MAY27-B66.5 | +7.4h  | $79.73 | −$76  |
+| OKC-26MAY27-B63.5 | +10-11 | $79.78 | −$38  |
+| CHI-26MAY27-B60.5 | +13.5  | $9.80  | −$9   |
+
+Median hpc on 5/26 jumped from +0.9h (5/25) → +8.4h. Total deployed $389
+(prior 7d max $252). Biggest single-day cost-deploy by far.
+
+### Audit (14d V1 min, n=56 BUY_NO resolved entries from 5/13-5/26)
+
+| T (h) | blocks | helps:hurts | gate_lift | LOO-1 robust |
+|---|---|---|---|---|
+| 4h | 31 | 20:11 (1.8:1) | +$491 | +$413 |
+| **5h** ✓ | **28** | **19:9 (2.1:1)** | **+$495** | **+$417** |
+| 6h | 20 | 12:8 (1.5:1) | +$291 | +$213 |
+| 8h | 16 | 9:7 (1.3:1) | +$178 | +$100 |
+
+Binomial p<0.01 at T=5h (19/28 = 68% loss-catch rate vs 50% null).
+
+Outcome-by-hpc-bucket shows the dip: 25-31% win rate in the +2-8h band
+vs ~45% in [-2h, +2h]. Model is uniformly worse at d-1 lead than its σ
+admits.
+
+### Constants
+
+```python
+ENTRY_TIME_WINDOW_ENABLED = True
+ENTRY_TIME_WINDOW_HOURS_MAX = 5.0
+```
+
+### Mechanism
+
+`opp.tz` (IANA, from `CITIES[series]["tz"]`) + `opp.date_str` → compute
+climate-day local midnight in UTC, subtract `datetime.now(UTC)`, get
+hours_pre_climate. Block BUY_NO when > 5h. Bypassed by `obs_alive`
+(running_min implies entry post climate-day start, so hpc ≤ 0 anyway).
+
+### Placement
+
+In `_evaluate_gates` after `OBS_CONFIRMED_LOSER`, before `MAX_EDGE`.
+Gate-unified path (since 5/26 `90a12d9`) → `execute_opportunity` delegates,
+single ship site.
+
+### Counterfactual on 5/26 cluster
+
+T=5h would have blocked ALL 6 disaster bets, saving ~$280 realized loss.
+Doesn't touch the 3 d-0/obs-aware entries that did fine.
+
+### Bars
+
+All MIN_BOT_BACKTEST_PLAYBOOK bars pass at T=5h:
+- n≥20 ✓ (n=28)
+- helps:hurts ≥ 2:1 ✓ (2.1:1)
+- gate_lift positive ✓ (+$495)
+- LOO-1 robust positive ✓ (+$417)
+- mechanism articulable ✓ (forecast σ underestimates error at d-1 lead)
+
+Tests: `tests/test_entry_time_window.py` (17 cases). Audit script:
+`/tmp/v1_entry_time_audit.py`. Commit `de56510`.
+
+### Sister recs (NOT shipped)
+
+- **P2 — Regional cap.** Max 2-3 BUY_NO entries within a region per
+  climate-day cohort. Addresses geographic-correlation directly.
+- **P3 — `*_d1_override` sizing taper.** d-1 forecasts get smaller cap.
+- **P4 — Rolling-24h $-deployed cap.** Bluntest tool; partly redundant
+  with ENTRY_TIME_WINDOW + P2.
+
+Audit data already in `bot_decisions.sqlite` + the 14d candidate pool.
+
 ## 2026-05-27 — BUY_NO stake $80 → $20 (per Chris): cut correlated-tail risk
 
 After the 5/27 **−$357** night, the root cause of the *magnitude* (not the busts) was the
