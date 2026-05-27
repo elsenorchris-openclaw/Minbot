@@ -1097,6 +1097,35 @@ HIGH_CONVICTION_DISAG_TRAP_ENABLED = True
 HIGH_CONVICTION_DISAG_TRAP_MP_MAX  = 0.075
 HIGH_CONVICTION_DISAG_TRAP_DISAG_F = 2.0
 
+# 2026-05-27: ENTRY_TIME_WINDOW — BUY_NO entry-window cap. Block BUY_NO entries
+# that would fire more than ENTRY_TIME_WINDOW_HOURS_MAX hours before the
+# climate-day midnight start (city local time). Catches the "d-1 forecast
+# entered too early" failure mode where MIN_EDGE clears on a confident d-1
+# forecast but the actual error bars are larger than the model's σ reflects.
+#
+# Trigger: 2026-05-26 Texas cluster (AUS-T65, SATX-T64, DAL-B66.5 at +9.0/
+# +8.4/+7.4h pre-climate, all $79.65 cap, all using hrrr_d1_override, all
+# settled LOSS for ~-$238 net). Cluster was 6 of 9 BUY_NO entries in Texas
+# region — single forecast bet, six times.
+#
+# Audit (14d, n=56 BUY_NO resolved entries from 5/13 → 5/26):
+#   T=5h: 28 blocks → 19L:9W = 2.1:1 helps:hurts
+#           gate_lift +$495.15, LOO-1 robust +$416.95
+#           binomial p<0.01 (19/28 = 68% loss-catch vs 50% null)
+#   T=4h: 31 blocks → 20L:11W (1.8:1, +$491 / robust +$413)
+#   T=6h: 20 blocks → 12L:8W  (1.5:1, +$291 / robust +$213)
+# All playbook bars pass at T=5h: n≥20 ✓, h:h≥2:1 ✓, lift positive ✓,
+# robust positive ✓. Outcome-by-hpc-bucket shows win-rate dip 25-31% in
+# the +2-8h range (vs ~45% in [-2h, +2h] window) — model is uniformly
+# worse at d-1 lead than the bot's σ admits.
+#
+# obs_alive cases never have hpc > 0 (running_min implies entry post climate-
+# day start), so this gate doesn't touch d-0/obs-aware entries.
+#
+# Audit script: /tmp/v1_entry_time_audit.py.
+ENTRY_TIME_WINDOW_ENABLED = True
+ENTRY_TIME_WINDOW_HOURS_MAX = 5.0  # block BUY_NO when hours pre-climate-day > this
+
 # 2026-05-15: HRRR_DISSENT — BUY_NO B-bracket gate. Block when HRRR predicts
 # low at-or-below cap (HRRR is the near-term short-horizon model, ~0-12h
 # lead) AND both slow consensus models (NBP, NBM-OM) confidently above cap
@@ -3921,6 +3950,36 @@ def _check_high_conviction_disag_trap(opp: dict) -> Optional[str]:
             f"{HIGH_CONVICTION_DISAG_TRAP_DISAG_F:.1f}°F")
 
 
+# ─── ENTRY_TIME_WINDOW gate (BUY_NO only) ─────────────────────────────────
+def _check_entry_time_window(opp: dict) -> Optional[str]:
+    """Block BUY_NO entries fired more than ENTRY_TIME_WINDOW_HOURS_MAX hours
+    before the climate-day local midnight start. Caller bypasses when
+    _obs_confirmed_alive (those cases always have hpc <= 0 anyway). See
+    ENTRY_TIME_WINDOW_* constants for backtest evidence + 5/26 Texas cluster.
+    """
+    if not ENTRY_TIME_WINDOW_ENABLED:
+        return None
+    if opp.get("action") != "BUY_NO":
+        return None
+    date_str = opp.get("date_str")
+    tz_name = opp.get("tz")
+    if not date_str or not tz_name:
+        return None
+    try:
+        tz = ZoneInfo(tz_name)
+        cd_midnight_local = datetime.strptime(date_str, "%Y-%m-%d").replace(
+            tzinfo=tz)
+        now_utc = datetime.now(tz=timezone.utc)
+        hours_pre = (cd_midnight_local - now_utc).total_seconds() / 3600.0
+    except Exception:
+        return None
+    if hours_pre > ENTRY_TIME_WINDOW_HOURS_MAX:
+        return (f"ENTRY_TIME_WINDOW: BUY_NO {hours_pre:.1f}h pre-climate-day "
+                f"> {ENTRY_TIME_WINDOW_HOURS_MAX:.0f}h cap "
+                f"(d-1 lead forecast error exceeds bot σ)")
+    return None
+
+
 # ─── BUY_NO_NBM_IN_BRACKET gate (d-1+ BUY_NO B-bracket only) ──────────────
 def _check_nbm_in_bracket(opp: dict) -> Optional[str]:
     """Block d-1+ BUY_NO B-bracket when NBM-OM lies INSIDE the upper edge of
@@ -5245,6 +5304,11 @@ def _evaluate_gates(opp: dict) -> tuple[Optional[str], Optional[str]]:
     if _check_obs_confirmed_loser(opp):
         return ("OBS_CONFIRMED_LOSER",
                 f"rm={opp.get('running_min')} in YES territory")
+    # 2026-05-27 ENTRY_TIME_WINDOW: block BUY_NO entries fired too early
+    # (d-1 lead forecast σ underestimates actual error). See constants block.
+    etw_block = _check_entry_time_window(opp)
+    if etw_block:
+        return ("ENTRY_TIME_WINDOW", etw_block)
     if edge > MAX_EDGE:
         return ("MAX_EDGE", f"{edge:.2%} > {MAX_EDGE:.0%}")
     if mp < MIN_MODEL_PROB or mp > MAX_MODEL_PROB:
