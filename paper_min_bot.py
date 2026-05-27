@@ -901,7 +901,7 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 # bottom. Est. 5/25: KBOS +$21, KSEA +$13; clean 99c winners unchanged.
 # Rollback: ENABLE_PACED_EXIT = False (byte-identical full dump).
 ENABLE_PACED_EXIT  = True
-PACED_EXIT_CLIP_C  = 8
+PACED_EXIT_CLIP_C  = 100000  # 2026-05-27: dribble DISABLED -> full-size dump. The paced clip self-crushed KOKC 62->29c live (5/27); pacing doesn't beat the thin-book exit crush (structural). Hold-confirmed-winner (A) retained via ENABLE_PACED_EXIT=True. Effectively-unlimited clip => _execute_exit sells full size like the long-standing baseline. Pending structural exit redesign.
 
 # ─── SHADOW exit activation gate (2026-05-13 ship) ────────────────────────
 # Graduates _check_position_obs_confirmed_loser_for_exit from logging-only

@@ -3,6 +3,27 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-27 — REVERT paced 10am dribble (self-crushed live); keep hold-confirmed-winner
+
+The paced clip shipped 5/26 (`ee203b0`) FAILED in production. KOKC-26MAY27's NO bid was a
+steady **62c for 30+ min** (running_min/mu flat — no new info), then the 8-contract/cycle
+dribble walked it **62→29c over 11 min** — a self-crush, the exact thing it was meant to
+prevent (24 min of visible persistent selling likely made market-makers pull bids *worse*
+than a fast dump). Fix: `PACED_EXIT_CLIP_C` 8 → 100000 so the clip == full position size →
+full-size dump (the long-standing baseline), no dribble. Kept `ENABLE_PACED_EXIT=True` so
+**(A) hold-confirmed-winners** (skip the 10am sell when running_min is already below the
+bracket floor → can't lose) is retained — that part is sound and was Chris-requested.
+
+**Honest limitation:** full-dump ALSO crushes large positions on these thin min-temp bid
+books — the thin-book exit crush is **structural** (deep asks / thin bids; you can't unload
+100+ contracts without ~halving the price). Neither pacing nor dumping solves it. Pending a
+structural redesign (smaller entries so exits don't overwhelm the book / gradual all-day
+exit / hold-to-settlement). 5/27's big loss (~−$196) was **83% genuine overnight busts**
+(SATX/DAL/LAS — lows collapsed into their brackets, the inherent NO risk), only ~$30 was the
+OKC self-crush. Tests 842 pass. Rollback: `ENABLE_PACED_EXIT=False` (also drops hold-winner)
+or restore `.bak_pacedrevert_20260527_170651`.
+
+
 ## 2026-05-26 — PACED 10am liquidation + keep confirmed winners
 
 `TIME_EXIT_10AM` was liquidating by throwing the FULL position at the bid every
