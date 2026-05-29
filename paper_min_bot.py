@@ -6205,6 +6205,14 @@ def _check_position_obs_winning(pos: dict, rm: float) -> bool:
         if floor is not None and cap is not None:
             if rm < float(floor) - 1.0:
                 return True
+            # 2026-05-29: warm-side winner (Chris). Running min locked ABOVE the
+            # bracket (low stayed warmer than [floor,cap]) -> BUY_NO wins. Mirror of
+            # entry-side _check_obs_confirmed_alive (~L3766). POST-LOW-LOCK gated:
+            # rm (running min) can still fall into the bracket pre-lock, so only
+            # confirm a warm winner after the low is set (_is_post_sunrise, >=8AM local).
+            _tz_w = pos.get("tz") or _STATION_TZ.get(pos.get("station"), "America/New_York")
+            if rm > float(cap) + 1.0 and _is_post_sunrise(_tz_w):
+                return True
         # T-high (single-bound floor): rm below threshold → NO wins
         elif floor is not None and cap is None:
             if rm < float(floor) - 1.0:
