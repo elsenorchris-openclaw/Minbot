@@ -4787,6 +4787,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
         # covers the new default.
         self._saved_flat = pb.FLAT_SIZING_NO_ENABLED
         pb.FLAT_SIZING_NO_ENABLED = False
+        self._saved_haircut = pb.MIN_NO_SIGMA_HAIRCUT_ENABLED
         with pb._positions_lock:
             pb._open_positions.clear()
         with pb._cycle_budget_lock:
@@ -4803,6 +4804,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
     def tearDown(self):
         pb.BANKROLL_REF_USD = self._saved_ref
         pb.FLAT_SIZING_NO_ENABLED = self._saved_flat
+        pb.MIN_NO_SIGMA_HAIRCUT_ENABLED = self._saved_haircut
         pb.place_kalshi_order = self._orig_place
 
     def _opp(self, sigma, **overrides):
@@ -4865,24 +4867,44 @@ class TestSigmaAwareSizing(unittest.TestCase):
         # Quadratic shrink at σ=3.5: ~0.51× — count should be roughly half.
         self.assertLess(count_wide, count_ref * 0.7)
 
-    def test_flat_sizing_ignores_sigma(self):
-        # 2026-05-26 shipped default: flat sizing for BUY_NO → count is
-        # FLAT_BET_NO_USD/price regardless of σ (the σ-Kelly shrink above only
-        # applies on the legacy Kelly path / BUY_YES).
-        pb.FLAT_SIZING_NO_ENABLED = True
-        pb.execute_opportunity(self._opp(sigma=2.5))
-        self.assertEqual(len(self._calls), 1)
-        count_narrow = self._calls[0][2]
+    def _flat_count_at(self, sigma):
         self._calls.clear()
         pb._reset_cycle_budget()
         with pb._positions_lock:
             pb._open_positions.clear()
-        pb.execute_opportunity(self._opp(sigma=5.0))
+        pb.execute_opportunity(self._opp(sigma=sigma))
         self.assertEqual(len(self._calls), 1)
-        count_wide = self._calls[0][2]
-        # σ doubled but flat sizing → identical count, == FLAT_BET_NO_USD/price.
-        self.assertEqual(count_wide, count_narrow)
-        self.assertEqual(count_narrow, int(pb.FLAT_BET_NO_USD / 0.50))
+        return self._calls[0][2]
+
+    def test_flat_sizing_sigma_haircut(self):
+        # 2026-05-29 shipped default: gentle σ-haircut on the flat BUY_NO
+        # stake. σ<LO_THRESH → full FLAT_BET_NO_USD; σ∈[LO,HI) → ×LO_MULT;
+        # σ≥HI → ×HI_MULT. Tail-variance control on correlated regime-bust
+        # nights (5/27, 5/29). Replaces the pre-5/29 flat-ignores-σ default.
+        pb.FLAT_SIZING_NO_ENABLED = True
+        pb.MIN_NO_SIGMA_HAIRCUT_ENABLED = True
+        full = int(pb.FLAT_BET_NO_USD / 0.50)
+        lo = int(pb.FLAT_BET_NO_USD * pb.MIN_NO_SIGMA_HAIRCUT_LO_MULT / 0.50)
+        hi = int(pb.FLAT_BET_NO_USD * pb.MIN_NO_SIGMA_HAIRCUT_HI_MULT / 0.50)
+        # below LO_THRESH (4.0): no haircut → full stake
+        self.assertEqual(self._flat_count_at(2.5), full)
+        self.assertEqual(self._flat_count_at(3.9), full)
+        # [LO_THRESH, HI_THRESH) = [4,5): ×0.5
+        self.assertEqual(self._flat_count_at(4.0), lo)
+        # ≥ HI_THRESH (5.0): ×0.25
+        self.assertEqual(self._flat_count_at(5.0), hi)
+        # haircut shrinks the high-σ stake well below the full flat stake
+        self.assertLess(hi, full)
+
+    def test_flat_sizing_haircut_disabled_ignores_sigma(self):
+        # Rollback path: with the haircut disabled, flat sizing ignores σ
+        # entirely → count == FLAT_BET_NO_USD/price regardless of σ
+        # (the pre-2026-05-29 behavior).
+        pb.FLAT_SIZING_NO_ENABLED = True
+        pb.MIN_NO_SIGMA_HAIRCUT_ENABLED = False
+        full = int(pb.FLAT_BET_NO_USD / 0.50)
+        self.assertEqual(self._flat_count_at(2.5), full)
+        self.assertEqual(self._flat_count_at(5.0), full)
 
 
 class TestPartialExitNoOrphan(unittest.TestCase):

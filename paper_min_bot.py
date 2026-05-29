@@ -356,6 +356,22 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
 FLAT_SIZING_NO_ENABLED = True
 FLAT_BET_NO_USD = 20.00          # 2026-05-27: $80 -> $20 per Chris (reduce correlated-tail drawdown after 5/27 -$357). Was $10->$80 on 5/26.
 
+# 2026-05-29: gentle σ-haircut on the flat BUY_NO stake (Chris). Flat $20
+# ignored forecast reliability — high-σ NO bets (wide-forecast σ-artifacts,
+# e.g. μ sitting near the bracket with σ=6) got the same $20 as a tight σ=2.5
+# forecast and detonate together on correlated regime-bust nights (5/27 −$357
+# across 6 stations; 5/29 LV/DAL/OKC). Shrink the unreliable ones: σ∈[4,5)→×0.5,
+# σ≥5→×0.25. Realized-pool (settle∪exit, post-live-chain) before/after: protects
+# the worst nights (5/27/28/29), ≈breakeven ex-tail — TAIL-VARIANCE control, not
+# alpha (consistent with the flat-sizing finding that size-by-signal adds no
+# edge). Graduated cousin of the Kelly path's sigma_shrink=(2.5/σ)², which the
+# flat NO path bypasses. Rollback: MIN_NO_SIGMA_HAIRCUT_ENABLED=False.
+MIN_NO_SIGMA_HAIRCUT_ENABLED = True
+MIN_NO_SIGMA_HAIRCUT_LO_THRESH = 4.0   # σ in [LO_THRESH, HI_THRESH) → LO_MULT
+MIN_NO_SIGMA_HAIRCUT_LO_MULT   = 0.50
+MIN_NO_SIGMA_HAIRCUT_HI_THRESH = 5.0   # σ ≥ HI_THRESH → HI_MULT
+MIN_NO_SIGMA_HAIRCUT_HI_MULT   = 0.25
+
 # 2026-05-10: DISABLED. 14d audit (n=16 settled): 5 helps / 11 hurts (31%
 # accuracy, well below random). Net -$93 raw / -$31 adj. Today (May 10)
 # stack-aware re-audit on n=10 fires showed 7 would actually buy if gate
@@ -5746,7 +5762,17 @@ def execute_opportunity(opp: dict) -> bool:
         # noise that has landed on losers. Flat stake removes it. BUY_YES keeps
         # Kelly (already bounded tiny by MAX_BET_BUY_YES_USD).
         if FLAT_SIZING_NO_ENABLED and _bet_action == "BUY_NO":
-            bet_usd = FLAT_BET_NO_USD
+            # gentle σ-haircut: shrink the flat stake when the forecast is
+            # unreliable (wide σ). Tail-variance control on correlated
+            # regime-bust nights. See MIN_NO_SIGMA_HAIRCUT_* constants.
+            _no_hc = 1.0
+            if MIN_NO_SIGMA_HAIRCUT_ENABLED:
+                _no_sigma = float(opp.get("sigma") or 0.0)
+                if _no_sigma >= MIN_NO_SIGMA_HAIRCUT_HI_THRESH:
+                    _no_hc = MIN_NO_SIGMA_HAIRCUT_HI_MULT
+                elif _no_sigma >= MIN_NO_SIGMA_HAIRCUT_LO_THRESH:
+                    _no_hc = MIN_NO_SIGMA_HAIRCUT_LO_MULT
+            bet_usd = FLAT_BET_NO_USD * _no_hc
         else:
             bet_usd = min(_effective_max_bet, max(MIN_BET_USD, kelly * bankroll))
         count = max(1, int(bet_usd / price))

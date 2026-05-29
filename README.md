@@ -3,6 +3,38 @@
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 
+## 2026-05-29 — gentle σ-haircut on flat BUY_NO stake (per Chris)
+
+Post-mortem of the 5/29 all-losers night (4 BUY_NO, 3 losers, ~−$42) found the
+losses are correlated **regime-bust nights**: a whole region's overnight lows
+come in biased vs the NWP models, so many NO bets fail together (worst: 5/27
+−$357 with 6/6 stations losing). No *entry* filter robustly separates these —
+tested ~16 (timing, σ-ceiling, μ-geometry, disagreement, per-night caps) on the
+realized settle∪exit pool via `tools/backtest_filters.py --stack live`; every
+one collapses to the single 5/27 night or hurts more nights than it helps. The
+losses concentrate in **high-σ forecasts** (realized BUY_NO pnl: σ<4 +$107,
+σ4–5 −$53, σ≥5 −$107), and the flat $20 stake gave a σ=6 junk forecast the same
+size as a tight σ=2.5 one.
+
+**Change:** gentle σ-haircut on the flat BUY_NO stake. The Kelly path already
+has `sigma_shrink=(2.5/σ)²`; the flat NO path bypassed it. New constants
+`MIN_NO_SIGMA_HAIRCUT_ENABLED=True`, `LO_THRESH=4.0`/`LO_MULT=0.5`,
+`HI_THRESH=5.0`/`HI_MULT=0.25` → σ∈[4,5) sized ×0.5, σ≥5 ×0.25; σ<4 unchanged.
+Applied at the flat-NO sizing branch in `execute_opportunity`.
+
+**Realized-pool before/after** (raw $, settle∪exit): full BUY_NO −$345 → −$167;
+post-live-chain (going forward) +$121 → +$242. **But robust lift ex-5/27 is only
++$7.4 (helps:hurts 9:12 by night)** — this is **tail-variance control, not
+alpha** (consistent with the 5/26 finding that size-by-signal has ~0 per-contract
+edge). It shrinks exactly the high-σ bets that detonate on regime-bust nights:
+5/27 −$357→−$243, 5/28 −$24→−$6; 5/29 LV/OKC $20→$5, DAL $20→$10. Good-σ busts
+(Chicago σ=2.6) are unaffected by design. Most 5/27-scale protection is already
+covered by the $20 `FLAT_BET_NO_USD`/`MAX_BET_USD` cap — this is incremental
+belt-and-suspenders. **Rollback:** `MIN_NO_SIGMA_HAIRCUT_ENABLED=False`. Tests:
+`TestSigmaAwareSizing` updated (old flat-ignores-σ test replaced by
+`test_flat_sizing_sigma_haircut` + `test_flat_sizing_haircut_disabled_ignores_sigma`);
+860 pass.
+
 ## 2026-05-27 PM — `ENTRY_TIME_WINDOW` gate (T=5h, BUY_NO)
 
 Block BUY_NO entries fired more than 5 hours before climate-day local
