@@ -654,6 +654,34 @@ PER_SERIES_D1_PRIMARY: dict[str, str] = {
                           # gets ported.
 }
 
+USE_D1_CONSENSUS = True  # 2026-05-29 (Chris): d-1 mu = median-consensus of HRRR/NBM/NBP
+# instead of a single per-city source. Source-accuracy test n=248 station-days, both halves:
+# NBM warm-biased +1.64F, HRRR best (-0.41F), median-consensus MAE 1.77 < every single source
+# (1.87-2.08); replaces the fragile per-city auto-select that wrongly assigned CHI->NBM (warm,
+# busted 05-29). Audited HRRR-primary cities (CHI/OKC/HOU/NOLA/SAT, hardcoded HRRR in
+# PER_SERIES_D1_PRIMARY) KEEP HRRR (NBP/NBM catastrophically warm there; consensus would re-warm).
+# Forecast-quality upgrade; PnL expected marginal -> forward-monitor. Rollback: USE_D1_CONSENSUS=False.
+
+
+def _d1_consensus_mu(series, hrrr, nbm, nbp):
+    """d-1 mu: median-consensus of available sources, EXCEPT hardcoded HRRR-primary
+    cities keep HRRR. Returns (mu, sigma, source) or None (caller falls back to single source)."""
+    import statistics as _st
+    sig = nbp["sigma"] if nbp else 2.5
+    if PER_SERIES_D1_PRIMARY.get(series) == "hrrr" and hrrr is not None:
+        return float(hrrr), sig, "hrrr_d1_override"
+    vals = []
+    if hrrr is not None:
+        vals.append(float(hrrr))
+    if nbm is not None:
+        vals.append(float(nbm))
+    if nbp:
+        vals.append(float(nbp["mu"]))
+    if len(vals) >= 2:
+        return _st.median(vals), sig, "consensus_d1"
+    return None
+
+
 # Per-city d-0 source override. d-0 default is HRRR (freshest nowcast), but
 # 30-day candidate-log audit (2026-04-29) shows three stations where NBP is
 # materially more accurate AND less biased than HRRR on d-0. Switching d-0
@@ -4293,6 +4321,9 @@ def find_opportunities(markets: list[dict]) -> list[dict]:
             mu = hrrr
             sigma = nbp["sigma"] if nbp else 2.5
             mu_source = "hrrr"
+        elif (not is_today and USE_D1_CONSENSUS
+              and (_cm := _d1_consensus_mu(m["series"], hrrr, nbm, nbp)) is not None):
+            mu, sigma, mu_source = _cm
         elif (not is_today
               and get_d1_primary(m["series"]) == "hrrr"
               and hrrr is not None):
@@ -5000,6 +5031,9 @@ def _resolve_live_min_forecast(series: str, station: str, date_str: str,
         mu, sigma, mu_source = nbp["mu"], nbp["sigma"], "nbp_d0_override"
     elif is_today and hrrr is not None:
         mu, sigma, mu_source = hrrr, (nbp["sigma"] if nbp else 2.5), "hrrr"
+    elif (not is_today and USE_D1_CONSENSUS
+          and (_cm := _d1_consensus_mu(series, hrrr, nbm, nbp)) is not None):
+        mu, sigma, mu_source = _cm
     elif (not is_today
           and get_d1_primary(series) == "hrrr"
           and hrrr is not None):
