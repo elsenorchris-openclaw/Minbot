@@ -39,7 +39,13 @@ import json
 import re
 import subprocess
 from collections import Counter, defaultdict
+from datetime import datetime, timezone
 from pathlib import Path
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:  # pragma: no cover - zoneinfo present on py3.9+
+    ZoneInfo = None
 
 ROOT = Path("/home/ubuntu/paper_min_bot")
 SETTLEMENTS_PATH = ROOT / "data" / "settlements.jsonl"
@@ -366,6 +372,36 @@ def _thin_margin(t):
     return False
 
 
+def _entry_time_window(t):
+    """ENTRY_TIME_WINDOW — BUY_NO entries fired more than 5.0h before the
+    climate-day local midnight start. Faithful backtest port of
+    paper_min_bot.py:_check_entry_time_window (ENTRY_TIME_WINDOW_HOURS_MAX=5.0,
+    DEPLOYED 2026-05-27 de56510 for the 5/26 Texas d-1 cluster). "now" in
+    backtest is the entry timestamp (record ts); tz is the entry tz; the
+    climate day is date_str. obs_alive entries fire post-climate-onset so
+    hours_pre <= 0 and self-exclude (the live caller's obs_alive bypass is a
+    no-op here, matching the deployed function's own docstring)."""
+    if t.get("action") != "BUY_NO":
+        return False
+    if ZoneInfo is None:
+        return False
+    date_str = t.get("date_str")
+    tz_name = t.get("entry_tz") or t.get("tz")
+    ts = t.get("ts")
+    if not date_str or not tz_name or not ts:
+        return False
+    try:
+        cd_midnight_local = datetime.strptime(date_str, "%Y-%m-%d").replace(
+            tzinfo=ZoneInfo(tz_name))
+        entry_utc = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        if entry_utc.tzinfo is None:
+            entry_utc = entry_utc.replace(tzinfo=timezone.utc)
+        hours_pre = (cd_midnight_local - entry_utc).total_seconds() / 3600.0
+    except Exception:
+        return False
+    return hours_pre > 5.0
+
+
 SCENARIOS = {
     "model_prob_oor": (
         _model_prob_out_of_range,
@@ -407,6 +443,10 @@ SCENARIOS = {
         _thin_margin,
         "THIN_MARGIN: BUY_NO μ within 2.0F of near bracket edge — DEPLOYED 2026-05-26",
     ),
+    "entry_time_window": (
+        _entry_time_window,
+        "ENTRY_TIME_WINDOW: BUY_NO fired > 5.0h before climate-day midnight — DEPLOYED 2026-05-27 de56510",
+    ),
 }
 
 # 2026-05-06: `live` meta-scenario — the canonical full-live entry filter
@@ -426,6 +466,7 @@ LIVE_CHAIN = [
     "cold_source_outlier",
     "high_conviction_disag_trap",
     "thin_margin",
+    "entry_time_window",
 ]
 SCENARIOS["live"] = (
     lambda t: any(SCENARIOS[name][0](t) for name in LIVE_CHAIN),
