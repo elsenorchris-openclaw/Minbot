@@ -947,6 +947,25 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 ENABLE_PACED_EXIT  = True
 PACED_EXIT_CLIP_C  = 100000  # 2026-05-27: dribble DISABLED -> full-size dump. The paced clip self-crushed KOKC 62->29c live (5/27); pacing doesn't beat the thin-book exit crush (structural). Hold-confirmed-winner (A) retained via ENABLE_PACED_EXIT=True. Effectively-unlimited clip => _execute_exit sells full size like the long-standing baseline. Pending structural exit redesign.
 
+# ─── ANTI-CHASE floor on TIME_EXIT_10AM (2026-06-01) ────────────────────
+# 2026-06-01: structural fix to the thin-book exit walk-down. Even with
+# PACED_EXIT_CLIP_C=100000 (full-size dump), the bot re-reads the (lower)
+# bid each cycle and chases it down on thin books. NOLA-26MAY28 walked
+# 89→33 in 13 cycles after 50 min of stable 89-90c bid (no new info =
+# self-crush). Same OKC-5/27 pattern, just slower.
+#
+# Fix: snapshot the uncrushed arrival bid as pos['_exit_ref_bid_c'] on
+# first fire; refuse to sell when current bid < ref - ANTICHASE_EXIT_TOL_C.
+# Lets self-crushed bids recover; genuine declines still caught by
+# market_stop (≤1c) and shadow_obs_loser (≤25c + obs-confirmed).
+#
+# Different from 5/26 ship (ee203b0, reverted): that combined floor with
+# PACED dribble — the dribble was the OKC self-crush cause. This adds the
+# floor on top of the (kept) full-size dump. No re-introduction of dribble.
+# Rollback: ENABLE_ANTICHASE_TIME_EXIT = False.
+ENABLE_ANTICHASE_TIME_EXIT = True
+ANTICHASE_EXIT_TOL_C = 8  # cents below ref bid where we stop chasing
+
 # ─── SHADOW exit activation gate (2026-05-13 ship) ────────────────────────
 # Graduates _check_position_obs_confirmed_loser_for_exit from logging-only
 # (Stage 1 since 2026-05-04) to actual exit, scoped to BUY_NO B-bracket
@@ -6666,6 +6685,22 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                 _ss10 = "yes" if action == "BUY_YES" else ("no" if action == "BUY_NO" else None)
                 _bid10 = mkt.get("yes_bid") if action == "BUY_YES" else mkt.get("no_bid")
                 if _ss10 and _bid10 is not None and _bid10 > 0:
+                    # (C) anti-chase floor — refuse to sell below ref_bid - TOL.
+                    # Snapshot uncrushed arrival bid; skip cycles where current
+                    # bid is below floor. Self-crushed bids recover (NOLA-5/28
+                    # 89→33 walk after stable 89c). market_stop (≤1c) +
+                    # shadow_obs_loser (≤25c+obs) still catch genuine declines.
+                    # (2026-06-01)
+                    if ENABLE_ANTICHASE_TIME_EXIT:
+                        if "_exit_ref_bid_c" not in pos:
+                            pos["_exit_ref_bid_c"] = int(_bid10)
+                            _save_positions()
+                        _floor = pos["_exit_ref_bid_c"] - ANTICHASE_EXIT_TOL_C
+                        if int(_bid10) < _floor:
+                            log(f"  TIME_EXIT_10AM ANTICHASE-SKIP {ticker}: "
+                                f"bid={int(_bid10)}c < floor {_floor}c "
+                                f"(ref {pos['_exit_ref_bid_c']}c) — hold this cycle")
+                            continue
                     # (B) sell everything else PACED — a clip per cycle so we don't
                     # outrun the thin book and crush our own bid. (2026-05-26)
                     _clip = (min(int(pos.get("count", 0)), PACED_EXIT_CLIP_C)
