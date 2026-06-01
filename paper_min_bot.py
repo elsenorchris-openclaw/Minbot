@@ -945,7 +945,7 @@ MARKET_STOP_BID_CEIL_C = 1          # exit if current bid ≤ 1¢ AND no obs-win
 # bottom. Est. 5/25: KBOS +$21, KSEA +$13; clean 99c winners unchanged.
 # Rollback: ENABLE_PACED_EXIT = False (byte-identical full dump).
 ENABLE_PACED_EXIT  = True
-PACED_EXIT_CLIP_C  = 100000  # 2026-05-27: dribble DISABLED -> full-size dump. The paced clip self-crushed KOKC 62->29c live (5/27); pacing doesn't beat the thin-book exit crush (structural). Hold-confirmed-winner (A) retained via ENABLE_PACED_EXIT=True. Effectively-unlimited clip => _execute_exit sells full size like the long-standing baseline. Pending structural exit redesign.
+PACED_EXIT_CLIP_C  = 8       # 2026-06-01: paced clip restored (8/cycle); anti-chase floor protects against crush -> full-size dump. The paced clip self-crushed KOKC 62->29c live (5/27); pacing doesn't beat the thin-book exit crush (structural). Hold-confirmed-winner (A) retained via ENABLE_PACED_EXIT=True. Effectively-unlimited clip => _execute_exit sells full size like the long-standing baseline. Pending structural exit redesign.
 
 # ─── ANTI-CHASE floor on TIME_EXIT_10AM (2026-06-01) ────────────────────
 # 2026-06-01: structural fix to the thin-book exit walk-down. Even with
@@ -6664,11 +6664,17 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
         _tz10 = _STATION_TZ.get(pos.get("station"))
         if _tz10:
             _nl10 = datetime.now(ZoneInfo(_tz10))
-            if pos.get("date_str") == _nl10.strftime("%Y-%m-%d") and _nl10.hour >= 10:
-                # (A) keep confirmed winners — hold to settlement, don't 10am-sell.
-                # Min-temp BUY_NO: running_min only falls, so once it's below the
-                # bracket floor NO can't lose; selling at the ~99c bid just gives
-                # up the last cent + adds execution risk. (2026-05-26)
+            if pos.get("date_str") == _nl10.strftime("%Y-%m-%d") and _nl10.hour >= 11:
+                # 2026-06-01 (Chris): "any positions that aren't already settled at
+                # 99c after 11am should be sold". Hour gate raised 10 -> 11; the
+                # HOLD-WINNER override now requires the MARKET to also agree
+                # (no_bid >= 99c) in addition to the obs winner check. Without
+                # market confirmation, the warm-side obs check can mishold tight-
+                # margin positions like PHIL-26JUN01-B55.5 (rm=57.2 vs cap=56.0,
+                # 0.2F over the +1F buffer, but no_bid was 53c -- market saw the
+                # evening cooling risk the +1F buffer missed).
+                _ss10 = "yes" if action == "BUY_YES" else ("no" if action == "BUY_NO" else None)
+                _bid10 = mkt.get("yes_bid") if action == "BUY_YES" else mkt.get("no_bid")
                 if ENABLE_PACED_EXIT:
                     _rm10 = pos.get("running_min")
                     if _rm10 is None:
@@ -6676,14 +6682,17 @@ def check_open_positions_for_exit(market_quotes: dict[str, dict]) -> int:
                     if _rm10 is not None:
                         try:
                             if _check_position_obs_winning(pos, float(_rm10)):
-                                log(f"  TIME_EXIT_10AM HOLD-WINNER {ticker}: rm={_rm10} "
-                                    f"confirms winner - holding to settlement (100c)")
-                                continue
+                                # 2026-06-01: require market agreement (no_bid >= 99c)
+                                if _bid10 is not None and int(_bid10) >= 99:
+                                    log(f"  TIME_EXIT_10AM HOLD-WINNER {ticker}: rm={_rm10} + "
+                                        f"bid={int(_bid10)}c >= 99c both confirm — holding to settlement (100c)")
+                                    continue
+                                else:
+                                    log(f"  TIME_EXIT_10AM HOLD-WINNER-OVERRIDE {ticker}: rm={_rm10} "
+                                        f"obs-winner but bid={_bid10}c < 99c (market disagrees) — selling")
                         except Exception as _wx:
                             log(f"  TIME_EXIT_10AM winner-check raised "
                                 f"{type(_wx).__name__}: {_wx}", "warn")
-                _ss10 = "yes" if action == "BUY_YES" else ("no" if action == "BUY_NO" else None)
-                _bid10 = mkt.get("yes_bid") if action == "BUY_YES" else mkt.get("no_bid")
                 if _ss10 and _bid10 is not None and _bid10 > 0:
                     # (C) anti-chase floor — refuse to sell below ref_bid - TOL.
                     # Snapshot uncrushed arrival bid; skip cycles where current
