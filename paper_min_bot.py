@@ -354,7 +354,7 @@ MIN_COST_USD = 1.00                 # cost floor: ceil(MIN_COST_USD / price) bum
 # Flat sizing alone took the realized 4wk book −$250 → ~−$23; flat $10 +
 # THIN_MARGIN → +$36. BUY_YES is unaffected (stays at MAX_BET_BUY_YES_USD).
 FLAT_SIZING_NO_ENABLED = True
-FLAT_BET_NO_USD = 20.00          # 2026-05-27: $80 -> $20 per Chris (reduce correlated-tail drawdown after 5/27 -$357). Was $10->$80 on 5/26.
+FLAT_BET_NO_USD = 5.00          # 2026-06-02: $20 -> $5 per Chris (smaller stake, shared wallet w/ locklag). Prior $20 (5/27), $80 (5/26).
 
 # 2026-05-29: gentle σ-haircut on the flat BUY_NO stake (Chris). Flat $20
 # ignored forecast reliability — high-σ NO bets (wide-forecast σ-artifacts,
@@ -4691,6 +4691,48 @@ def _compute_today_exposure() -> float:
     return total
 
 
+# 2026-06-02 (Chris): cross-bot conflict guard. locklag_low_bot also trades KXLOWT on
+# this same wallet (BUY_YES on the obs-low bracket); min_bot is mostly BUY_NO. Holding YES
+# and NO on the SAME ticker just pays the spread to ourselves. Block taking the opposite
+# side of anything already on the wallet. Allows same-side add-ons.
+CONFLICT_GUARD_ENABLED = True
+_wallet_pos_cache: dict = {}
+_wallet_pos_cache_ts: float = 0.0
+_WALLET_POS_TTL = 20.0
+
+def _wallet_pos_map(force: bool = False) -> dict:
+    """{ticker: 'yes'|'no'} for every nonzero position on the shared wallet (ALL bots).
+    Short-TTL cached. FAIL-OPEN: on any error returns the last good map (or {})."""
+    global _wallet_pos_cache, _wallet_pos_cache_ts
+    now = time.time()
+    if not force and _wallet_pos_cache_ts and (now - _wallet_pos_cache_ts) < _WALLET_POS_TTL:
+        return _wallet_pos_cache
+    try:
+        data = kalshi_get("/trade-api/v2/portfolio/positions", {"limit": 200})
+    except Exception:
+        return _wallet_pos_cache
+    m = {}
+    for p in (data.get("market_positions") or []):
+        tk = p.get("ticker", "")
+        if not tk:
+            continue
+        try:
+            pf = float(p.get("position_fp") or 0)
+        except (TypeError, ValueError):
+            pf = 0.0
+        if abs(pf) < 0.01:
+            continue
+        m[tk] = "yes" if pf > 0 else "no"
+    _wallet_pos_cache = m
+    _wallet_pos_cache_ts = now
+    return m
+
+def _wallet_has_opposite_side(ticker: str, my_side: str) -> bool:
+    """True if the shared wallet already holds the OPPOSITE side of `ticker`."""
+    held = _wallet_pos_map().get(ticker)
+    return held is not None and held != my_side
+
+
 def _reconcile_kalshi_positions() -> int:
     """Fetch current open positions from Kalshi /portfolio/positions and add
     any non-zero KXLOWT* holdings that aren't already in _open_positions.
@@ -5918,6 +5960,10 @@ def execute_opportunity(opp: dict) -> bool:
         _audit_skip(opp, "BUDGET", f"  skip {ticker}: {reason}")
         return False
     price_cents = int(round(price * 100))
+    # cross-bot conflict guard (2026-06-02): skip if the wallet already holds the opposite side
+    if CONFLICT_GUARD_ENABLED and _wallet_has_opposite_side(ticker, side):
+        _audit_skip(opp, "CONFLICT", f"  skip {ticker}: wallet holds opposite side (cross-bot guard)")
+        return False
     order_id = place_kalshi_order(ticker, side, count, price_cents)
     if not order_id:
         return False

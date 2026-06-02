@@ -181,7 +181,7 @@ class TestMaxBetRollback(unittest.TestCase):
     def test_max_bet_is_20(self):
         import paper_min_bot as pb
         self.assertEqual(pb.MAX_BET_USD, 20.00)
-        self.assertEqual(pb.FLAT_BET_NO_USD, 20.00)
+        self.assertEqual(pb.FLAT_BET_NO_USD, 5.00)   # 2026-06-02: FLAT stake $20->$5 per Chris
 
 
 if __name__ == "__main__":
