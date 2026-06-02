@@ -4773,6 +4773,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
     that should size down."""
 
     def setUp(self):
+        self._saved_max_sig = pb.MAX_BET_USD; pb.MAX_BET_USD = 1000.0
         # 2026-05-02: BANKROLL_REF_USD became the Kelly anchor (was: live cash).
         # For σ-shrink to be visible in `count`, anchor × Kelly fraction must
         # land BELOW MAX_BET_USD — otherwise the cap masks the shrink.
@@ -4802,6 +4803,7 @@ class TestSigmaAwareSizing(unittest.TestCase):
         )
 
     def tearDown(self):
+        pb.MAX_BET_USD = self._saved_max_sig
         pb.BANKROLL_REF_USD = self._saved_ref
         pb.FLAT_SIZING_NO_ENABLED = self._saved_flat
         pb.MIN_NO_SIGMA_HAIRCUT_ENABLED = self._saved_haircut
@@ -5347,6 +5349,7 @@ class TestAddOnPath(unittest.TestCase):
     Same gate stack as entry. No add-on after settled / exited / partial-exit."""
 
     def setUp(self):
+        self._saved_max_addon = pb.MAX_BET_USD; pb.MAX_BET_USD = 1000.0
         # Bankroll plenty large so Kelly bet is capped by MAX_BET_USD, not by
         # bankroll, making intended count predictable. Setting
         # _bankroll_cache_ts = now() prevents _get_bankroll_cached from
@@ -5417,6 +5420,7 @@ class TestAddOnPath(unittest.TestCase):
         pb.get_recent_cli_range = lambda *a, **kw: None
 
     def tearDown(self):
+        pb.MAX_BET_USD = self._saved_max_addon
         pb.place_kalshi_order = self._orig_place
         pb.wait_for_fill = self._orig_wait
         pb.kalshi_delete = self._orig_delete
@@ -6146,8 +6150,8 @@ class TestYesTailMaxBetCap(unittest.TestCase):
         self.assertEqual(len(self._captured), 1)
         ticker, side, count, price_cents = self._captured[0]
         cost = count * price_cents / 100.0
-        self.assertGreater(cost, 5.00 + 0.01,
-                           f"BUY_NO T-low cost ${cost:.2f} should NOT be $5-capped")
+        self.assertGreater(cost, pb.MAX_BET_BUY_YES_USD + 0.01,
+                           f"BUY_NO T-low cost ${cost:.2f} should use full MAX_BET_USD, not the tiny BUY_YES cap")
 
     def test_constant_is_defined_positive(self):
         """2026-05-10 PM: lowered $5 → $1 per Chris (asymmetric BUY_YES

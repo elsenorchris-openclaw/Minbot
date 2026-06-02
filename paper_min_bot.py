@@ -289,7 +289,7 @@ MAX_OPEN_PER_EVENT = 1              # at most this many *open* positions per eve
                                     # Correlated bets — if forecast is wrong, all lose.
 
 # Kelly sizing
-MAX_BET_USD = 20.00                 # 2026-05-27: $80 -> $20 per Chris (tail control; also caps add-on growth). $80 8x'd correlated-bust drawdown -> 5/27 -$357 night wiped ~a month. Was $50->$80 on 5/26.
+MAX_BET_USD = 5.00                 # 2026-06-02: hard $5 cap per Chris (was $20; total position incl add-ons ≤ $5). Shared wallet w/ locklag.
                                     # 2026-05-20: $25 → $50 per Chris (raise after 5/19 net +$49 settle, post-tail_risk + post-hrrr_in_bracket_warm).
                                     # 2026-05-17: $25 → $50 per Chris (rolled back same day).
                                     # 2026-05-15 PM: $60 → $25 per Chris.
