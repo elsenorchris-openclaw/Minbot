@@ -5654,6 +5654,7 @@ def record_candidate(opp: dict) -> None:
         "days_out": _days_out_int(opp),
         "entry_local_hour": _entry_local_hour,
         "entry_local_dow": _entry_local_dow,
+        "current_temp_f": _get_current_temp_f(opp.get("station")),  # 2026-06-01: current obs temp for edge analysis
         **{k: opp.get(k) for k in fields},
     }
     _append_jsonl(_trades_file_today(), record)
