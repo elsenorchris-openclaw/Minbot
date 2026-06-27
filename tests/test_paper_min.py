@@ -4929,7 +4929,7 @@ class TestPartialExitNoOrphan(unittest.TestCase):
         self._orig_save = pb._save_positions
         self._orig_discord = pb.discord_send
         pb.kalshi_post = lambda path, body: {
-            "order": {"order_id": "test-order-id", "status": "resting"}}
+            "order_id": "test-order-id", "fill_count": "0", "remaining_count": "0"}
         pb.kalshi_delete = lambda path: {}
         pb._append_jsonl = lambda path, rec: None
         pb._save_positions = lambda: None

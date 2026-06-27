@@ -1,5 +1,13 @@
 # min_bot
 
+> **2026-06-27 — Kalshi v2 order-endpoint migration (REQUIRED FIX).** Kalshi retired the legacy
+> create-order POST `/trade-api/v2/portfolio/orders` (HTTP 410 `deprecated_v1_order_endpoint`),
+> silently halting all trading. Order create/cancel migrated to `/trade-api/v2/portfolio/events/orders`
+> — single YES-book bid/ask model, fixed-point dollar-string prices (bid=buy YES, ask=sell YES=buy
+> NO@1-price), flat response (order_id/fill_count/remaining_count). Reads (GET order/balance/positions/
+> orderbook, list orders) unchanged. Default time_in_force=GTC preserves legacy resting-limit behavior.
+> Verified live on the real wallet. Pre-migration source backed up to `*.bak.20260627`.
+
 Live trading bot for Kalshi low-temperature markets (`KXLOWT*`). Same 20
 cities as V1/V2 but opposite settlement: daily minimum instead of maximum.
 

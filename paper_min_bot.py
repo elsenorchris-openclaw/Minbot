@@ -32,6 +32,7 @@ import base64
 import concurrent.futures
 import json
 import math
+import uuid
 import os
 import re
 import signal
@@ -1788,6 +1789,42 @@ def get_kalshi_balance() -> Optional[float]:
         return None
 
 
+def _order_body_v2(ticker, action, side, count, price_cents):
+    """Build a Kalshi create-order-v2 body (POST /portfolio/events/orders).
+    Kalshi retired the legacy action/yes_price/no_price endpoint 2026-06-27
+    (HTTP 410). v2 = single YES book, bid/ask sides, fixed-point $ string prices:
+    side="bid"=buy YES, side="ask"=sell YES (=buy NO at 1-price). So buy/yes &
+    sell/no -> bid ; buy/no & sell/yes -> ask. YES price cents = price_cents for a
+    YES order else 100-price_cents. GTC default keeps legacy resting-limit behavior."""
+    yes_c = price_cents if side == "yes" else (100 - price_cents)
+    is_bid = (action == "buy") == (side == "yes")
+    return {
+        "ticker": ticker,
+        "side": "bid" if is_bid else "ask",
+        "count": str(int(count)),
+        "price": f"{yes_c / 100:.2f}",
+        "time_in_force": "good_till_canceled",
+        "self_trade_prevention_type": "taker_at_cross",
+        "client_order_id": uuid.uuid4().hex,
+    }
+
+
+def _parse_order_v2(r):
+    """Flat create-order-v2 response -> (order_id, status, filled_int). No 'order'
+    wrapper / status field; counts are fixed-point strings."""
+    oid = r.get("order_id")
+    try:
+        filled = int(float(r.get("fill_count") or 0))
+    except (TypeError, ValueError):
+        filled = 0
+    try:
+        remaining = int(float(r.get("remaining_count")))
+    except (TypeError, ValueError):
+        remaining = None
+    status = "executed" if (remaining == 0 and filled > 0) else ("partial" if filled > 0 else "resting")
+    return oid, status, filled
+
+
 def place_kalshi_order(ticker: str, side: str, count: int,
                        price_cents: int) -> Optional[str]:
     """Place a limit BUY at price_cents. Returns order_id or None on failure.
@@ -1796,20 +1833,12 @@ def place_kalshi_order(ticker: str, side: str, count: int,
     cooldowns. Per `feedback_no_unnecessary_cooldowns.md`: speed > politeness;
     cost of retry is one HTTP RTT and a log line, no fee, no fill. Faster
     retry = faster fill the moment Kalshi unpauses or a balance refresh
-    (every 60s) repopulates the cache."""
-    body = {
-        "ticker": ticker, "action": "buy", "side": side,
-        "type": "limit", "count": count,
-    }
-    if side == "yes":
-        body["yes_price"] = price_cents
-    else:
-        body["no_price"] = price_cents
+    (every 60s) repopulates the cache.
+    2026-06-27: migrated to create-order-v2 (events/orders, bid/ask model)."""
+    body = _order_body_v2(ticker, "buy", side, count, price_cents)
     try:
-        r = kalshi_post("/trade-api/v2/portfolio/orders", body)
-        order = r.get("order", {})
-        oid = order.get("order_id")
-        st = order.get("status", "?")
+        r = kalshi_post("/trade-api/v2/portfolio/events/orders", body)
+        oid, st, _ = _parse_order_v2(r)
         log(f"  ORDER buy {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
         return oid
     except Exception as e:
@@ -1822,19 +1851,10 @@ def place_kalshi_sell_order(ticker: str, side: str, count: int,
     """Place a limit SELL at price_cents. Used by hard-stop exits.
     `side` is the side we currently HOLD (e.g. 'no' if we hold BUY_NO).
     Returns order_id or None on failure."""
-    body = {
-        "ticker": ticker, "action": "sell", "side": side,
-        "type": "limit", "count": count,
-    }
-    if side == "yes":
-        body["yes_price"] = price_cents
-    else:
-        body["no_price"] = price_cents
+    body = _order_body_v2(ticker, "sell", side, count, price_cents)
     try:
-        r = kalshi_post("/trade-api/v2/portfolio/orders", body)
-        order = r.get("order", {})
-        oid = order.get("order_id")
-        st = order.get("status", "?")
+        r = kalshi_post("/trade-api/v2/portfolio/events/orders", body)
+        oid, st, _ = _parse_order_v2(r)
         log(f"  ORDER sell {count}x {side} @ {price_cents}c on {ticker} -> {oid} ({st})")
         return oid
     except Exception as e:
@@ -5970,7 +5990,7 @@ def execute_opportunity(opp: dict) -> bool:
     status, filled = wait_for_fill(order_id, count, ORDER_FILL_TIMEOUT_SEC)
     if filled <= 0:
         try:
-            kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+            kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{order_id}")
         except Exception as _cx:
             # noqa: should_log — cancel is best-effort; Kalshi auto-GCs stale
             # orders, but a persistent cancel-failure can leak ghost orders
@@ -5980,7 +6000,7 @@ def execute_opportunity(opp: dict) -> bool:
         return False
     if filled < count:
         try:
-            kalshi_delete(f"/trade-api/v2/portfolio/orders/{order_id}")
+            kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{order_id}")
         except Exception as _cx:
             # noqa: should_log — see above; partial-fill remainder cancel.
             log(f"  cancel-remainder failed for {order_id} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
@@ -6068,7 +6088,7 @@ def execute_opportunity(opp: dict) -> bool:
             if _r_filled > 0:
                 if _r_filled < _max_count:
                     try:
-                        kalshi_delete(f"/trade-api/v2/portfolio/orders/{_retry_id}")
+                        kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{_retry_id}")
                     except Exception as _cx:
                         log(f"  ladder cancel-remainder failed for {_retry_id} on {ticker}: "
                             f"{type(_cx).__name__}: {_cx}", "warn")
@@ -6079,7 +6099,7 @@ def execute_opportunity(opp: dict) -> bool:
                     f"new_edge={_new_edge:.2%})", "trade")
             else:
                 try:
-                    kalshi_delete(f"/trade-api/v2/portfolio/orders/{_retry_id}")
+                    kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{_retry_id}")
                 except Exception as _cx:
                     log(f"  ladder cancel failed for {_retry_id} on {ticker}: "
                         f"{type(_cx).__name__}: {_cx}", "warn")
@@ -6579,7 +6599,7 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
     status, filled = wait_for_fill(oid, order_count, ORDER_FILL_TIMEOUT_SEC)
     if filled <= 0:
         try:
-            kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
+            kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{oid}")
         except Exception as _cx:
             # noqa: should_log — exit cancel is best-effort; logging the
             # underlying failure makes ghost-order leaks investigable.
@@ -6588,7 +6608,7 @@ def _execute_exit(ticker: str, pos: dict, sell_side: str, sell_price_c: int,
         return False
     if filled < order_count:
         try:
-            kalshi_delete(f"/trade-api/v2/portfolio/orders/{oid}")
+            kalshi_delete(f"/trade-api/v2/portfolio/events/orders/{oid}")
         except Exception as _cx:
             # noqa: should_log — exit partial-fill remainder cancel.
             log(f"  exit cancel-remainder failed for {oid} on {ticker}: {type(_cx).__name__}: {_cx}", "warn")
